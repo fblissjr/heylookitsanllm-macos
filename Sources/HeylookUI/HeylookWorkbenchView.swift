@@ -49,6 +49,7 @@ public final class HeylookWorkbenchViewModel {
     // Models & Engine State
     public var registeredModels: [EngineDescription] = []
     public var selectedModelID: String = ""
+    public var editingSidecarModel: EngineDescription?
     public var memorySnapshot: HardwareMemoryMonitor.MemorySnapshot = HardwareMemoryMonitor.snapshot()
     public var schedulerMetrics: ComputeScheduler.SchedulerMetrics = ComputeScheduler.SchedulerMetrics(
         gpuGateBusy: false,
@@ -1100,6 +1101,58 @@ public final class HeylookWorkbenchViewModel {
             selectedModelID = firstRemote.modelID
         }
         statusBanner = "Connected to remote Mac Studio at \(trimmed) (\(remoteDescriptions.count) models)."
+    }
+
+    // MARK: - Model Lifecycle & Sidecar Administration
+
+    public func toggleModelPin(_ model: EngineDescription) async {
+        await scheduler.setPinned(!model.isPinned, for: model.modelID)
+        await refreshMetrics()
+    }
+
+    public func toggleModelLoaded(_ model: EngineDescription) async {
+        if model.isLoaded {
+            await scheduler.unloadModel(model.modelID)
+        } else {
+            _ = try? await scheduler.activateModel(model.modelID)
+        }
+        await refreshMetrics()
+    }
+
+    public func loadSidecarConfig(for model: EngineDescription) -> ModelSidecarConfig {
+        let dirURL = URL(fileURLWithPath: model.modelPath)
+        let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")
+        if let text = try? String(contentsOf: sidecarURL, encoding: .utf8) {
+            return ModelSidecarConfig.parseTOML(text)
+        }
+        return ModelSidecarConfig(
+            id: model.modelID,
+            provider: model.provider,
+            pinned: model.isPinned,
+            computePlacement: model.computePlacement.value,
+            ctxSize: model.contextSize.value,
+            flashAttn: model.flashAttention.value,
+            supportsVision: model.supportsVision.value,
+            supportsThinking: model.supportsThinking.value,
+            sampling: SamplerSettings(
+                temperature: 0.7,
+                topP: 0.95,
+                thinkingBudget: model.thinkingBudget.value
+            ),
+            tags: model.tags
+        )
+    }
+
+    public func saveModelSidecar(_ sidecar: ModelSidecarConfig, for model: EngineDescription) async {
+        let dirURL = URL(fileURLWithPath: model.modelPath)
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: dirURL.path, isDirectory: &isDir), isDir.boolValue {
+            let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")
+            try? sidecar.toTOML().write(to: sidecarURL, atomically: true, encoding: .utf8)
+        }
+        _ = try? await scheduler.applySidecarUpdate(sidecar, for: model.modelID)
+        await refreshMetrics()
+        statusBanner = "Saved model.heylook.toml sidecar for \(model.modelID)."
     }
 }
 
@@ -2776,7 +2829,10 @@ struct ModelsInspectorSurface: View {
     var body: some View {
         List(viewModel.registeredModels) { model in
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(model.isLoaded ? Color.green : Color.secondary.opacity(0.35))
+                        .frame(width: 8, height: 8)
                     Text(model.modelID)
                         .font(.headline)
                     Text(model.provider.displayName)
@@ -2791,20 +2847,43 @@ struct ModelsInspectorSurface: View {
                         .background(Color.green.opacity(0.15), in: Capsule())
                     if model.isPinned {
                         Text("PINNED")
-                            .font(.caption2.monospaced())
+                            .font(.caption2.monospaced().weight(.bold))
                             .foregroundStyle(.orange)
                     }
                     Spacer()
-                    Button("Select") {
-                        viewModel.selectedModelID = model.modelID
+
+                    Button(model.isPinned ? "Unpin" : "Pin") {
+                        Task { await viewModel.toggleModelPin(model) }
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+
+                    Button(model.isLoaded ? "Unload" : "Load") {
+                        Task { await viewModel.toggleModelLoaded(model) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button {
+                        viewModel.editingSidecarModel = model
+                    } label: {
+                        Label("Sidecar", systemImage: "doc.badge.gearshape")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button("Select") {
+                        viewModel.selectedModelID = model.modelID
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
                 }
 
-                Text("Path: \(model.modelPath) • Arch: \(model.architecture.value) (\(model.architecture.provenance.rawValue)) • Quant: \(model.quantization.value)")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Path: \(model.modelPath) • Arch: \(model.architecture.value) (\(model.architecture.provenance.rawValue)) • Quant: \(model.quantization.value) • Ctx: \(model.contextSize.value) (\(model.contextSize.provenance.rawValue)) • Template: \(model.templateSource.value)"
+                )
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
 
                 HStack(spacing: 8) {
                     ForEach(model.tags, id: \.self) { tag in
@@ -2817,6 +2896,127 @@ struct ModelsInspectorSurface: View {
                 }
             }
             .padding(.vertical, 6)
+        }
+        .sheet(item: $viewModel.editingSidecarModel) { model in
+            ModelSidecarEditorSheet(viewModel: viewModel, model: model)
+        }
+    }
+}
+
+private struct ModelSidecarEditorSheet: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    let model: EngineDescription
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var pinned: Bool = false
+    @State private var ctxSize: Int = 8192
+    @State private var flashAttn: Bool = true
+    @State private var supportsVision: Bool = false
+    @State private var supportsThinking: Bool = true
+    @State private var temperature: Double = 0.7
+    @State private var topP: Double = 0.95
+    @State private var thinkingBudget: Int = 4096
+    @State private var tagsText: String = ""
+    @State private var unsetText: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Edit model.heylook.toml Sidecar")
+                        .font(.headline)
+                    Text(model.modelID)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            Toggle("Pin Model in Unified Memory (Exempt from GPU LRU Eviction)", isOn: $pinned)
+            Stepper("Context Size (ctx_size): \(ctxSize)", value: $ctxSize, in: 2048...1_048_576, step: 4096)
+                .font(.subheadline.monospacedDigit())
+            Toggle("Flash Attention (flash_attn)", isOn: $flashAttn)
+            Toggle("Supports Vision (supports_vision)", isOn: $supportsVision)
+            Toggle("Supports Thinking (supports_thinking)", isOn: $supportsThinking)
+
+            Divider()
+
+            HStack {
+                Text("Default Temperature: \(String(format: "%.2f", temperature))")
+                    .font(.subheadline.monospacedDigit())
+                Slider(value: $temperature, in: 0...2.0)
+            }
+            HStack {
+                Text("Default Top-P: \(String(format: "%.2f", topP))")
+                    .font(.subheadline.monospacedDigit())
+                Slider(value: $topP, in: 0.05...1.0)
+            }
+            Stepper("Default Thinking Budget: \(thinkingBudget)", value: $thinkingBudget, in: 256...65536, step: 512)
+                .font(.subheadline.monospacedDigit())
+
+            TextField("Tags (comma-separated, e.g. chat, vision, mtp)", text: $tagsText)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption.monospaced())
+
+            TextField("Unset Keys (comma-separated, e.g. draft_model_path, spec_type)", text: $unsetText)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption.monospaced())
+
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.bordered)
+                Spacer()
+                Button("Save model.heylook.toml") {
+                    let parsedTags = tagsText
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    let parsedUnset = unsetText
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    let updatedSidecar = ModelSidecarConfig(
+                        id: model.modelID,
+                        provider: model.provider,
+                        pinned: pinned,
+                        computePlacement: model.computePlacement.value,
+                        ctxSize: ctxSize,
+                        flashAttn: flashAttn,
+                        supportsVision: supportsVision,
+                        supportsThinking: supportsThinking,
+                        unsetKeys: parsedUnset,
+                        sampling: SamplerSettings(
+                            temperature: temperature,
+                            topP: topP,
+                            thinkingBudget: thinkingBudget
+                        ),
+                        tags: parsedTags
+                    )
+                    Task {
+                        await viewModel.saveModelSidecar(updatedSidecar, for: model)
+                        dismiss()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 500)
+        .onAppear {
+            let loaded = viewModel.loadSidecarConfig(for: model)
+            pinned = loaded.pinned ?? model.isPinned
+            ctxSize = loaded.ctxSize ?? model.contextSize.value
+            flashAttn = loaded.flashAttn ?? model.flashAttention.value
+            supportsVision = loaded.supportsVision ?? model.supportsVision.value
+            supportsThinking = loaded.supportsThinking ?? model.supportsThinking.value
+            temperature = loaded.sampling.temperature ?? 0.7
+            topP = loaded.sampling.topP ?? 0.95
+            thinkingBudget = loaded.sampling.thinkingBudget ?? (model.thinkingBudget.value ?? 4096)
+            tagsText = (loaded.tags.isEmpty ? model.tags : loaded.tags).joined(separator: ", ")
+            unsetText = loaded.unsetKeys.joined(separator: ", ")
         }
     }
 }

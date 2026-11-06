@@ -44,3 +44,11 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 - [x] **3.1 Bonjour (`_heylook._tcp`) Auto-Discovery Picker (`iOS 27.2+` & macOS)**: Wired `BonjourServiceBrowser` (`NWBrowser` for `_heylook._tcp`) and `DiscoveredHeylookServer` into `HeylookWorkbenchViewModel` (`startBonjourDiscovery()`, `connectToRemoteServer(_:)`) and `PerfServerSurface` so mobile and remote clients auto-discover and connect to the Mac Studio in one click.
 - [x] **3.2 Multimodal Chat Composer, Provenance Badges & Keyboard Shortcuts**: Added `MessagesRequest.MediaAttachment` with dual string/block-array `MessageTurn` `Codable` encoding, HTTP `422` capability gating on `POST /v1/messages`, image/audio attachment pills + drag-and-drop + capability warnings in `ChatWorkbenchSurface`, per-slider `SamplerProvenancePill` (`derived` / `configured` / `request`) + `Reset Overrides` in `LoadAndSamplerPanelSheet`, and keyboard shortcuts (`Cmd+Return` to send, `Escape` to stop, `Cmd+N` for new chat, `Cmd+Shift+P` for prompt preview).
+
+---
+
+## Phase 4: Production Cutover — VLM Media Forwarding & Sidecar Admin (Done)
+
+- [x] **4.1 End-to-End VLM Media Forwarding (`--mmproj` + Vision/Audio Blocks)**: Added `HeylookConfig.discoverMMProj(in:)`, auto-wired `--mmproj` into `GGUFSpawnConfig.autoSized`, implemented `GGUFSubprocessProvider.buildOpenAIChatMessages(from:)` (`image_url` data URIs + `input_audio` blocks), and wired decoded `CIImage` inputs into `MLXSwiftProvider`'s `UserInput`.
+- [x] **4.2 Interactive Model Sidecar Editor & `/v1/admin/models/*` Routes**: Added `ComputeScheduler.applySidecarUpdate`, wired `GET/PATCH /v1/admin/models/{id}`, `POST /v1/admin/models/{id}/load`, and `POST /v1/admin/models/{id}/unload` in `HeylookRouter`, and added **Pin / Load / Unload** buttons + `ModelSidecarEditorSheet` (`model.heylook.toml` editor) to `ModelsInspectorSurface`.
+- [x] **4.3 Live Verification Suite (`HeylookTests`)**: Expanded `HeylookTests` to 18/18 passing suites covering `--mmproj` discovery, OpenAI vision/audio message serialization, and `/v1/admin/models/*` routes.

@@ -426,6 +426,23 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return (nil, nil)
     }
 
+    /// Discovers a `mmproj*.gguf` multimodal vision projector in `candidateDir` or its parent repo directory.
+    public static func discoverMMProj(in candidateDir: URL) -> String? {
+        let fm = FileManager.default
+        for folder in [candidateDir, candidateDir.deletingLastPathComponent()] {
+            guard let items = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
+                continue
+            }
+            for item in items.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                let lower = item.lastPathComponent.lowercased()
+                if lower.hasSuffix(".gguf") && lower.contains("mmproj") {
+                    return item.standardizedFileURL.path
+                }
+            }
+        }
+        return nil
+    }
+
     /// Strips `-00001-of-00005` shard suffix and `.gguf` extension from a GGUF filename (`model_importer.py`).
     public static func ggufModelStem(from filename: String) -> String {
         var name = filename
@@ -554,8 +571,13 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                     ?? provider.rawValue
                 let isEmbedding = modelID.localizedCaseInsensitiveContains("embed")
                     || archString.localizedCaseInsensitiveContains("embedding")
+                let mmprojPath = provider == .gguf ? discoverMMProj(in: candidateDir) : nil
                 let hasVision = sidecar?.supportsVision
-                    ?? (configJSON?["vision_config"] != nil || modelID.localizedCaseInsensitiveContains("vl") || isEmbedding)
+                    ?? (configJSON?["vision_config"] != nil
+                        || mmprojPath != nil
+                        || modelID.localizedCaseInsensitiveContains("vl")
+                        || modelID.localizedCaseInsensitiveContains("vision")
+                        || isEmbedding)
                 let hasAudio = configJSON?["audio_config"] != nil || isEmbedding
                 let ctxValue = sidecar?.ctxSize
                     ?? (configJSON?["max_position_embeddings"] as? Int)
@@ -579,6 +601,9 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                     if !tags.contains("mtp") {
                         tags.append("mtp")
                     }
+                }
+                if hasVision && !tags.contains("vision") {
+                    tags.append("vision")
                 }
 
                 discovered.append(

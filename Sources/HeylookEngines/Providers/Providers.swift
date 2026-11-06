@@ -532,8 +532,20 @@ public actor MLXSwiftProvider: InferenceProvider {
 
                     var additionalContext: [String: any Sendable] = [:]
                     additionalContext["enable_thinking"] = enableThinking
+                    var userImages: [UserInput.Image] = []
+                    #if canImport(CoreImage)
+                    for turn in request.messages {
+                        for att in turn.attachments where att.kind == "image" {
+                            if let data = Data(base64Encoded: att.dataBase64),
+                               let ciImg = CIImage(data: data) {
+                                userImages.append(.ciImage(ciImg))
+                            }
+                        }
+                    }
+                    #endif
                     let userInput = UserInput(
                         chat: chatMessages,
+                        images: userImages,
                         additionalContext: additionalContext
                     )
                     let lmInput = try await container.prepare(input: userInput)
@@ -873,12 +885,14 @@ public struct GGUFSpawnConfig: Codable, Sendable, Equatable {
 
         let templateResolution = HeylookConfig.resolveGGUFTemplate(in: dirURL, sidecar: resolvedSidecar)
         let drafter = HeylookConfig.discoverDrafter(in: dirURL, provider: .gguf, sidecar: resolvedSidecar)
+        let mmproj = HeylookConfig.discoverMMProj(in: dirURL)
 
         return GGUFSpawnConfig(
             modelPath: description.modelPath,
             ctxSize: description.contextSize.value,
             flashAttention: description.flashAttention.value,
             ubatchSize: autoUbatch,
+            mmprojPath: mmproj,
             chatTemplateFile: templateResolution.resolvedFilePath,
             draftModelPath: drafter.draftModelPath,
             specType: drafter.specType,
@@ -1070,6 +1084,52 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         )
     }
 
+    /// Converts an Anthropic-style `MessagesRequest` (including `image` and `audio` attachments)
+    /// into the OpenAI `/v1/chat/completions` `messages` array expected by `llama-server --mmproj`.
+    public static func buildOpenAIChatMessages(from request: MessagesRequest) -> [[String: Any]] {
+        var wireMessages: [[String: Any]] = []
+        if let sys = request.system, !sys.isEmpty {
+            wireMessages.append(["role": "system", "content": sys])
+        }
+        for turn in request.messages {
+            if turn.attachments.isEmpty {
+                wireMessages.append(["role": turn.role, "content": turn.content])
+            } else {
+                var parts: [[String: Any]] = []
+                for att in turn.attachments {
+                    if att.kind == "image" {
+                        parts.append([
+                            "type": "image_url",
+                            "image_url": [
+                                "url": "data:\(att.mediaType);base64,\(att.dataBase64)"
+                            ]
+                        ])
+                    } else if att.kind == "audio" {
+                        let audioFormat = att.mediaType.components(separatedBy: "/").last ?? "wav"
+                        parts.append([
+                            "type": "input_audio",
+                            "input_audio": [
+                                "data": att.dataBase64,
+                                "format": audioFormat
+                            ]
+                        ])
+                    }
+                }
+                if !turn.content.isEmpty {
+                    parts.append([
+                        "type": "text",
+                        "text": turn.content
+                    ])
+                }
+                wireMessages.append([
+                    "role": turn.role,
+                    "content": parts
+                ])
+            }
+        }
+        return wireMessages
+    }
+
     public func describe() async -> EngineDescription {
         descriptionState
     }
@@ -1172,13 +1232,7 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                     urlReq.httpMethod = "POST"
                     urlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-                    var wireMessages: [[String: String]] = []
-                    if let sys = request.system, !sys.isEmpty {
-                        wireMessages.append(["role": "system", "content": sys])
-                    }
-                    for turn in request.messages {
-                        wireMessages.append(["role": turn.role, "content": turn.content])
-                    }
+                    let wireMessages = Self.buildOpenAIChatMessages(from: request)
 
                     let body: [String: Any] = [
                         "messages": wireMessages,

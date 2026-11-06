@@ -153,6 +153,49 @@ public actor ComputeScheduler {
         descriptions[modelID] = desc
     }
 
+    /// Applies an updated `ModelSidecarConfig` (`model.heylook.toml`) to `modelID` in-place,
+    /// marking modified fields with `.configured` provenance.
+    @discardableResult
+    public func applySidecarUpdate(_ sidecar: ModelSidecarConfig, for modelID: String) throws -> EngineDescription {
+        guard let existing = descriptions[modelID] else {
+            throw ComputeSchedulerError.modelNotFound(modelID)
+        }
+        let updated = EngineDescription(
+            modelID: existing.modelID,
+            provider: sidecar.provider ?? existing.provider,
+            modelPath: existing.modelPath,
+            architecture: existing.architecture,
+            quantization: existing.quantization,
+            computePlacement: sidecar.computePlacement.map {
+                ProvenanceField(value: $0, provenance: .configured, effect: .reload, computePlacement: $0)
+            } ?? existing.computePlacement,
+            isPinned: sidecar.pinned ?? existing.isPinned,
+            isLoaded: existing.isLoaded,
+            contextSize: sidecar.ctxSize.map {
+                ProvenanceField(value: $0, provenance: .configured, effect: .reload)
+            } ?? existing.contextSize,
+            flashAttention: sidecar.flashAttn.map {
+                ProvenanceField(value: $0, provenance: .configured, effect: .reload)
+            } ?? existing.flashAttention,
+            supportsVision: sidecar.supportsVision.map {
+                ProvenanceField(value: $0, provenance: .configured, effect: .reload)
+            } ?? existing.supportsVision,
+            supportsAudio: existing.supportsAudio,
+            supportsEmbeddings: existing.supportsEmbeddings,
+            supportsThinking: sidecar.supportsThinking.map {
+                ProvenanceField(value: $0, provenance: .configured, effect: .perRequest)
+            } ?? existing.supportsThinking,
+            thinkingBudget: sidecar.sampling.thinkingBudget.map {
+                ProvenanceField(value: $0, provenance: .configured, effect: .perRequest)
+            } ?? existing.thinkingBudget,
+            templateSource: existing.templateSource,
+            estimatedMemoryMB: existing.estimatedMemoryMB,
+            tags: sidecar.tags.isEmpty ? existing.tags : sidecar.tags
+        )
+        descriptions[modelID] = updated
+        return updated
+    }
+
     /// Marks `modelID` as loaded and enforces LRU eviction on unpinned GPU models while leaving
     /// ANE-resident models (`computePlacement.runsOnNeuralEngineLane`) untouched.
     public func activateModel(_ modelID: String) throws -> EngineDescription {

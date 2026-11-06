@@ -230,6 +230,47 @@ public actor HeylookRouter {
                 }
             }
 
+            if segments.count >= 4 && segments[0] == "v1" && segments[1] == "admin" && segments[2] == "models" {
+                let modelID = segments[3]
+                if segments.count == 4 && method.uppercased() == "GET" {
+                    guard let desc = await scheduler.modelDescription(for: modelID) else {
+                        throw ComputeSchedulerError.modelNotFound(modelID)
+                    }
+                    return try .json(desc)
+                }
+                if segments.count == 4 && (method.uppercased() == "PATCH" || method.uppercased() == "PUT") {
+                    guard let existing = await scheduler.modelDescription(for: modelID) else {
+                        throw ComputeSchedulerError.modelNotFound(modelID)
+                    }
+                    let sidecar: ModelSidecarConfig
+                    if let decodedJSON = try? JSONDecoder().decode(ModelSidecarConfig.self, from: body) {
+                        sidecar = decodedJSON
+                    } else {
+                        let tomlText = String(decoding: body, as: UTF8.self)
+                        sidecar = ModelSidecarConfig.parseTOML(tomlText)
+                    }
+                    let dirURL = URL(fileURLWithPath: existing.modelPath)
+                    var isDir: ObjCBool = false
+                    if FileManager.default.fileExists(atPath: dirURL.path, isDirectory: &isDir), isDir.boolValue {
+                        let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")
+                        try? sidecar.toTOML().write(to: sidecarURL, atomically: true, encoding: .utf8)
+                    }
+                    let updated = try await scheduler.applySidecarUpdate(sidecar, for: modelID)
+                    return try .json(updated)
+                }
+                if segments.count == 5 && segments[4] == "load" && method.uppercased() == "POST" {
+                    let loaded = try await scheduler.activateModel(modelID)
+                    return try .json(loaded)
+                }
+                if segments.count == 5 && segments[4] == "unload" && method.uppercased() == "POST" {
+                    await scheduler.unloadModel(modelID)
+                    guard let unloaded = await scheduler.modelDescription(for: modelID) else {
+                        throw ComputeSchedulerError.modelNotFound(modelID)
+                    }
+                    return try .json(unloaded)
+                }
+            }
+
             return .error(status: 404, type: "not_found_error", message: "Route \(method) \(cleanPath) not found")
         } catch let error as ComputeSchedulerError {
             switch error {

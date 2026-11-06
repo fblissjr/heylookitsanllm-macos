@@ -871,4 +871,115 @@ struct HeylookTests {
         )
         #expect(okResp.status == 200)
     }
+
+    @Test("GGUF --mmproj auto-discovery, OpenAI vision/audio message serialization, and /v1/admin/models/{id} sidecar & load routes")
+    func testMMProjOpenAIVisionSerializationAndAdminModelRoutes() async throws {
+        // 1. GGUF --mmproj auto-discovery & buildLlamaServerArgs
+        let rootDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase4_\(UUID().uuidString)", isDirectory: true)
+        let modelDir = rootDir.appendingPathComponent("DeepSeek-V4-Vision-GGUF", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        let primaryGGUF = modelDir.appendingPathComponent("DeepSeek-V4-Vision-Q8_0.gguf")
+        let mmprojGGUF = modelDir.appendingPathComponent("mmproj-DeepSeek-V4-F16.gguf")
+        try Data("GGUF".utf8).write(to: primaryGGUF)
+        try Data("GGUF".utf8).write(to: mmprojGGUF)
+
+        let discovered = HeylookConfig.discoverModels(in: [rootDir])
+            .first(where: { $0.modelPath == modelDir.standardizedFileURL.path })
+        let vlmDesc = try #require(discovered)
+        #expect(vlmDesc.supportsVision.value == true)
+        #expect(vlmDesc.tags.contains("vision"))
+
+        let spawnCfg = GGUFSpawnConfig.autoSized(for: vlmDesc, headroomGB: 64.0)
+        #expect(spawnCfg.mmprojPath == mmprojGGUF.standardizedFileURL.path)
+        let cliArgs = GGUFSubprocessProvider.buildLlamaServerArgs(config: spawnCfg)
+        #expect(cliArgs.contains("--mmproj"))
+        #expect(cliArgs.contains(mmprojGGUF.standardizedFileURL.path))
+
+        // 2. OpenAI vision + audio message serialization for llama-server
+        let imgAtt = MessagesRequest.MediaAttachment(
+            kind: "image",
+            mediaType: "image/png",
+            dataBase64: "iVBORw==",
+            filename: "chart.png"
+        )
+        let audioAtt = MessagesRequest.MediaAttachment(
+            kind: "audio",
+            mediaType: "audio/wav",
+            dataBase64: "UklGRg==",
+            filename: "clip.wav"
+        )
+        let req = MessagesRequest(
+            model: vlmDesc.modelID,
+            messages: [
+                MessagesRequest.MessageTurn(
+                    role: "user",
+                    content: "Analyze image and audio",
+                    attachments: [imgAtt, audioAtt]
+                )
+            ],
+            system: "Be concise"
+        )
+        let openAIMessages = GGUFSubprocessProvider.buildOpenAIChatMessages(from: req)
+        #expect(openAIMessages.count == 2)
+        let userParts = try #require(openAIMessages.last?["content"] as? [[String: Any]])
+        #expect(userParts.count == 3)
+        #expect((userParts[0]["type"] as? String) == "image_url")
+        #expect((userParts[1]["type"] as? String) == "input_audio")
+        #expect((userParts[2]["type"] as? String) == "text")
+
+        // 3. /v1/admin/models/{id} PATCH sidecar + load/unload routes
+        let dbURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase4_db_\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: dbURL) }
+        let store = try SQLiteStore(databaseURL: dbURL)
+        let scheduler = ComputeScheduler()
+        await scheduler.register(provider: GGUFSubprocessProvider(description: vlmDesc), description: vlmDesc)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        let sidecarPatch = ModelSidecarConfig(
+            id: vlmDesc.modelID,
+            provider: .gguf,
+            pinned: true,
+            ctxSize: 65536,
+            flashAttn: true,
+            supportsVision: true,
+            supportsThinking: true,
+            sampling: SamplerSettings(temperature: 0.4, thinkingBudget: 8192),
+            tags: ["vision", "pinned-vlm"]
+        )
+        let patchResp = await router.handle(
+            method: "PATCH",
+            path: "/v1/admin/models/\(vlmDesc.modelID)",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(sidecarPatch)
+        )
+        #expect(patchResp.status == 200)
+        let updatedDesc = try JSONDecoder().decode(EngineDescription.self, from: patchResp.body)
+        #expect(updatedDesc.isPinned == true)
+        #expect(updatedDesc.contextSize.value == 65536)
+        #expect(updatedDesc.contextSize.provenance == .configured)
+        #expect(updatedDesc.tags.contains("pinned-vlm"))
+        #expect(FileManager.default.fileExists(atPath: modelDir.appendingPathComponent("model.heylook.toml").path))
+
+        let loadResp = await router.handle(
+            method: "POST",
+            path: "/v1/admin/models/\(vlmDesc.modelID)/load",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(loadResp.status == 200)
+        let loadedDesc = try JSONDecoder().decode(EngineDescription.self, from: loadResp.body)
+        #expect(loadedDesc.isLoaded == true)
+
+        let unloadResp = await router.handle(
+            method: "POST",
+            path: "/v1/admin/models/\(vlmDesc.modelID)/unload",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(unloadResp.status == 200)
+        let unloadedDesc = try JSONDecoder().decode(EngineDescription.self, from: unloadResp.body)
+        #expect(unloadedDesc.isLoaded == false)
+    }
 }
