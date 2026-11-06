@@ -91,3 +91,9 @@ flowchart TB
    - Persists the user turn to `SQLiteStore` before generation starts, runs the provider stream inside a server-owned `Task` registered in `RequestRegistry`, and persists the assistant message (including partial content + `thinking` + `stop_reason = "cancelled"` on abort) even if the mobile client drops its SSE connection mid-flight.
 4. **Matryoshka Multimodal Vector Indexing (`HeylookEmbeddings`)**:
    - Stores full `768d` `Float32` embeddings once in SQLite (`WAL` mode) and projects/L2-normalizes to `768`, `512`, `256`, or `128` dimensions at query time via Apple `Accelerate` (`vDSP`), grouping search hits by parent `Artifact` so multi-window videos or multi-page PDFs never produce duplicate cards.
+5. **5-Layer Deterministic Sampler Cascade (`SamplerCascade`)**:
+   - Resolves `builtin` -> `vendor generation_config.json` -> `model.heylook.toml` -> `preset` -> `request`, recording per-field provenance (`derived`, `configured`, or `request`).
+6. **4-Rung GGUF Template Ladder & Operator Overrides (`HeylookConfig` & `HeylookRouter`)**:
+   - Resolves `chat_template_path` (sidecar override) > `chat_template.heylook.jinja` (operator override via `GET/PUT/DELETE /v1/admin/models/{id}/chat-template`) > `chat_template.jinja` (vendor ship) > `gguf_embedded` (`tokenizer.chat_template` in GGUF metadata), without ever mutating vendor files.
+7. **Multimodal Capability Gating & Image Token Budgeting (`/v1/messages`, `/image-plan`, `/prompt`)**:
+   - Rejects image or audio attachments sent to text-only models with HTTP `422 invalid_request_error` naming the offending media type, computes pre-send image token budgets via `POST /v1/models/{id}/image-plan` (`409` when unloaded, `200` when resident), and renders exact formatted prompts via `POST /v1/conversations/{id}/prompt`.
