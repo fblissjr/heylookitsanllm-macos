@@ -98,6 +98,7 @@ public enum SamplerCascade {
 
     public static func resolve(
         builtin: SamplerSettings = .builtinDefaults,
+        vendor: SamplerSettings? = nil,
         modelSidecar: SamplerSettings? = nil,
         preset: SamplerSettings? = nil,
         request: SamplerSettings? = nil
@@ -125,6 +126,7 @@ public enum SamplerCascade {
             if let v = layer.stopSequences { resolved.stopSequences = v; provenance[.stopSequences] = source }
         }
 
+        applyLayer(vendor, source: .derived)
         applyLayer(modelSidecar, source: .configured)
         applyLayer(preset, source: .configured)
         applyLayer(request, source: .configured)

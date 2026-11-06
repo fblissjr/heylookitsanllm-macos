@@ -14,6 +14,11 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         /// Display filename for UI pills
         public let filename: String?
 
+        /// Estimated soft-token budget on vision/audio towers (`<=280` for image, `750` for 30s audio).
+        public var estimatedTokens: Int {
+            kind == "audio" ? 750 : 280
+        }
+
         public init(
             id: String = UUID().uuidString,
             kind: String,
@@ -65,17 +70,26 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
     public struct MessageTurn: Codable, Sendable, Equatable {
         public let role: String
         public let content: String
+        public var thinking: String?
         public var attachments: [MediaAttachment]
 
-        public init(role: String, content: String, attachments: [MediaAttachment] = []) {
+        public init(
+            role: String,
+            content: String,
+            thinking: String? = nil,
+            attachments: [MediaAttachment] = []
+        ) {
             self.role = role
             self.content = content
+            self.thinking = thinking
             self.attachments = attachments
         }
 
         private enum CodingKeys: String, CodingKey {
             case role
             case content
+            case thinking
+            case reasoningContent = "reasoning_content"
         }
 
         private struct WireContentBlock: Codable {
@@ -86,21 +100,28 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
             }
             let type: String
             let text: String?
+            let thinking: String?
             let source: Source?
         }
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.role = try container.decode(String.self, forKey: .role)
+            let explicitThinking = (try? container.decodeIfPresent(String.self, forKey: .thinking))
+                ?? (try? container.decodeIfPresent(String.self, forKey: .reasoningContent))
             if let plainText = try? container.decode(String.self, forKey: .content) {
                 self.content = plainText
+                self.thinking = explicitThinking
                 self.attachments = []
             } else if let blocks = try? container.decode([WireContentBlock].self, forKey: .content) {
                 var textParts: [String] = []
+                var thinkingParts: [String] = []
                 var media: [MediaAttachment] = []
                 for block in blocks {
                     if block.type == "text", let t = block.text {
                         textParts.append(t)
+                    } else if block.type == "thinking", let th = block.thinking ?? block.text {
+                        thinkingParts.append(th)
                     } else if (block.type == "image" || block.type == "audio"),
                               let src = block.source,
                               let b64 = src.data {
@@ -114,9 +135,11 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
                     }
                 }
                 self.content = textParts.joined(separator: "\n")
+                self.thinking = explicitThinking ?? (thinkingParts.isEmpty ? nil : thinkingParts.joined(separator: "\n"))
                 self.attachments = media
             } else {
                 self.content = ""
+                self.thinking = explicitThinking
                 self.attachments = []
             }
         }
@@ -124,6 +147,9 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         public func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(role, forKey: .role)
+            if let thinking, !thinking.isEmpty {
+                try container.encode(thinking, forKey: .thinking)
+            }
             if attachments.isEmpty {
                 try container.encode(content, forKey: .content)
             } else {
@@ -131,11 +157,12 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
                     WireContentBlock(
                         type: att.kind,
                         text: nil,
+                        thinking: nil,
                         source: .init(type: "base64", media_type: att.mediaType, data: att.dataBase64)
                     )
                 }
                 if !content.isEmpty {
-                    blocks.append(WireContentBlock(type: "text", text: content, source: nil))
+                    blocks.append(WireContentBlock(type: "text", text: content, thinking: nil, source: nil))
                 }
                 try container.encode(blocks, forKey: .content)
             }

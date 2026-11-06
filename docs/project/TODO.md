@@ -52,3 +52,21 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 - [x] **4.1 End-to-End VLM Media Forwarding (`--mmproj` + Vision/Audio Blocks)**: Added `HeylookConfig.discoverMMProj(in:)`, auto-wired `--mmproj` into `GGUFSpawnConfig.autoSized`, implemented `GGUFSubprocessProvider.buildOpenAIChatMessages(from:)` (`image_url` data URIs + `input_audio` blocks), and wired decoded `CIImage` inputs into `MLXSwiftProvider`'s `UserInput`.
 - [x] **4.2 Interactive Model Sidecar Editor & `/v1/admin/models/*` Routes**: Added `ComputeScheduler.applySidecarUpdate`, wired `GET/PATCH /v1/admin/models/{id}`, `POST /v1/admin/models/{id}/load`, and `POST /v1/admin/models/{id}/unload` in `HeylookRouter`, and added **Pin / Load / Unload** buttons + `ModelSidecarEditorSheet` (`model.heylook.toml` editor) to `ModelsInspectorSurface`.
 - [x] **4.3 Live Verification Suite (`HeylookTests`)**: Expanded `HeylookTests` to 18/18 passing suites covering `--mmproj` discovery, OpenAI vision/audio message serialization, and `/v1/admin/models/*` routes.
+
+---
+
+## Phase 5: Python Engine-Contract Parity Additions (Done)
+
+- [x] **5.1 Vendor `generation_config.json` Sampling Layer**: Added `HeylookConfig.loadVendorSampling(in:)` (`temperature`, `top_p`, `top_k`) and `vendor: SamplerSettings?` in `SamplerCascade.resolve` (`builtin` < `vendor` < `model.heylook.toml` < `preset` < `request`).
+- [x] **5.2 Multi-Turn `reasoning_content` Forwarding**: Added `thinking: String?` on `MessagesRequest.MessageTurn` and emitted `"reasoning_content"` on prior assistant turns in `GGUFSubprocessProvider.buildOpenAIChatMessages(from:)`.
+- [x] **5.3 Operator Template Override Routes (`chat_template.heylook.jinja`)**: Added `GET / PUT / DELETE /v1/admin/models/{id}/chat-template` writing/deleting `chat_template.heylook.jinja` without ever mutating vendor `chat_template.jinja`.
+- [x] **5.4 Prompt Inspector & Image Token Budgeting (`/prompt` & `/image-plan`)**: Added `POST /v1/conversations/{id}/prompt`, `POST /v1/models/{id}/image-plan` (returning `409` when unloaded and `200` with `tokens_per_image` when resident), and `~tok` badges on staged attachment pills in `ChatWorkbenchSurface`.
+- [x] **5.5 Verification Suite**: Expanded `HeylookTests` to 19/19 passing tests (`0.082s`).
+
+---
+
+## Phase 6: Full-Package Metal Compilation & Live Checkpoint Benchmarking (Next Session)
+
+- [ ] **6.1 Full Native Xcode/Metal Build (`./scripts/build_native.sh`)**: Resolve and compile remote `mlx-swift`, `mlx-swift-lm`, `coreai-models`, `argmax-oss-swift`, `hummingbird`, and `swift-transformers` with `HEYLOOK_FULL_NATIVE=1` + `default.metallib` shader bundle.
+- [ ] **6.2 Live `MLXSwiftProvider` & `GGUFSubprocessProvider` Token Streaming Smoke**: Run end-to-end streaming inference against resident M2 Ultra checkpoints (`Qwen3.5`, `Gemma-4`, and GGUF MTP drafters) and verify live `tok/s`, APC prefix reuse, and speculative acceptance telemetry.
+- [ ] **6.3 Live `NativeMLXEmbeddingGemma2` Hybrid ANE + MLX Media Indexing**: Index a sample folder of images, PDFs, audio, and video using `EmbeddingGemma2VisionANE.mlmodelc` + `EmbeddingGemma2AudioANE.mlmodelc` + MLX text decoder and verify Matryoshka `768d`..`128d` retrieval.

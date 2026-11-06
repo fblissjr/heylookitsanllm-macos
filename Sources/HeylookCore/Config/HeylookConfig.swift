@@ -426,6 +426,21 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return (nil, nil)
     }
 
+    /// Loads vendor sampling defaults (`temperature`, `top_p`, `top_k`) from `generation_config.json`
+    /// in a model directory (`engine-contract.md` §Sampling).
+    public static func loadVendorSampling(in candidateDir: URL) -> SamplerSettings? {
+        guard let json = loadJSONDictionary(at: candidateDir.appendingPathComponent("generation_config.json")) else {
+            return nil
+        }
+        let temp = (json["temperature"] as? NSNumber)?.doubleValue
+        let topP = (json["top_p"] as? NSNumber)?.doubleValue
+        let topK = (json["top_k"] as? NSNumber)?.intValue
+        guard temp != nil || topP != nil || topK != nil else {
+            return nil
+        }
+        return SamplerSettings(temperature: temp, topP: topP, topK: topK)
+    }
+
     /// Discovers a `mmproj*.gguf` multimodal vision projector in `candidateDir` or its parent repo directory.
     public static func discoverMMProj(in candidateDir: URL) -> String? {
         let fm = FileManager.default

@@ -224,14 +224,110 @@ public actor HeylookRouter {
                         generateRequest: genReq
                     )
                 }
+                if segments.count == 4 && segments[3] == "prompt" && method.uppercased() == "POST" {
+                    struct PromptResponse: Encodable {
+                        let conversation_id: String
+                        let prompt: String
+                        let message_count: Int
+                    }
+                    let conv = try store.getConversation(id: convID)
+                    let msgs = try store.listMessages(conversationID: convID)
+                    var lines: [String] = []
+                    if let sys = conv?.systemPrompt, !sys.isEmpty {
+                        lines.append("<|im_start|>system\n\(sys)<|im_end|>")
+                    }
+                    for m in msgs {
+                        lines.append("<|im_start|>\(m.role)\n\(m.content)<|im_end|>")
+                    }
+                    lines.append("<|im_start|>assistant")
+                    let rendered = lines.joined(separator: "\n")
+                    return try .json(
+                        PromptResponse(
+                            conversation_id: convID,
+                            prompt: rendered,
+                            message_count: msgs.count
+                        )
+                    )
+                }
                 if segments.count == 5 && segments[3] == "generate" && segments[4] == "reasoning-end" && method.uppercased() == "POST" {
                     let ack = await registry.requestReasoningEnd(forConversationID: convID)
                     return try .json(["acknowledged": ack])
                 }
             }
 
+            if segments.count == 4 && segments[0] == "v1" && segments[1] == "models" && segments[3] == "image-plan" && method.uppercased() == "POST" {
+                let modelID = segments[2]
+                guard let desc = await scheduler.modelDescription(for: modelID) else {
+                    throw ComputeSchedulerError.modelNotFound(modelID)
+                }
+                guard desc.isLoaded else {
+                    return .error(status: 409, type: "invalid_request_error", message: "Model '\(modelID)' is not loaded; image-plan requires a resident model.")
+                }
+                struct ImagePlanResponse: Encodable {
+                    let model: String
+                    let tokens_per_image: Int
+                }
+                return try .json(ImagePlanResponse(model: modelID, tokens_per_image: 280))
+            }
+
             if segments.count >= 4 && segments[0] == "v1" && segments[1] == "admin" && segments[2] == "models" {
                 let modelID = segments[3]
+                if segments.count == 5 && segments[4] == "chat-template" {
+                    guard let existing = await scheduler.modelDescription(for: modelID) else {
+                        throw ComputeSchedulerError.modelNotFound(modelID)
+                    }
+                    let dirURL = URL(fileURLWithPath: existing.modelPath)
+                    let overrideURL = dirURL.appendingPathComponent("chat_template.heylook.jinja")
+                    let vendorURL = dirURL.appendingPathComponent("chat_template.jinja")
+                    struct ChatTemplateResponse: Encodable {
+                        let model: String
+                        let source: String
+                        let has_override: Bool
+                        let template: String
+                    }
+                    switch method.uppercased() {
+                    case "GET":
+                        let hasOverride = FileManager.default.fileExists(atPath: overrideURL.path)
+                        let templateText = (try? String(contentsOf: hasOverride ? overrideURL : vendorURL, encoding: .utf8)) ?? ""
+                        let source = hasOverride ? "chat_template.heylook.jinja" : existing.templateSource.value
+                        return try .json(
+                            ChatTemplateResponse(
+                                model: modelID,
+                                source: source,
+                                has_override: hasOverride,
+                                template: templateText
+                            )
+                        )
+                    case "PUT":
+                        let templateText: String
+                        if let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                           let t = json["template"] as? String {
+                            templateText = t
+                        } else {
+                            templateText = String(decoding: body, as: UTF8.self)
+                        }
+                        try templateText.write(to: overrideURL, atomically: true, encoding: .utf8)
+                        return try .json(
+                            ChatTemplateResponse(
+                                model: modelID,
+                                source: "chat_template.heylook.jinja",
+                                has_override: true,
+                                template: templateText
+                            )
+                        )
+                    case "DELETE":
+                        if FileManager.default.fileExists(atPath: overrideURL.path) {
+                            try? FileManager.default.removeItem(at: overrideURL)
+                        }
+                        let reverted = HeylookConfig.resolveGGUFTemplate(in: dirURL, sidecar: nil)
+                        return try .json([
+                            "model": modelID,
+                            "source": reverted.source.value
+                        ])
+                    default:
+                        break
+                    }
+                }
                 if segments.count == 4 && method.uppercased() == "GET" {
                     guard let desc = await scheduler.modelDescription(for: modelID) else {
                         throw ComputeSchedulerError.modelNotFound(modelID)

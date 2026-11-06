@@ -444,9 +444,12 @@ public final class HeylookWorkbenchViewModel {
 
     public var currentResolvedSamplers: SamplerCascade.ResolvedSampling {
         let activePreset = presets.first(where: { $0.name == selectedPresetName })?.settings
+        var vendorSettings: SamplerSettings?
         var modelSidecarSettings: SamplerSettings?
         if let desc = activeModelDescription {
-            let sidecarURL = URL(fileURLWithPath: desc.modelPath).appendingPathComponent("model.heylook.toml")
+            let modelDirURL = URL(fileURLWithPath: desc.modelPath)
+            vendorSettings = HeylookConfig.loadVendorSampling(in: modelDirURL)
+            let sidecarURL = modelDirURL.appendingPathComponent("model.heylook.toml")
             if let text = try? String(contentsOf: sidecarURL, encoding: .utf8) {
                 modelSidecarSettings = ModelSidecarConfig.parseTOML(text).sampling
             }
@@ -461,6 +464,7 @@ public final class HeylookWorkbenchViewModel {
             thinkingBudget: userOverriddenSamplerKeys.contains("thinking_budget") ? thinkingBudgetOverride : nil
         )
         return SamplerCascade.resolve(
+            vendor: vendorSettings,
             modelSidecar: modelSidecarSettings,
             preset: activePreset,
             request: requestOverlay
@@ -550,6 +554,7 @@ public final class HeylookWorkbenchViewModel {
                 MessagesRequest.MessageTurn(
                     role: msg.role,
                     content: msg.content,
+                    thinking: msg.thinking,
                     attachments: idx == lastIdx ? latestAttachments : []
                 )
             }
@@ -1376,6 +1381,12 @@ struct ChatWorkbenchSurface: View {
                                         Text(att.mediaType)
                                             .font(.caption2.monospaced())
                                             .foregroundStyle(.secondary)
+                                        Text("~\(att.estimatedTokens) tok")
+                                            .font(.caption2.monospaced().weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 2)
+                                            .background(Color.secondary.opacity(0.12), in: Capsule())
                                         Button {
                                             viewModel.removeChatAttachment(id: att.id)
                                         } label: {

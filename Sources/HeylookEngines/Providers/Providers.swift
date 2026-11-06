@@ -1092,8 +1092,13 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             wireMessages.append(["role": "system", "content": sys])
         }
         for turn in request.messages {
+            var msgDict: [String: Any] = ["role": turn.role]
+            if let thinking = turn.thinking, !thinking.isEmpty {
+                msgDict["reasoning_content"] = thinking
+            }
             if turn.attachments.isEmpty {
-                wireMessages.append(["role": turn.role, "content": turn.content])
+                msgDict["content"] = turn.content
+                wireMessages.append(msgDict)
             } else {
                 var parts: [[String: Any]] = []
                 for att in turn.attachments {
@@ -1121,10 +1126,8 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                         "text": turn.content
                     ])
                 }
-                wireMessages.append([
-                    "role": turn.role,
-                    "content": parts
-                ])
+                msgDict["content"] = parts
+                wireMessages.append(msgDict)
             }
         }
         return wireMessages

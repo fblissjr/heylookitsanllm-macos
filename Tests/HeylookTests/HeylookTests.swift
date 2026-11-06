@@ -982,4 +982,152 @@ struct HeylookTests {
         let unloadedDesc = try JSONDecoder().decode(EngineDescription.self, from: unloadResp.body)
         #expect(unloadedDesc.isLoaded == false)
     }
+
+    @Test("Vendor generation_config.json sampling layer, multi-turn reasoning_content forwarding, chat_template.heylook.jinja routes, and /image-plan")
+    func testVendorSamplingReasoningContentAndTemplateRoutes() async throws {
+        let rootDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase5_\(UUID().uuidString)", isDirectory: true)
+        let modelDir = rootDir.appendingPathComponent("Qwen3.5-Vendor-MLX", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        // 1. Vendor generation_config.json sampling layer (builtin < vendor < modelSidecar < preset < request)
+        let genCfgJSON = """
+        {
+          "temperature": 0.6,
+          "top_p": 0.92,
+          "top_k": 30
+        }
+        """
+        try genCfgJSON.write(
+            to: modelDir.appendingPathComponent("generation_config.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let vendorSamplers = try #require(HeylookConfig.loadVendorSampling(in: modelDir))
+        #expect(vendorSamplers.temperature == 0.6)
+        #expect(vendorSamplers.topP == 0.92)
+        #expect(vendorSamplers.topK == 30)
+
+        let resolvedVendor = SamplerCascade.resolve(
+            vendor: vendorSamplers,
+            modelSidecar: SamplerSettings(topP: 0.85),
+            preset: nil,
+            request: nil
+        )
+        #expect(resolvedVendor.effective.temperature == 0.6)
+        #expect(resolvedVendor.provenanceByField[.temperature] == .derived)
+        #expect(resolvedVendor.effective.topP == 0.85)
+        #expect(resolvedVendor.provenanceByField[.topP] == .configured)
+        #expect(resolvedVendor.effective.topK == 30)
+        #expect(resolvedVendor.provenanceByField[.topK] == .derived)
+
+        // 2. Multi-turn reasoning_content forwarding to llama-server
+        let multiTurnReq = MessagesRequest(
+            model: "qwen3.5-gguf",
+            messages: [
+                MessagesRequest.MessageTurn(role: "user", content: "What is 6 * 7?"),
+                MessagesRequest.MessageTurn(
+                    role: "assistant",
+                    content: "42.",
+                    thinking: "Multiply 6 by 7 to get 42."
+                ),
+                MessagesRequest.MessageTurn(role: "user", content: "Double it.")
+            ]
+        )
+        let openAIMsgs = GGUFSubprocessProvider.buildOpenAIChatMessages(from: multiTurnReq)
+        #expect(openAIMsgs.count == 3)
+        #expect((openAIMsgs[1]["role"] as? String) == "assistant")
+        #expect((openAIMsgs[1]["content"] as? String) == "42.")
+        #expect((openAIMsgs[1]["reasoning_content"] as? String) == "Multiply 6 by 7 to get 42.")
+
+        // 3. chat_template.heylook.jinja GET/PUT/DELETE without mutating vendor chat_template.jinja
+        let vendorTemplateURL = modelDir.appendingPathComponent("chat_template.jinja")
+        try "VENDOR_TEMPLATE".write(to: vendorTemplateURL, atomically: true, encoding: .utf8)
+
+        let dbURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase5_db_\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: dbURL) }
+        let store = try SQLiteStore(databaseURL: dbURL)
+        let scheduler = ComputeScheduler()
+        let desc = EngineDescription(
+            modelID: "qwen3.5-vendor-mlx",
+            provider: .mlx,
+            modelPath: modelDir.path,
+            architecture: ProvenanceField(value: "qwen3_5", provenance: .derived),
+            quantization: ProvenanceField(value: "8bit", provenance: .derived),
+            computePlacement: ProvenanceField(value: .mlxGPU, provenance: .derived),
+            contextSize: ProvenanceField(value: 32768, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: true, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived),
+            templateSource: ProvenanceField(value: "chat_template.jinja", provenance: .derived)
+        )
+        await scheduler.register(provider: MLXSwiftProvider(description: desc), description: desc)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        let putResp = await router.handle(
+            method: "PUT",
+            path: "/v1/admin/models/qwen3.5-vendor-mlx/chat-template",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONSerialization.data(withJSONObject: ["template": "OPERATOR_OVERRIDE_TEMPLATE"])
+        )
+        #expect(putResp.status == 200)
+        let overrideURL = modelDir.appendingPathComponent("chat_template.heylook.jinja")
+        #expect(FileManager.default.fileExists(atPath: overrideURL.path))
+        #expect(try String(contentsOf: vendorTemplateURL, encoding: .utf8) == "VENDOR_TEMPLATE")
+
+        let getResp = await router.handle(
+            method: "GET",
+            path: "/v1/admin/models/qwen3.5-vendor-mlx/chat-template",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        let getJSON = try JSONSerialization.jsonObject(with: getResp.body) as? [String: Any]
+        #expect((getJSON?["has_override"] as? Bool) == true)
+        #expect((getJSON?["source"] as? String) == "chat_template.heylook.jinja")
+        #expect((getJSON?["template"] as? String) == "OPERATOR_OVERRIDE_TEMPLATE")
+
+        let delResp = await router.handle(
+            method: "DELETE",
+            path: "/v1/admin/models/qwen3.5-vendor-mlx/chat-template",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(delResp.status == 200)
+        #expect(!FileManager.default.fileExists(atPath: overrideURL.path))
+        #expect(try String(contentsOf: vendorTemplateURL, encoding: .utf8) == "VENDOR_TEMPLATE")
+
+        // 4. POST /v1/models/{id}/image-plan (409 when unloaded, 200 when loaded) & POST /v1/conversations/{id}/prompt
+        let unloadedPlanResp = await router.handle(
+            method: "POST",
+            path: "/v1/models/qwen3.5-vendor-mlx/image-plan",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(unloadedPlanResp.status == 409)
+
+        _ = await router.handle(
+            method: "POST",
+            path: "/v1/admin/models/qwen3.5-vendor-mlx/load",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        let loadedPlanResp = await router.handle(
+            method: "POST",
+            path: "/v1/models/qwen3.5-vendor-mlx/image-plan",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(loadedPlanResp.status == 200)
+        let planJSON = try JSONSerialization.jsonObject(with: loadedPlanResp.body) as? [String: Any]
+        #expect((planJSON?["tokens_per_image"] as? Int) == 280)
+
+        let conv = ConversationRecord(id: "conv_p5", title: "Prompt Inspector Test", defaultModelID: "qwen3.5-vendor-mlx")
+        try store.upsertConversation(conv)
+        _ = try store.appendMessage(MessageRecord(conversationID: "conv_p5", position: 0, role: "user", content: "Inspect prompt"))
+        let promptResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_p5/prompt",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(promptResp.status == 200)
+        let promptJSON = try JSONSerialization.jsonObject(with: promptResp.body) as? [String: Any]
+        #expect((promptJSON?["message_count"] as? Int) == 1)
+    }
 }
