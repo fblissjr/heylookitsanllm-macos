@@ -393,4 +393,172 @@ struct HeylookTests {
         #expect(persisted.first?.role == "user")
         #expect(persisted.last?.role == "assistant")
     }
+
+    @Test("PrefixCacheTracker reports cold, reused, system_changed, and history_diverged cache outcomes")
+    func testPrefixCacheTrackerOutcomes() {
+        var tracker = PrefixCacheTracker()
+        let u1 = MessagesRequest.MessageTurn(role: "user", content: "Explain Apple Silicon unified memory bandwidth.")
+        let a1 = MessagesRequest.MessageTurn(role: "assistant", content: "M2 Ultra delivers 800 GB/s across CPU, GPU, and ANE.")
+        let u2 = MessagesRequest.MessageTurn(role: "user", content: "How does ANE co-residency avoid GPU eviction?")
+
+        // Turn 1: Cold cache miss
+        let r1 = tracker.evaluate(system: "You are a systems architect.", messages: [u1])
+        #expect(r1.outcome == .miss)
+        #expect(r1.cause == "cold")
+        #expect(r1.cachedTokens == 0)
+        #expect(r1.processedTokens == r1.promptTokens)
+        tracker.recordAssistantReply(a1.content)
+
+        // Turn 2: Prefix reuse across [u1, a1] + system prompt
+        let r2 = tracker.evaluate(system: "You are a systems architect.", messages: [u1, a1, u2])
+        #expect(r2.outcome == .reused)
+        #expect(r2.cause == nil)
+        #expect(r2.cachedTokens > 0)
+        #expect(r2.processedTokens < r2.promptTokens)
+
+        // Turn 3: System prompt changed -> system_changed miss
+        let r3 = tracker.evaluate(system: "Different system prompt.", messages: [u1, a1, u2])
+        #expect(r3.outcome == .miss)
+        #expect(r3.cause == "system_changed")
+        #expect(r3.cachedTokens == 0)
+
+        // Turn 4: Branch edit on Turn 1 -> history_diverged miss
+        let u1Edited = MessagesRequest.MessageTurn(role: "user", content: "Completely different opening question.")
+        let r4 = tracker.evaluate(system: "Different system prompt.", messages: [u1Edited, a1, u2])
+        #expect(r4.outcome == .miss)
+        #expect(r4.cause == "history_diverged")
+        #expect(r4.cachedTokens == 0)
+    }
+
+    @Test("CoreAIBundleManifest inspects .aimodel metadata.json and CoreAIProvider emits SpeculativeReport")
+    func testCoreAIBundleManifestAndSpeculativeTelemetry() async throws {
+        let fm = FileManager.default
+        let bundleDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("qwen3_ane_\(UUID().uuidString).aimodel", isDirectory: true)
+        try fm.createDirectory(at: bundleDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: bundleDir) }
+
+        let metaJSON = """
+        {
+          "name": "Qwen3-4B-ANE",
+          "kind": "vlm",
+          "vocabSize": 151936,
+          "maxContextLength": 16384,
+          "prefillChunkSize": 128,
+          "components": {
+            "main": {},
+            "vision": {},
+            "drafter": {}
+          }
+        }
+        """
+        try metaJSON.write(to: bundleDir.appendingPathComponent("metadata.json"), atomically: true, encoding: .utf8)
+
+        let manifest = try CoreAIBundleManifest.inspect(at: bundleDir)
+        #expect(manifest.name == "Qwen3-4B-ANE")
+        #expect(manifest.kind == "vlm")
+        #expect(manifest.maxContextLength == 16384)
+        #expect(manifest.prefillChunkSize == 128)
+        #expect(manifest.hasVisionComponent)
+        #expect(manifest.hasDrafterComponent)
+
+        let baseDesc = EngineDescription(
+            modelID: "qwen3-4b-ane",
+            provider: .coreai,
+            modelPath: bundleDir.path,
+            architecture: ProvenanceField(value: "qwen3", provenance: .derived),
+            quantization: ProvenanceField(value: "w4a16", provenance: .derived),
+            computePlacement: ProvenanceField(value: .ane, provenance: .configured, computePlacement: .ane),
+            contextSize: ProvenanceField(value: 8192, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: false, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+        let provider = CoreAIProvider(description: baseDesc)
+        let enriched = await provider.describe()
+        #expect(enriched.contextSize.value == 16384)
+        #expect(enriched.contextSize.provenance == .observed)
+        #expect(enriched.supportsVision.value == true)
+
+        let registry = RequestRegistry()
+        let stream = await provider.generate(
+            requestID: "req-coreai-spec",
+            request: MessagesRequest(
+                model: "qwen3-4b-ane",
+                messages: [MessagesRequest.MessageTurn(role: "user", content: "Test speculative ANE")]
+            ),
+            effectiveSampling: .builtinDefaults,
+            registry: registry
+        )
+        var lastChunk: GenerationChunk?
+        for try await chunk in stream {
+            lastChunk = chunk
+        }
+        #expect(lastChunk?.speculativeReport != nil)
+        #expect((lastChunk?.speculativeReport?.acceptedTokens ?? 0) > 0)
+    }
+
+    @Test("GGUFSubprocessProvider builds llama-server CLI flags, sanitizes child env, and parses SSE timings")
+    func testGGUFSubprocessProviderContract() {
+        let cfg = GGUFSpawnConfig(
+            binaryPath: "/usr/local/bin/llama-server",
+            modelPath: "/models/Qwen3-30B-A3B-Q4_K_M.gguf",
+            host: "127.0.0.1",
+            port: 18081,
+            nGPULayers: 999,
+            ctxSize: 32768,
+            flashAttention: true,
+            batchSize: 2048,
+            ubatchSize: 512,
+            mmprojPath: "/models/mmproj-f16.gguf",
+            imageMaxTokens: 1024,
+            chatTemplateFile: "/models/template.jinja",
+            draftModelPath: "/models/Qwen3-0.6B-Q8_0.gguf",
+            specType: "ngram-mod",
+            specDraftMax: 16,
+            specDraftPMin: 0.75,
+            cacheTypeK: "q8_0",
+            cacheTypeV: "q8_0",
+            cacheRAMMiB: 4096
+        )
+
+        let args = GGUFSubprocessProvider.buildLlamaServerArgs(config: cfg)
+        #expect(args.contains("-np"))
+        #expect(args.contains("--no-webui"))
+        #expect(args.contains("--mmproj"))
+        #expect(args.contains("--image-max-tokens"))
+        #expect(args.contains("-md"))
+        #expect(args.contains("--spec-type"))
+        #expect(args.contains("-ctk"))
+        #expect(args.contains("-ctv"))
+        #expect(args.contains("-cram"))
+        #expect(args.suffix(2) == ["-lv", "4"])
+
+        let sanitizedEnv = GGUFSubprocessProvider.childEnvironment(from: [
+            "PATH": "/usr/bin",
+            "LLAMA_ARG_LOG_FILE": "/tmp/should_be_removed.log",
+        ])
+        #expect(sanitizedEnv["LLAMA_ARG_LOG_FILE"] == nil)
+        #expect(sanitizedEnv["GGML_METAL_RESIDENCY_KEEP_ALIVE_S"] == "604800")
+
+        let sseLine = """
+        data: {"choices":[{"delta":{"content":"Hello","reasoning_content":"step 1"},"finish_reason":null}],"timings":{"prompt_n":48,"cache_n":32,"predicted_n":12,"prompt_per_second":820.5,"predicted_per_second":94.2,"draft_n":16,"draft_n_accepted":14}}
+        """
+        let delta = GGUFSubprocessProvider.parseOpenAISSEDataLine(sseLine)
+        #expect(delta?.content == "Hello")
+        #expect(delta?.reasoningContent == "step 1")
+        #expect(delta?.promptTokens == 48)
+        #expect(delta?.cachedTokens == 32)
+        #expect(delta?.predictedTokens == 12)
+        #expect(delta?.draftedTokens == 16)
+        #expect(delta?.acceptedTokens == 14)
+        #expect(GGUFSubprocessProvider.parseOpenAISSEDataLine("data: [DONE]") == nil)
+
+        // Verify RemoteHeylookProvider SSE frame parser
+        let remoteDelta = RemoteHeylookProvider.parseAnthropicSSEEvent(
+            event: "content_block_delta",
+            data: #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Native Swift"}}"#
+        )
+        #expect(remoteDelta?.textDelta == "Native Swift")
+    }
 }
