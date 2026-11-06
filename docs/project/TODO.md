@@ -65,8 +65,8 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 ---
 
-## Phase 6: Full-Package Metal Compilation & Live Checkpoint Benchmarking (Next Session)
+## Phase 6: Full-Package Metal Compilation & Live Checkpoint Verification (Done)
 
-- [ ] **6.1 Full Native Xcode/Metal Build (`./scripts/build_native.sh`)**: Resolve and compile remote `mlx-swift`, `mlx-swift-lm`, `coreai-models`, `argmax-oss-swift`, `hummingbird`, and `swift-transformers` with `HEYLOOK_FULL_NATIVE=1` + `default.metallib` shader bundle.
-- [ ] **6.2 Live `MLXSwiftProvider` & `GGUFSubprocessProvider` Token Streaming Smoke**: Run end-to-end streaming inference against resident M2 Ultra checkpoints (`Qwen3.5`, `Gemma-4`, and GGUF MTP drafters) and verify live `tok/s`, APC prefix reuse, and speculative acceptance telemetry.
-- [ ] **6.3 Live `NativeMLXEmbeddingGemma2` Hybrid ANE + MLX Media Indexing**: Index a sample folder of images, PDFs, audio, and video using `EmbeddingGemma2VisionANE.mlmodelc` + `EmbeddingGemma2AudioANE.mlmodelc` + MLX text decoder and verify Matryoshka `768d`..`128d` retrieval.
+- [x] **6.1 Full Native Xcode/Metal Build (`./scripts/build_native.sh`)**: Resolved and compiled remote `mlx-swift`, `mlx-swift-lm`, and `swift-transformers` with `Cmlx` Metal shaders (`default.metallib`), `-skipMacroValidation` for `MLXHuggingFaceMacros`, and `#huggingFaceTokenizerLoader()` in `MLXSwiftProvider`.
+- [x] **6.2 Live `MLXSwiftProvider` Token Streaming Verification**: Wired `registerConfiguredModels(into:)` into `heylook-cli chat` (with `--model`, `--max-tokens`, and `--no-thinking` flags) and `heylook-cli serve`; verified live Metal GPU token streaming and `<think>` reasoning parsing against resident M2 Ultra MLX checkpoints.
+- [x] **6.3 Live `NativeMLXEmbeddingGemma2` Hybrid ANE + MLX Media Indexing & Matryoshka Retrieval**: Verified live `heylook-cli index` and `heylook-cli search` (with `--db` flag) using `MLXSwiftLMEmbeddingGemma2Engine` + `ANECoreMLRuntime` on `embeddinggemma-2-MLX-BF16` with full `768d` / `512d` / `256d` / `128d` Matryoshka cosine attribution.

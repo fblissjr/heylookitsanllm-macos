@@ -261,7 +261,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
     private let descriptor: NativeMLXEmbeddingGemma2.CheckpointDescriptor
     private let customTokenizerLoader: (any TokenizerLoader)?
     private let aneRuntime: ANECoreMLRuntime
-    private var cachedTokenizer: (any Tokenizer)?
+    private var cachedTokenizer: (any MLXLMCommon.Tokenizer)?
     private var cachedEmbedder: MLXVLM.EmbeddingGemma2Embedding?
 
     public init(
@@ -297,7 +297,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         )
     }
 
-    private func resolvedTokenizer() async throws -> any Tokenizer {
+    private func resolvedTokenizer() async throws -> any MLXLMCommon.Tokenizer {
         if let cachedTokenizer {
             return cachedTokenizer
         }
@@ -553,13 +553,14 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                     for: videoURL,
                     sampling: .fps
                 )
-                let frameTimes = WindowPlanner.pickFPS(
+                let frameIndices = WindowPlanner.pickFPS(
                     times: candidates.times,
                     lo: 0,
                     hi: min(candidates.duration, descriptor.maxWindowSeconds),
                     fps: descriptor.videoFPS,
                     maxFrames: descriptor.videoMaxFrames
                 )
+                let frameTimes = frameIndices.map { candidates.times[$0] }
                 let decoded = try await ArtifactProcessor.decodeVideoFrames(
                     for: videoURL,
                     at: frameTimes

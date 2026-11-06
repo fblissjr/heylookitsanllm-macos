@@ -2,10 +2,16 @@ import Foundation
 import HeylookCore
 import HeylookEmbeddings
 
+#if canImport(CoreImage)
+import CoreImage
+#endif
+
 #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM)
 import MLX
+import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
+import Tokenizers
 #endif
 
 #if canImport(MLXVLM)
@@ -411,7 +417,7 @@ public actor MLXSwiftProvider: InferenceProvider {
     private var descriptionState: EngineDescription
     private var prefixCache = PrefixCacheTracker()
 
-    #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM)
+    #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
     private var loadedContainer: ModelContainer?
     #endif
 
@@ -434,7 +440,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         let cacheReport = prefixCache.evaluate(system: request.system, messages: request.messages)
         let enableThinking = (effectiveSampling.thinking ?? true) && descriptionState.supportsThinking.value
 
-        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM)
+        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
         if Self.hasSafetensorsWeights(at: descriptionState.modelPath) {
             return generateWithMLXContainer(
                 requestID: requestID,
@@ -480,22 +486,22 @@ public actor MLXSwiftProvider: InferenceProvider {
         return items.contains { $0.pathExtension.lowercased() == "safetensors" }
     }
 
-    #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM)
+    #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
     private func ensureContainerLoaded() async throws -> ModelContainer {
         if let loadedContainer {
             return loadedContainer
         }
         let dirURL = URL(fileURLWithPath: descriptionState.modelPath)
-        let config = ModelConfiguration(directory: dirURL)
+        let loader: any TokenizerLoader = #huggingFaceTokenizerLoader()
         let container: ModelContainer
         #if canImport(MLXVLM)
         if descriptionState.supportsVision.value {
-            container = try await VLMModelFactory.shared.loadContainer(configuration: config)
+            container = try await VLMModelFactory.shared.loadContainer(from: dirURL, using: loader)
         } else {
-            container = try await LLMModelFactory.shared.loadContainer(configuration: config)
+            container = try await LLMModelFactory.shared.loadContainer(from: dirURL, using: loader)
         }
         #else
-        container = try await LLMModelFactory.shared.loadContainer(configuration: config)
+        container = try await LLMModelFactory.shared.loadContainer(from: dirURL, using: loader)
         #endif
         loadedContainer = container
         descriptionState.isLoaded = true
@@ -526,26 +532,23 @@ public actor MLXSwiftProvider: InferenceProvider {
                         case "system":
                             chatMessages.append(.system(m.content))
                         default:
-                            chatMessages.append(.user(m.content))
+                            var turnImages: [UserInput.Image] = []
+                            #if canImport(CoreImage)
+                            for att in m.attachments where att.kind == "image" {
+                                if let data = Data(base64Encoded: att.dataBase64),
+                                   let ciImg = CIImage(data: data) {
+                                    turnImages.append(.ciImage(ciImg))
+                                }
+                            }
+                            #endif
+                            chatMessages.append(.user(m.content, images: turnImages))
                         }
                     }
 
                     var additionalContext: [String: any Sendable] = [:]
                     additionalContext["enable_thinking"] = enableThinking
-                    var userImages: [UserInput.Image] = []
-                    #if canImport(CoreImage)
-                    for turn in request.messages {
-                        for att in turn.attachments where att.kind == "image" {
-                            if let data = Data(base64Encoded: att.dataBase64),
-                               let ciImg = CIImage(data: data) {
-                                userImages.append(.ciImage(ciImg))
-                            }
-                        }
-                    }
-                    #endif
                     let userInput = UserInput(
                         chat: chatMessages,
-                        images: userImages,
                         additionalContext: additionalContext
                     )
                     let lmInput = try await container.prepare(input: userInput)
@@ -557,7 +560,11 @@ public actor MLXSwiftProvider: InferenceProvider {
                         repetitionContextSize: effectiveSampling.repetitionContextSize ?? 64
                     )
 
-                    var reasoningParser = ReasoningParser(startsInThinking: false)
+                    let archLower = descriptionState.architecture.value.lowercased()
+                    let startsInThinking = enableThinking && (
+                        archLower.contains("qwen3") || archLower.contains("deepseek")
+                    )
+                    var reasoningParser = ReasoningParser(startsInThinking: startsInThinking)
                     var stripSpecials = StripSpecials()
                     var generatedCount = 0
                     var promptTokens = cacheReport.promptTokens

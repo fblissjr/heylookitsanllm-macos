@@ -31,8 +31,7 @@ struct HeylookCLI {
             let port = args.dropFirst().first.flatMap { UInt16($0) } ?? 8000
             await runServe(port: port)
         case "chat":
-            let prompt = args.dropFirst().joined(separator: " ")
-            await runChat(prompt: prompt.isEmpty ? "Explain unified memory + ANE co-residency in two sentences." : prompt)
+            await runChat(args: Array(args.dropFirst()))
         default:
             printUsage()
         }
@@ -46,6 +45,13 @@ struct HeylookCLI {
         return appSupport
             .appendingPathComponent("heylook", isDirectory: true)
             .appendingPathComponent("vectors.sqlite")
+    }
+
+    static func resolveVectorStoreURL(from args: [String] = []) -> URL {
+        if let dbIdx = args.firstIndex(of: "--db"), dbIdx + 1 < args.count {
+            return URL(fileURLWithPath: args[dbIdx + 1])
+        }
+        return defaultVectorStoreURL()
     }
 
     static func parseComputeOptions(from args: [String]) -> ModelComputeOptions {
@@ -147,7 +153,7 @@ struct HeylookCLI {
         let computeOptions = parseComputeOptions(from: args)
 
         do {
-            let store = try VectorStore(databaseURL: defaultVectorStoreURL())
+            let store = try VectorStore(databaseURL: resolveVectorStoreURL(from: args))
             let engine = makeEmbeddingEngine(computeOptions: computeOptions)
             let coordinator = IndexCoordinator(engine: engine, store: store)
             let url = URL(fileURLWithPath: targetPath)
@@ -198,7 +204,7 @@ struct HeylookCLI {
         let computeOptions = parseComputeOptions(from: args)
 
         do {
-            let storeURL = defaultVectorStoreURL()
+            let storeURL = resolveVectorStoreURL(from: args)
             let store = try VectorStore(databaseURL: storeURL)
             let engine = makeEmbeddingEngine(computeOptions: computeOptions)
             let coordinator = IndexCoordinator(engine: engine, store: store)
@@ -267,40 +273,130 @@ struct HeylookCLI {
         }
     }
 
-    static func runChat(prompt: String) async {
+    static func registerConfiguredModels(into scheduler: ComputeScheduler) async -> [EngineDescription] {
+        let cfg = HeylookConfig.loadDefault()
+        let folderURLs = cfg.scanFolders.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+        let found = HeylookConfig.discoverModels(in: folderURLs)
+        for desc in found {
+            let provider: any InferenceProvider
+            switch desc.provider {
+            case .mlx:
+                provider = MLXSwiftProvider(description: desc)
+            case .gguf:
+                provider = GGUFSubprocessProvider(description: desc)
+            case .coreai:
+                provider = CoreAIProvider(description: desc)
+            case .remote:
+                provider = RemoteHeylookProvider(baseURL: URL(string: "http://127.0.0.1:8000")!, description: desc)
+            }
+            await scheduler.register(provider: provider, description: desc)
+        }
+        return found
+    }
+
+    static func runChat(args: [String]) async {
+        var requestedModel: String? = ProcessInfo.processInfo.environment["HEYLOOK_MODEL"]
+        var maxTokens = 256
+        var thinking = true
+        var promptParts: [String] = []
+
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
+            if arg == "--model" || arg == "-m", i + 1 < args.count {
+                requestedModel = args[i + 1]
+                i += 2
+            } else if arg == "--max-tokens", i + 1 < args.count, let n = Int(args[i + 1]) {
+                maxTokens = n
+                i += 2
+            } else if arg == "--no-thinking" {
+                thinking = false
+                i += 1
+            } else if arg == "--thinking" {
+                thinking = true
+                i += 1
+            } else {
+                promptParts.append(arg)
+                i += 1
+            }
+        }
+        let prompt = promptParts.isEmpty
+            ? "Explain unified memory + ANE co-residency in two sentences."
+            : promptParts.joined(separator: " ")
+
         let scheduler = ComputeScheduler()
-        let desc = EngineDescription(
-            modelID: "gemma-4-26b-a4b-it-mlx",
-            provider: .mlx,
-            modelPath: "models/mlx/Gemma-4-26B-A4B-IT",
-            architecture: ProvenanceField(value: "gemma4", provenance: .derived),
-            quantization: ProvenanceField(value: "4bit", provenance: .derived),
-            computePlacement: ProvenanceField(value: .hybridANEGPU, provenance: .configured, computePlacement: .hybridANEGPU),
-            contextSize: ProvenanceField(value: 32768, provenance: .derived),
-            flashAttention: ProvenanceField(value: true, provenance: .derived),
-            supportsVision: ProvenanceField(value: true, provenance: .derived),
-            supportsThinking: ProvenanceField(value: true, provenance: .derived)
-        )
-        let provider = MLXSwiftProvider(description: desc)
-        await scheduler.register(provider: provider, description: desc)
+        let discovered = await registerConfiguredModels(into: scheduler)
+        let cfg = HeylookConfig.loadDefault()
+
+        let selectedDesc: EngineDescription
+        if let reqModel = requestedModel, !reqModel.isEmpty {
+            if let exact = discovered.first(where: { $0.modelID.caseInsensitiveCompare(reqModel) == .orderedSame })
+                ?? discovered.first(where: { $0.modelID.localizedCaseInsensitiveContains(reqModel) }) {
+                selectedDesc = exact
+            } else if FileManager.default.fileExists(atPath: reqModel) {
+                let dirURL = URL(fileURLWithPath: reqModel)
+                let adHoc = HeylookConfig.discoverModels(in: [dirURL]).first ?? EngineDescription(
+                    modelID: dirURL.lastPathComponent,
+                    provider: .mlx,
+                    modelPath: dirURL.path,
+                    architecture: ProvenanceField(value: "mlx", provenance: .derived),
+                    quantization: ProvenanceField(value: "bf16", provenance: .derived),
+                    computePlacement: ProvenanceField(value: .mlxGPU, provenance: .derived),
+                    contextSize: ProvenanceField(value: 32768, provenance: .derived),
+                    flashAttention: ProvenanceField(value: true, provenance: .derived),
+                    supportsVision: ProvenanceField(value: false, provenance: .derived),
+                    supportsThinking: ProvenanceField(value: true, provenance: .derived)
+                )
+                let prov = MLXSwiftProvider(description: adHoc)
+                await scheduler.register(provider: prov, description: adHoc)
+                selectedDesc = adHoc
+            } else {
+                print("Model '\(reqModel)' not found among \(discovered.count) discovered models.")
+                return
+            }
+        } else if let defMatch = discovered.first(where: { $0.modelID == cfg.defaultModel })
+            ?? discovered.first(where: { $0.provider == .mlx })
+            ?? discovered.first {
+            selectedDesc = defMatch
+        } else {
+            let fallback = EngineDescription(
+                modelID: "gemma-4-26b-a4b-it-mlx",
+                provider: .mlx,
+                modelPath: "models/mlx/Gemma-4-26B-A4B-IT",
+                architecture: ProvenanceField(value: "gemma4", provenance: .derived),
+                quantization: ProvenanceField(value: "4bit", provenance: .derived),
+                computePlacement: ProvenanceField(value: .hybridANEGPU, provenance: .configured, computePlacement: .hybridANEGPU),
+                contextSize: ProvenanceField(value: 32768, provenance: .derived),
+                flashAttention: ProvenanceField(value: true, provenance: .derived),
+                supportsVision: ProvenanceField(value: true, provenance: .derived),
+                supportsThinking: ProvenanceField(value: true, provenance: .derived)
+            )
+            await scheduler.register(provider: MLXSwiftProvider(description: fallback), description: fallback)
+            selectedDesc = fallback
+        }
+
         let registry = RequestRegistry()
         let req = MessagesRequest(
-            model: desc.modelID,
+            model: selectedDesc.modelID,
             messages: [MessagesRequest.MessageTurn(role: "user", content: prompt)],
-            maxTokens: 256,
+            maxTokens: maxTokens,
             stream: true,
-            thinking: true
+            thinking: thinking
         )
-        let resolved = SamplerCascade.resolve(request: req.samplerOverlay)
+        let vendorSamplers = HeylookConfig.loadVendorSampling(in: URL(fileURLWithPath: selectedDesc.modelPath))
+        let resolved = SamplerCascade.resolve(vendor: vendorSamplers, request: req.samplerOverlay)
         do {
-            try await scheduler.withComputeLease(for: desc.modelID) {
+            let provider = try await scheduler.provider(for: selectedDesc.modelID)
+            let lastChunk = try await scheduler.withComputeLease(for: selectedDesc.modelID) { () throws -> GenerationChunk? in
                 let stream = await provider.generate(
                     requestID: "cli_req_1",
                     request: req,
                     effectiveSampling: resolved.effective,
                     registry: registry
                 )
+                var latest: GenerationChunk?
                 for try await chunk in stream {
+                    latest = chunk
                     if !chunk.thinking.isEmpty {
                         FileHandle.standardError.write(Data(chunk.thinking.utf8))
                     }
@@ -309,6 +405,21 @@ struct HeylookCLI {
                     }
                 }
                 print("")
+                return latest
+            }
+            if let final = lastChunk {
+                let cacheStr = final.cacheReport.map { "\($0.outcome.rawValue)(\($0.cachedTokens)/\($0.promptTokens))" } ?? "n/a"
+                let statsLine = String(
+                    format: "[%@] %.1f tok/s | prompt: %d tok (%.1f tok/s) | output: %d tok | cache: %@ | compute: %@\n",
+                    selectedDesc.modelID,
+                    final.generationTPS,
+                    final.promptTokens,
+                    final.promptTPS,
+                    final.tokenCount,
+                    cacheStr,
+                    final.activeComputePlacement.label
+                )
+                FileHandle.standardError.write(Data(statsLine.utf8))
             }
         } catch {
             print("Chat error: \(error)")
@@ -320,10 +431,11 @@ struct HeylookCLI {
             let dbURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("heylook_serve.sqlite")
             let store = try SQLiteStore(databaseURL: dbURL)
             let scheduler = ComputeScheduler()
+            let registered = await registerConfiguredModels(into: scheduler)
             let router = HeylookRouter(store: store, scheduler: scheduler)
             let server = HeylookHTTPServer(router: router, host: "127.0.0.1", port: port)
             try await server.start()
-            print("Heylook Server listening on http://127.0.0.1:\(port)")
+            print("Heylook Server listening on http://127.0.0.1:\(port) (\(registered.count) models registered)")
             try await Task.sleep(for: .seconds(3600 * 24))
         } catch {
             print("Server error: \(error)")

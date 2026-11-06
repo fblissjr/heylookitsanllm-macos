@@ -3,8 +3,15 @@ import Foundation
 import PackageDescription
 
 let env = ProcessInfo.processInfo.environment
+let isXcode = (env["__CFBundleIdentifier"]?.contains("Xcode") == true)
+    || (env["XPC_SERVICE_NAME"]?.contains("Xcode") == true)
 let enableAll = env["HEYLOOK_ENABLE_ALL_PACKAGES"] == "1"
-let enableNativeMLX = enableAll || env["HEYLOOK_ENABLE_NATIVE_MLX"] == "1"
+let enableNativeMLX: Bool = {
+    if env["HEYLOOK_DISABLE_NATIVE_MLX"] == "1" || env["HEYLOOK_ENABLE_NATIVE_MLX"] == "0" {
+        return false
+    }
+    return enableAll || env["HEYLOOK_ENABLE_NATIVE_MLX"] == "1" || isXcode
+}()
 let enableCoreAI = enableAll || env["HEYLOOK_ENABLE_COREAI"] == "1"
 let enableArgmax = enableAll || env["HEYLOOK_ENABLE_ARGMAX"] == "1"
 let enableHummingbird = enableAll || env["HEYLOOK_ENABLE_HUMMINGBIRD"] == "1"
