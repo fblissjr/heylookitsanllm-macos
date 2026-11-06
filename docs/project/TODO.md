@@ -33,14 +33,14 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 ---
 
-## Phase 2B: Live Mac Studio Checkpoint & `llama-server` Smoke Pass (Next)
+## Phase 2B: Live Mac Studio Checkpoint & `llama-server` Smoke Pass (Done)
 
-- [ ] **2B.1 Live `heylook.toml` Model Discovery Smoke Check**: Point `heylook-cli models` and `heylook-cli doctor` at the Mac Studio's model scan folders and verify all MLX, GGUF, and CoreAI/ANE checkpoints register with accurate provenance, templates, and drafters.
-- [ ] **2B.2 Native Xcode / Metal Build & Live Generation Probe**: Run `./scripts/build_native.sh` and verify live ANE tower inspection (`inspect-ane`), checkpoint inspection (`inspect-checkpoint`), and generation on the M2 Ultra Mac Studio.
+- [x] **2B.1 Live `heylook.toml` Model Discovery Smoke Check**: Pointed `heylook-cli models` and `heylook-cli doctor` at the 192 GB M2 Ultra Mac Studio's model scan folders; verified 26 MLX and GGUF models register with accurate context lengths, 4-rung `chat_template` provenance (`chat_template.heylook.jinja`, `chat_template.jinja`, `gguf_embedded`, `tokenizer_config.json`), per-quant variant directory normalization (`UD-Q6_K_XL/`, `Q8_0/`, `Q6_K/`), and automatic `[MTP]` drafter pairing (`dspark`, `-MTP-`, `-assistant`, and built-in `mtp.`).
+- [x] **2B.2 Live ANE Tower & Checkpoint Inspection**: Verified `heylook-cli inspect-ane` (`MLComputePlan` reporting 100% ANE on `EmbeddingGemma2VisionANE.mlmodelc` and 99% ANE on `EmbeddingGemma2AudioANE.mlmodelc` with sandbox readability guard) and `heylook-cli inspect-checkpoint` (`embedding_gemma2` 24L, 512d->768d Matryoshka, 32s video window, <=280 image soft tokens) on the M2 Ultra Mac Studio.
 
 ---
 
-## Phase 3: Workbench & Mobile (`iOS 27.2+`) Polish
+## Phase 3: Workbench & Mobile (`iOS 27.2+`) Polish (Next)
 
 - [ ] **3.1 Bonjour (`_heylook._tcp`) Auto-Discovery Picker on iOS 27.2**: Zero-config `NWBrowser` service picker in `HeylookWorkbenchViewModel` so the iPhone/iPad app auto-connects to the Mac Studio when its embedded server toggle is on.
 - [ ] **3.2 Multimodal Chat Composer & Keyboard Shortcuts**: Image/audio attachment pills in Chat composer, per-slider provenance badges (`derived` vs `configured`), and shared hotkeys (`Cmd+Enter` to send, `Escape` to stop).

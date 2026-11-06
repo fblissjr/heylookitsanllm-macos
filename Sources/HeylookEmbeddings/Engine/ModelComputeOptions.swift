@@ -264,13 +264,26 @@ public enum ANETowerInspector {
         }
     }
 
+    /// Verifies that a `.mlmodelc` or `.mlpackage` bundle exists AND its inner payload file
+    /// (`coremldata.bin` or `Manifest.json`) can actually be opened for reading, preventing
+    /// CoreML's C++ `IArchive` reader from throwing an uncaught `std::ios_base::failure` abort.
+    public static func isReadableCoreMLBundle(at url: URL) -> Bool {
+        let sentinel = url.pathExtension.lowercased() == "mlpackage"
+            ? url.appendingPathComponent("Manifest.json")
+            : url.appendingPathComponent("coremldata.bin")
+        guard let handle = try? FileHandle(forReadingFrom: sentinel) else {
+            return false
+        }
+        try? handle.close()
+        return true
+    }
+
     /// Locates `.mlmodelc` or `.mlpackage` for a given `EmbeddingComponent` inside `checkpointDirectory`
     /// (or its `coreml/` or `ane/` subdirectory).
     public static func locateBundle(
         for component: EmbeddingComponent,
         in checkpointDirectory: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL
     ) -> URL? {
-        let fm = FileManager.default
         let baseName = component.coreMLBundleName
         let candidateDirs = [
             checkpointDirectory,
@@ -280,7 +293,7 @@ public enum ANETowerInspector {
         for dir in candidateDirs {
             for ext in ["mlmodelc", "mlpackage"] {
                 let url = dir.appendingPathComponent("\(baseName).\(ext)")
-                if fm.fileExists(atPath: url.path) {
+                if isReadableCoreMLBundle(at: url) {
                     return url
                 }
             }

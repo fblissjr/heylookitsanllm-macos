@@ -372,9 +372,22 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             if let rootDrafter = findDrafterFile(in: candidateDir) {
                 return (rootDrafter, nil)
             }
-            let mtpSubdir = candidateDir.appendingPathComponent("MTP", isDirectory: true)
-            if let subDrafter = findDrafterFile(in: mtpSubdir) {
-                return (subDrafter, nil)
+            for subName in ["MTP", "dspark", "dflash", "eagle3"] {
+                let subDir = candidateDir.appendingPathComponent(subName, isDirectory: true)
+                if let subDrafter = findDrafterFile(in: subDir) {
+                    return (subDrafter, nil)
+                }
+            }
+            // Also check parent directory if candidateDir is a per-quant variant subfolder
+            let parentDir = candidateDir.deletingLastPathComponent()
+            if let parentDrafter = findDrafterFile(in: parentDir) {
+                return (parentDrafter, nil)
+            }
+            for subName in ["MTP", "dspark", "dflash", "eagle3"] {
+                let parentSub = parentDir.appendingPathComponent(subName, isDirectory: true)
+                if let subDrafter = findDrafterFile(in: parentSub) {
+                    return (subDrafter, nil)
+                }
             }
         } else if provider == .mlx {
             let indexURL = candidateDir.appendingPathComponent("model.safetensors.index.json")
@@ -383,8 +396,54 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                text.contains("\"mtp.") || text.contains(".mtp.") {
                 return (candidateDir.standardizedFileURL.path, "draft-mtp")
             }
+            // Check for nested or sibling *-mtp / *-MTP-* drafter folder
+            if let children = try? fm.contentsOfDirectory(at: candidateDir, includingPropertiesForKeys: [.isDirectoryKey]) {
+                if let nestedMTP = children.first(where: { $0.lastPathComponent.lowercased().contains("-mtp") }) {
+                    return (nestedMTP.standardizedFileURL.path, "draft-mtp")
+                }
+            }
+            let parentDir = candidateDir.deletingLastPathComponent()
+            let baseLower = candidateDir.lastPathComponent.lowercased()
+            if let siblings = try? fm.contentsOfDirectory(at: parentDir, includingPropertiesForKeys: [.isDirectoryKey]) {
+                for sibling in siblings.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                    let sLower = sibling.lastPathComponent.lowercased()
+                    guard sLower != baseLower else { continue }
+                    let stem: String?
+                    if let range = sLower.range(of: "-mtp") {
+                        stem = String(sLower[..<range.lowerBound])
+                    } else if sLower.hasSuffix("-assistant") {
+                        stem = String(sLower.dropLast("-assistant".count))
+                    } else {
+                        stem = nil
+                    }
+                    if let stem, !stem.isEmpty, baseLower.hasPrefix(stem) {
+                        let spec = sLower.hasSuffix("-assistant") ? "draft-model" : "draft-mtp"
+                        return (sibling.standardizedFileURL.path, spec)
+                    }
+                }
+            }
         }
         return (nil, nil)
+    }
+
+    /// Strips `-00001-of-00005` shard suffix and `.gguf` extension from a GGUF filename (`model_importer.py`).
+    public static func ggufModelStem(from filename: String) -> String {
+        var name = filename
+        if name.lowercased().hasSuffix(".gguf") {
+            name = String(name.dropLast(5))
+        }
+        if let range = name.range(of: #"-\d{5}-of-\d{5}$"#, options: .regularExpression) {
+            name.removeSubrange(range)
+        }
+        return name
+    }
+
+    /// True when `candidateDir` is a per-quant variant subfolder (e.g. `UD-Q6_K_XL/` or `Q8_0/`)
+    /// whose name is a proper substring of the primary `.gguf` file stem (`model_importer.py`).
+    public static func isGGUFVariantDirectory(_ candidateDir: URL, primaryGGUFFile: URL) -> Bool {
+        let stem = ggufModelStem(from: primaryGGUFFile.lastPathComponent).lowercased()
+        let dirName = candidateDir.lastPathComponent.lowercased()
+        return dirName != stem && stem.contains(dirName)
     }
 
     /// Scans `scanFolders` for `.safetensors` (MLX), `.aimodel` / `.mlmodelc` (CoreAI / ANE),
@@ -392,6 +451,7 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
     public static func discoverModels(in folders: [URL]) -> [EngineDescription] {
         var discovered: [EngineDescription] = []
         let fm = FileManager.default
+        let drafterSubfolderNames: Set<String> = ["mtp", "dspark", "dflash", "eagle3", "coreml", "ane"]
 
         for root in folders {
             let expandedRoot = URL(fileURLWithPath: (root.path as NSString).expandingTildeInPath).resolvingSymlinksInPath()
@@ -408,23 +468,39 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 let candidateDir: URL
                 let detectedProvider: EngineProviderKind
                 let defaultPlacement: ComputePlacement
+                var primaryGGUFURL: URL?
 
                 if ext == "safetensors" {
                     candidateDir = url.deletingLastPathComponent()
                     detectedProvider = .mlx
                     defaultPlacement = .mlxGPU
                 } else if ext == "aimodel" || ext == "mlmodelc" {
-                    candidateDir = url.deletingLastPathComponent()
+                    let parentDir = url.deletingLastPathComponent()
+                    // Skip auxiliary ANE tower sub-bundles inside an MLX checkpoint's `coreml/` or `ane/` folder
+                    if drafterSubfolderNames.contains(parentDir.lastPathComponent.lowercased()) {
+                        continue
+                    }
+                    candidateDir = parentDir
                     detectedProvider = .coreai
                     defaultPlacement = .ane
                 } else if ext == "gguf" {
                     let lowerName = url.lastPathComponent.lowercased()
-                    if lowerName.hasPrefix("mmproj") || lowerName.hasPrefix("mtp-") || lowerName.hasPrefix("dflash-") {
+                    if lowerName.contains("mmproj")
+                        || lowerName.hasPrefix("mtp-")
+                        || lowerName.hasPrefix("dflash-")
+                        || lowerName.hasPrefix("dspark-")
+                        || lowerName.hasPrefix("eagle3-")
+                        || lowerName.contains("-dspark-") {
                         continue
                     }
-                    candidateDir = url.deletingLastPathComponent()
+                    let parentDir = url.deletingLastPathComponent()
+                    if drafterSubfolderNames.contains(parentDir.lastPathComponent.lowercased()) {
+                        continue
+                    }
+                    candidateDir = parentDir
                     detectedProvider = .gguf
                     defaultPlacement = .ggufSubprocess
+                    primaryGGUFURL = url
                 } else {
                     continue
                 }
@@ -433,16 +509,46 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 guard !visitedDirs.contains(dirPath) else { continue }
                 visitedDirs.insert(dirPath)
 
-                let sidecarURL = candidateDir.appendingPathComponent("model.heylook.toml")
+                let dirLower = candidateDir.lastPathComponent.lowercased()
+                if drafterSubfolderNames.contains(dirLower)
+                    || dirLower.hasSuffix("-assistant")
+                    || dirLower.hasSuffix("-mtp")
+                    || dirLower.contains("-mtp-")
+                    || dirLower.contains("-dspark-") {
+                    continue
+                }
+
+                let configJSON = loadJSONDictionary(at: candidateDir.appendingPathComponent("config.json"))
+                if let archs = configJSON?["architectures"] as? [String],
+                   archs.contains(where: { $0.localizedCaseInsensitiveContains("assistant") || $0 == "D1Model" }) {
+                    continue
+                }
+                if configJSON?["mtp_num_layers"] != nil && configJSON?["num_hidden_layers"] == nil {
+                    continue
+                }
+
+                let isVariant = (detectedProvider == .gguf && primaryGGUFURL != nil)
+                    ? isGGUFVariantDirectory(candidateDir, primaryGGUFFile: primaryGGUFURL!)
+                    : false
+                let repoRootDir = isVariant ? candidateDir.deletingLastPathComponent() : candidateDir
+
+                let sidecarURL = fm.fileExists(atPath: candidateDir.appendingPathComponent("model.heylook.toml").path)
+                    ? candidateDir.appendingPathComponent("model.heylook.toml")
+                    : repoRootDir.appendingPathComponent("model.heylook.toml")
                 let sidecar: ModelSidecarConfig? = (try? String(contentsOf: sidecarURL, encoding: .utf8))
                     .map { ModelSidecarConfig.parseTOML($0) }
 
-                let modelID = sidecar?.id ?? candidateDir.lastPathComponent
+                let defaultID: String
+                if isVariant, let primaryGGUFURL {
+                    defaultID = ggufModelStem(from: primaryGGUFURL.lastPathComponent)
+                } else {
+                    defaultID = candidateDir.lastPathComponent
+                }
+                let modelID = sidecar?.id ?? defaultID
                 let provider = sidecar?.provider ?? detectedProvider
                 let placementValue = sidecar?.computePlacement ?? defaultPlacement
                 let placementProv: ProvenanceSource = sidecar?.computePlacement != nil ? .configured : .derived
 
-                let configJSON = loadJSONDictionary(at: candidateDir.appendingPathComponent("config.json"))
                 let archString = (configJSON?["model_type"] as? String)
                     ?? (configJSON?["architectures"] as? [String])?.first
                     ?? provider.rawValue
@@ -457,7 +563,12 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
 
                 let templateField: ProvenanceField<String>
                 if provider == .gguf {
-                    templateField = resolveGGUFTemplate(in: candidateDir, sidecar: sidecar).source
+                    let ownTemplate = resolveGGUFTemplate(in: candidateDir, sidecar: sidecar)
+                    if ownTemplate.source.value == "gguf_embedded" && isVariant {
+                        templateField = resolveGGUFTemplate(in: repoRootDir, sidecar: sidecar).source
+                    } else {
+                        templateField = ownTemplate.source
+                    }
                 } else {
                     templateField = ProvenanceField(value: "tokenizer_config.json", provenance: .derived, effect: .reload)
                 }

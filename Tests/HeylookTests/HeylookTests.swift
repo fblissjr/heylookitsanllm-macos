@@ -716,4 +716,66 @@ struct HeylookTests {
         let expectedBytes = HeylookHTTPServer.expectedTotalBytes(for: rawHTTP)
         #expect(expectedBytes == rawHTTP.count - 5 + 1024)
     }
+
+    @Test("HeylookConfig discovers per-quant GGUF variant folders, pairs sibling MTP/assistant drafters, and skips auxiliary CoreML sub-bundles")
+    func testDiscoverModelsVariantFoldersAndDrafterFiltering() throws {
+        let rootDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase2b_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        // 1. Per-quant GGUF variant folder with parent template + parent dspark drafter
+        let ggufRepo = rootDir.appendingPathComponent("unsloth_Qwen3.8-Flash-Next-GGUF", isDirectory: true)
+        let quantDir = ggufRepo.appendingPathComponent("UD-Q6_K_XL", isDirectory: true)
+        let dsparkDir = ggufRepo.appendingPathComponent("dspark", isDirectory: true)
+        try FileManager.default.createDirectory(at: quantDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dsparkDir, withIntermediateDirectories: true)
+
+        let shardFile = quantDir.appendingPathComponent("Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00003.gguf")
+        try Data("GGUF".utf8).write(to: shardFile)
+        try "{{ messages }}".write(
+            to: ggufRepo.appendingPathComponent("chat_template.heylook.jinja"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let dsparkFile = dsparkDir.appendingPathComponent("dspark-qwen3.8-draft.gguf")
+        try Data("GGUF".utf8).write(to: dsparkFile)
+
+        #expect(HeylookConfig.ggufModelStem(from: shardFile.lastPathComponent) == "Qwen3.8-Flash-Next-UD-Q6_K_XL")
+        #expect(HeylookConfig.isGGUFVariantDirectory(quantDir, primaryGGUFFile: shardFile) == true)
+
+        // 2. MLX target folder + sibling -assistant drafter folder + nested coreml/ ANE bundle
+        let mlxTarget = rootDir.appendingPathComponent("meta-models_Muse-Glimmer-30B-8bit", isDirectory: true)
+        let mlxAssistant = rootDir.appendingPathComponent("meta-models_Muse-Glimmer-30B-assistant", isDirectory: true)
+        let nestedCoreML = mlxTarget
+            .appendingPathComponent("coreml", isDirectory: true)
+            .appendingPathComponent("VisionTower.mlmodelc", isDirectory: true)
+        try FileManager.default.createDirectory(at: mlxTarget, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: mlxAssistant, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: nestedCoreML, withIntermediateDirectories: true)
+
+        try Data("weights".utf8).write(to: mlxTarget.appendingPathComponent("model.safetensors"))
+        try Data("weights".utf8).write(to: mlxAssistant.appendingPathComponent("model.safetensors"))
+
+        // Verify ANETowerInspector.isReadableCoreMLBundle sentinel check
+        #expect(ANETowerInspector.isReadableCoreMLBundle(at: nestedCoreML) == false)
+        try Data("coreml".utf8).write(to: nestedCoreML.appendingPathComponent("coremldata.bin"))
+        #expect(ANETowerInspector.isReadableCoreMLBundle(at: nestedCoreML) == true)
+
+        let discovered = HeylookConfig.discoverModels(in: [rootDir])
+        let ids = discovered.map(\.modelID)
+        #expect(ids == ["meta-models_Muse-Glimmer-30B-8bit", "Qwen3.8-Flash-Next-UD-Q6_K_XL"])
+
+        let ggufModel = try #require(discovered.first(where: { $0.modelID == "Qwen3.8-Flash-Next-UD-Q6_K_XL" }))
+        #expect(ggufModel.templateSource.value == "chat_template.heylook.jinja")
+        #expect(ggufModel.tags.contains("mtp"))
+        let ggufDrafter = HeylookConfig.discoverDrafter(in: quantDir, provider: .gguf, sidecar: nil)
+        #expect(ggufDrafter.draftModelPath == dsparkFile.standardizedFileURL.path)
+
+        let mlxModel = try #require(discovered.first(where: { $0.modelID == "meta-models_Muse-Glimmer-30B-8bit" }))
+        #expect(mlxModel.tags.contains("mtp"))
+        let mlxDrafter = HeylookConfig.discoverDrafter(in: mlxTarget, provider: .mlx, sidecar: nil)
+        #expect(mlxDrafter.draftModelPath == mlxAssistant.standardizedFileURL.path)
+        #expect(mlxDrafter.specType == "draft-model")
+    }
 }
