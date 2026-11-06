@@ -32,9 +32,12 @@ Operating guide for `heylookitsanllm-macos` — a native Swift 6.2 multiplatform
   - `swift run heylook-cli doctor`
   - `swift run heylook-cli status`
   - `swift run heylook-cli models`
-  - `swift run heylook-cli inspect-ane <dir>`
+  - `swift run heylook-cli index <path> [--sampling fps|content|off] [--audio-from-video] [--compute all_gpu|hybrid_ane|all_ane]`
+  - `swift run heylook-cli search "<query>" [--dim 768|512|256|128] [--task query|similarity|code|qa|fact] [--media <path>]`
+  - `swift run heylook-cli watched`
+  - `swift run heylook-cli inspect-ane [dir]`
+  - `swift run heylook-cli inspect-checkpoint [dir]`
   - `swift run heylook-cli chat "<prompt>"`
-  - `swift run heylook-cli search "<query>"`
   - `swift run heylook-cli serve 8000`
 - Full native Xcode build (compiling Metal shaders `default.metallib` + linking `mlx-swift`, `mlx-swift-lm`, `coreai-models`, and `argmax-oss-swift` via remote GitHub packages):
   - `./scripts/build_native.sh build`

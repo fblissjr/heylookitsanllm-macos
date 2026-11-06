@@ -144,6 +144,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("SwiftUI"),
                 .linkedFramework("AVKit"),
+                .linkedFramework("UniformTypeIdentifiers"),
                 .linkedFramework("AppKit", .when(platforms: [.macOS])),
             ]
         ),

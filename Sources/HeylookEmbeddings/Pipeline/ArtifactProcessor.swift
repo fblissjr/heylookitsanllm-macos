@@ -380,15 +380,18 @@ public enum ArtifactProcessor {
     }
 
     public static func decodeMonoPCM(for url: URL, sampleRate: Int = audioSampleRate) async throws -> [Float] {
-        let audioFile = try AVAudioFile(forReading: url)
-        let frameCount = AVAudioFrameCount(audioFile.length)
-        guard frameCount > 0,
-              let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount)
-        else { return [] }
-        try audioFile.read(into: buffer)
-        guard let channelData = buffer.floatChannelData else { return [] }
-        let nFrames = Int(buffer.frameLength)
-        return Array(UnsafeBufferPointer(start: channelData[0], count: nFrames))
+        if let audioFile = try? AVAudioFile(forReading: url) {
+            let frameCount = AVAudioFrameCount(audioFile.length)
+            if frameCount > 0,
+               let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount) {
+                try audioFile.read(into: buffer)
+                if let channelData = buffer.floatChannelData {
+                    let nFrames = Int(buffer.frameLength)
+                    return Array(UnsafeBufferPointer(start: channelData[0], count: nFrames))
+                }
+            }
+        }
+        return []
     }
 
     public static func encodeWAV16Mono(samples: [Float], sampleRate: Int = audioSampleRate) -> Data {

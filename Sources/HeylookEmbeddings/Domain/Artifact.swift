@@ -2,13 +2,37 @@ import Foundation
 
 /// Extensible modality taxonomy supporting media (image, video, audio) and
 /// non-media artifacts (text, code, document) under one indexing contract.
-public enum ArtifactKind: String, Codable, CaseIterable, Sendable {
+public enum ArtifactKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case image
     case video
     case audio
     case text
     case code
     case document
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .image: return "Images"
+        case .video: return "Video"
+        case .audio: return "Audio"
+        case .text: return "Text Notes"
+        case .code: return "Source Code"
+        case .document: return "Documents (PDF)"
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .image: return "photo"
+        case .video: return "film"
+        case .audio: return "waveform"
+        case .text: return "doc.plaintext"
+        case .code: return "chevron.left.forwardslash.chevron.right"
+        case .document: return "doc.richtext"
+        }
+    }
 
     public var isMedia: Bool {
         switch self {
@@ -208,7 +232,8 @@ public struct ScoredFeatureSummary: Sendable, Hashable {
 
 /// A deduplicated search result grouped by parent `Artifact`.
 public struct SearchHit: Identifiable, Hashable, Sendable {
-    public struct SpanMatch: Sendable, Hashable {
+    public struct SpanMatch: Identifiable, Sendable, Hashable {
+        public var id: String { chunkID }
         public let chunkID: String
         public let span: ArtifactSpan
         public let score: Float
@@ -342,6 +367,11 @@ public struct SearchHit: Identifiable, Hashable, Sendable {
 
     public var bestMatch: SpanMatch? {
         spanMatches.first
+    }
+
+    public var hasMultiFeatureMatch: Bool {
+        spanMatches.contains(where: { $0.isAudioTrackChunk })
+            && spanMatches.contains(where: { !$0.isAudioTrackChunk })
     }
 
     public var bestScoredFeature: ScoredFeatureSummary {

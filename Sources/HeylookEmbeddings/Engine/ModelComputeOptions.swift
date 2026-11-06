@@ -2,21 +2,84 @@ import Accelerate
 import CoreGraphics
 import CoreML
 import Foundation
+import ImageIO
 
-/// Individual sub-towers of `EmbeddingGemma 2` that can be assigned independently
-/// to Metal GPU (`MLX`) or Apple Neural Engine (`CoreML`).
-public enum EmbeddingComponent: String, Codable, CaseIterable, Identifiable, Sendable {
-    case visionEncoder = "vision"
-    case audioEncoder = "audio"
-    case textBackbone = "text"
+/// Compute device target for an individual `EmbeddingGemma 2` tower, inspired by
+/// Argmax Playground / WhisperKit's per-encoder `ModelComputeOptions`.
+public enum TowerComputeUnit: String, Codable, CaseIterable, Sendable {
+    case mlxGPU = "mlx_gpu"
+    case cpuAndNeuralEngine = "ane"
+    case cpuAndGPU = "coreml_gpu"
+    case cpuOnly = "cpu"
+
+    public var label: String {
+        switch self {
+        case .mlxGPU: return "MLX GPU (Metal)"
+        case .cpuAndNeuralEngine: return "Neural Engine (ANE)"
+        case .cpuAndGPU: return "CoreML GPU"
+        case .cpuOnly: return "CPU Only"
+        }
+    }
+
+    public var shortBadge: String {
+        switch self {
+        case .mlxGPU: return "MLX GPU"
+        case .cpuAndNeuralEngine: return "ANE"
+        case .cpuAndGPU: return "CoreML GPU"
+        case .cpuOnly: return "CPU"
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .mlxGPU, .cpuAndGPU: return "gpu"
+        case .cpuAndNeuralEngine: return "brain.head.profile"
+        case .cpuOnly: return "cpu"
+        }
+    }
+
+    public var mlComputeUnits: MLComputeUnits {
+        switch self {
+        case .cpuAndNeuralEngine: return .cpuAndNeuralEngine
+        case .cpuAndGPU, .mlxGPU: return .cpuAndGPU
+        case .cpuOnly: return .cpuOnly
+        }
+    }
+}
+
+/// Individual sub-models inside multimodal `EmbeddingGemma 2` (`744.1M` total parameters)
+/// that can be independently routed to ANE, GPU, or CPU.
+public enum EmbeddingComponent: String, Codable, CaseIterable, Sendable, Identifiable {
+    case visionEncoder = "vision_tower"
+    case audioEncoder = "audio_tower"
+    case textBackbone = "language_model"
 
     public var id: String { rawValue }
 
     public var title: String {
         switch self {
-        case .visionEncoder: return "Vision Tower (SigLIP-400M)"
-        case .audioEncoder: return "Audio Tower (Conformer 16kHz)"
-        case .textBackbone: return "Text & Fusion Backbone (24L + PLE)"
+        case .visionEncoder: return "Vision Encoder"
+        case .audioEncoder: return "Audio Encoder"
+        case .textBackbone: return "Text & Fusion Backbone"
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .visionEncoder: return "eye"
+        case .audioEncoder: return "waveform"
+        case .textBackbone: return "text.word.spacing"
+        }
+    }
+
+    public var architectureSummary: String {
+        switch self {
+        case .visionEncoder:
+            return "Gemma4Vision 16L · d=768 · <=280/140 soft tokens"
+        case .audioEncoder:
+            return "Gemma4Audio Conformer 12L · d=1024 · 30s (750 tokens)"
+        case .textBackbone:
+            return "Gemma4Text 24L + PLE · d=512 -> 768d Matryoshka"
         }
     }
 
@@ -45,57 +108,25 @@ public enum EmbeddingComponent: String, Codable, CaseIterable, Identifiable, Sen
     }
 }
 
-/// Per-tower compute unit selection matching Argmax Playground (`WhisperKit` / `ModelComputeOptions`).
-public enum TowerComputeUnit: String, Codable, CaseIterable, Identifiable, Sendable {
-    case mlxGPU = "mlx_gpu"
-    case cpuAndNeuralEngine = "cpu_and_ne"
-    case cpuAndGPU = "cpu_and_gpu"
-    case cpuOnly = "cpu_only"
-
-    public var id: String { rawValue }
-
-    public var label: String {
-        switch self {
-        case .mlxGPU: return "MLX Metal GPU"
-        case .cpuAndNeuralEngine: return "Apple Neural Engine (ANE)"
-        case .cpuAndGPU: return "CoreML GPU + CPU"
-        case .cpuOnly: return "CPU Only"
-        }
-    }
-
-    public var mlComputeUnits: MLComputeUnits {
-        switch self {
-        case .mlxGPU, .cpuAndGPU:
-            return .cpuAndGPU
-        case .cpuAndNeuralEngine:
-            return .cpuAndNeuralEngine
-        case .cpuOnly:
-            return .cpuOnly
-        }
-    }
-}
-
-/// High-level compute placement preset across the 3 towers.
-public enum ComputePreset: String, Codable, CaseIterable, Identifiable, Sendable {
-    case allMLXGPU = "all_gpu"
-    case hybridANETowers = "hybrid_ane"
+/// High-level preset for `ModelComputeOptions`.
+public enum ComputePreset: String, Codable, CaseIterable, Sendable {
+    case allMLXGPU = "all_mlx_gpu"
+    case hybridANETowers = "hybrid_ane_towers"
     case allNeuralEngine = "all_ane"
     case custom = "custom"
 
-    public var id: String { rawValue }
-
     public var label: String {
         switch self {
-        case .allMLXGPU: return "All Metal GPU (MLX)"
-        case .hybridANETowers: return "Hybrid (Vision & Audio on ANE · Text on GPU)"
-        case .allNeuralEngine: return "100% Neural Engine (Vision · Audio · Text on ANE)"
+        case .allMLXGPU: return "All MLX GPU (Default)"
+        case .hybridANETowers: return "Hybrid (ANE Media + GPU Fusion)"
+        case .allNeuralEngine: return "100% Neural Engine (All ANE)"
         case .custom: return "Custom Per-Tower Split"
         }
     }
 }
 
-/// Argmax-style per-tower compute configuration (`Vision`, `Audio`, `Text`).
-public struct ModelComputeOptions: Codable, Sendable, Equatable {
+/// Per-component compute assignment for `EmbeddingGemma 2`, modeled after Argmax Playground / WhisperKit.
+public struct ModelComputeOptions: Codable, Sendable, Equatable, Hashable {
     public var visionEncoder: TowerComputeUnit
     public var audioEncoder: TowerComputeUnit
     public var textBackbone: TowerComputeUnit
@@ -116,17 +147,28 @@ public struct ModelComputeOptions: Codable, Sendable, Equatable {
         textBackbone: .mlxGPU
     )
 
+    /// Offloads the heavy Vision (`167.7M`) and Audio (`305.4M`) encoders to the Apple Neural Engine
+    /// while keeping the 24-layer dynamic-sequence multimodal fusion backbone (`271.0M`) on MLX GPU.
     public static let hybridANETowers = ModelComputeOptions(
         visionEncoder: .cpuAndNeuralEngine,
         audioEncoder: .cpuAndNeuralEngine,
         textBackbone: .mlxGPU
     )
 
+    /// Routes all three towers (`744.1M` params) to CoreML `.cpuAndNeuralEngine` using enumerated
+    /// shape buckets and FP16 pre-scaled RMSNorm (`alpha = 1/16`) for zero-GPU wired memory inference.
     public static let allNeuralEngine = ModelComputeOptions(
         visionEncoder: .cpuAndNeuralEngine,
         audioEncoder: .cpuAndNeuralEngine,
         textBackbone: .cpuAndNeuralEngine
     )
+
+    public var preset: ComputePreset {
+        if self == .allMLXGPU { return .allMLXGPU }
+        if self == .hybridANETowers { return .hybridANETowers }
+        if self == .allNeuralEngine { return .allNeuralEngine }
+        return .custom
+    }
 
     public subscript(component: EmbeddingComponent) -> TowerComputeUnit {
         get {
@@ -145,13 +187,6 @@ public struct ModelComputeOptions: Codable, Sendable, Equatable {
         }
     }
 
-    public var preset: ComputePreset {
-        if self == .allMLXGPU { return .allMLXGPU }
-        if self == .hybridANETowers { return .hybridANETowers }
-        if self == .allNeuralEngine { return .allNeuralEngine }
-        return .custom
-    }
-
     public var usesANE: Bool {
         visionEncoder == .cpuAndNeuralEngine
             || audioEncoder == .cpuAndNeuralEngine
@@ -159,9 +194,12 @@ public struct ModelComputeOptions: Codable, Sendable, Equatable {
     }
 
     public var isFullANE: Bool {
-        self == .allNeuralEngine
+        visionEncoder == .cpuAndNeuralEngine
+            && audioEncoder == .cpuAndNeuralEngine
+            && textBackbone == .cpuAndNeuralEngine
     }
 
+    /// Memory breakdown (in MB) across ANE, GPU, and CPU according to the selected tower assignment.
     public var memorySplitMB: (aneMB: Int, gpuMB: Int, cpuMB: Int) {
         var ane = 0
         var gpu = 0
@@ -178,122 +216,185 @@ public struct ModelComputeOptions: Codable, Sendable, Equatable {
     }
 
     public var shortSummaryBadge: String {
-        switch preset {
-        case .allMLXGPU: return "100% MLX GPU"
-        case .hybridANETowers: return "Hybrid ANE (Vision+Audio) + GPU (Text)"
-        case .allNeuralEngine: return "100% ANE (Vision · Audio · Text)"
-        case .custom:
-            return "V:\(visionEncoder.rawValue) A:\(audioEncoder.rawValue) T:\(textBackbone.rawValue)"
+        if isFullANE {
+            return "100% ANE (Vision · Audio · Text)"
         }
+        return "V:\(visionEncoder.shortBadge) · A:\(audioEncoder.shortBadge) · T:\(textBackbone.shortBadge)"
     }
 }
 
-/// Inspects `MLComputePlan` residency across ANE, GPU, and CPU for each exported CoreML tower.
+/// Inspects CoreML `.mlmodelc` / `.mlpackage` ANE bundles for `EmbeddingGemma 2` and reports
+/// operation residency across Neural Engine, GPU, and CPU via `MLComputePlan`.
 public enum ANETowerInspector {
     public struct ComponentComputeReport: Sendable, Equatable, Identifiable {
-        public var id: String { component.rawValue }
+        public var id: String { component.id }
         public let component: EmbeddingComponent
         public let assignedUnit: TowerComputeUnit
+        public let bundleURL: URL?
         public let isCompiledBundlePresent: Bool
         public let aneOperationCount: Int
         public let gpuOperationCount: Int
         public let cpuOperationCount: Int
+
+        public init(
+            component: EmbeddingComponent,
+            assignedUnit: TowerComputeUnit,
+            bundleURL: URL?,
+            isCompiledBundlePresent: Bool,
+            aneOperationCount: Int,
+            gpuOperationCount: Int,
+            cpuOperationCount: Int
+        ) {
+            self.component = component
+            self.assignedUnit = assignedUnit
+            self.bundleURL = bundleURL
+            self.isCompiledBundlePresent = isCompiledBundlePresent
+            self.aneOperationCount = aneOperationCount
+            self.gpuOperationCount = gpuOperationCount
+            self.cpuOperationCount = cpuOperationCount
+        }
 
         public var totalOperations: Int {
             aneOperationCount + gpuOperationCount + cpuOperationCount
         }
 
         public var aneResidencyFraction: Double {
-            guard totalOperations > 0 else {
-                return assignedUnit == .cpuAndNeuralEngine ? 1.0 : 0.0
-            }
+            guard totalOperations > 0 else { return 0 }
             return Double(aneOperationCount) / Double(totalOperations)
         }
     }
 
-    public static func statusSnapshot(
-        options: ModelComputeOptions,
-        checkpointDirectory: URL? = nil
-    ) -> [ComponentComputeReport] {
-        EmbeddingComponent.allCases.map { comp in
-            let unit = options[comp]
-            let bundlePresent: Bool
-            if let dir = checkpointDirectory {
-                bundlePresent = compiledBundleURL(for: comp, in: dir) != nil
-            } else {
-                bundlePresent = false
-            }
-            return ComponentComputeReport(
-                component: comp,
-                assignedUnit: unit,
-                isCompiledBundlePresent: bundlePresent,
-                aneOperationCount: unit == .cpuAndNeuralEngine ? 100 : 0,
-                gpuOperationCount: (unit == .mlxGPU || unit == .cpuAndGPU) ? 100 : 0,
-                cpuOperationCount: unit == .cpuOnly ? 100 : 0
-            )
-        }
-    }
-
-    public static func compiledBundleURL(for component: EmbeddingComponent, in checkpointDirectory: URL) -> URL? {
-        let coremlDir = checkpointDirectory.appendingPathComponent("coreml", isDirectory: true)
-        for ext in ["mlmodelc", "mlpackage"] {
-            let candidate = coremlDir.appendingPathComponent("\(component.coreMLBundleName).\(ext)")
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                return candidate
+    /// Locates `.mlmodelc` or `.mlpackage` for a given `EmbeddingComponent` inside `checkpointDirectory`
+    /// (or its `coreml/` or `ane/` subdirectory).
+    public static func locateBundle(
+        for component: EmbeddingComponent,
+        in checkpointDirectory: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL
+    ) -> URL? {
+        let fm = FileManager.default
+        let baseName = component.coreMLBundleName
+        let candidateDirs = [
+            checkpointDirectory,
+            checkpointDirectory.appendingPathComponent("coreml", isDirectory: true),
+            checkpointDirectory.appendingPathComponent("ane", isDirectory: true),
+        ]
+        for dir in candidateDirs {
+            for ext in ["mlmodelc", "mlpackage"] {
+                let url = dir.appendingPathComponent("\(baseName).\(ext)")
+                if fm.fileExists(atPath: url.path) {
+                    return url
+                }
             }
         }
         return nil
     }
 
+    /// Synchronously checks which CoreML ANE tower bundles exist on disk for `checkpointDirectory`.
+    public static func statusSnapshot(
+        options: ModelComputeOptions,
+        checkpointDirectory: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL
+    ) -> [ComponentComputeReport] {
+        EmbeddingComponent.allCases.map { comp in
+            let bundle = locateBundle(for: comp, in: checkpointDirectory)
+            return ComponentComputeReport(
+                component: comp,
+                assignedUnit: options[comp],
+                bundleURL: bundle,
+                isCompiledBundlePresent: bundle != nil,
+                aneOperationCount: 0,
+                gpuOperationCount: 0,
+                cpuOperationCount: 0
+            )
+        }
+    }
+
+    /// Inspects all three towers asynchronously using `MLComputePlan`.
+    public static func inspect(
+        checkpointDirectory: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
+        options: ModelComputeOptions = .allNeuralEngine
+    ) async -> [ComponentComputeReport] {
+        var reports = [ComponentComputeReport]()
+        for comp in EmbeddingComponent.allCases {
+            if let report = try? await inspectComputePlan(
+                for: comp,
+                assignedUnit: options[comp],
+                in: checkpointDirectory
+            ) {
+                reports.append(report)
+            } else {
+                let bundle = locateBundle(for: comp, in: checkpointDirectory)
+                reports.append(
+                    ComponentComputeReport(
+                        component: comp,
+                        assignedUnit: options[comp],
+                        bundleURL: bundle,
+                        isCompiledBundlePresent: bundle != nil,
+                        aneOperationCount: 0,
+                        gpuOperationCount: 0,
+                        cpuOperationCount: 0
+                    )
+                )
+            }
+        }
+        return reports
+    }
+
+    /// Uses `MLComputePlan` to inspect the hardware device assignment of every operation
+    /// in a compiled `.mlmodelc` bundle.
     public static func inspectComputePlan(
         for component: EmbeddingComponent,
-        assignedUnit: TowerComputeUnit,
-        in checkpointDirectory: URL
+        assignedUnit: TowerComputeUnit = .cpuAndNeuralEngine,
+        in checkpointDirectory: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL
     ) async throws -> ComponentComputeReport {
-        guard let url = compiledBundleURL(for: component, in: checkpointDirectory),
-              url.pathExtension == "mlmodelc"
-        else {
+        guard let bundleURL = locateBundle(for: component, in: checkpointDirectory) else {
             return ComponentComputeReport(
                 component: component,
                 assignedUnit: assignedUnit,
+                bundleURL: nil,
                 isCompiledBundlePresent: false,
                 aneOperationCount: 0,
                 gpuOperationCount: 0,
                 cpuOperationCount: 0
             )
         }
-        let cfg = MLModelConfiguration()
-        cfg.computeUnits = assignedUnit.mlComputeUnits
-        let plan = try await MLComputePlan.load(contentsOf: url, configuration: cfg)
-        guard case let .program(program) = plan.modelStructure,
-              let mainFn = program.functions["main"]
-        else {
-            return ComponentComputeReport(
-                component: component,
-                assignedUnit: assignedUnit,
-                isCompiledBundlePresent: true,
-                aneOperationCount: assignedUnit == .cpuAndNeuralEngine ? 1 : 0,
-                gpuOperationCount: assignedUnit == .cpuAndGPU ? 1 : 0,
-                cpuOperationCount: 0
-            )
+
+        let compiledURL: URL
+        if bundleURL.pathExtension == "mlpackage" {
+            compiledURL = try await MLModel.compileModel(at: bundleURL)
+        } else {
+            compiledURL = bundleURL
         }
+
+        let config = MLModelConfiguration()
+        config.computeUnits = assignedUnit.mlComputeUnits
+        let plan = try await MLComputePlan.load(contentsOf: compiledURL, configuration: config)
 
         var aneOps = 0
         var gpuOps = 0
         var cpuOps = 0
-        for op in mainFn.block.operations {
-            if let usage = plan.deviceUsage(for: op) {
-                switch usage.preferred {
-                case .neuralEngine: aneOps += 1
-                case .gpu: gpuOps += 1
-                case .cpu: cpuOps += 1
-                @unknown default: cpuOps += 1
+
+        if case let .program(program) = plan.modelStructure {
+            for (_, function) in program.functions {
+                for op in function.block.operations {
+                    if let usage = plan.deviceUsage(for: op) {
+                        switch usage.preferred {
+                        case .neuralEngine:
+                            aneOps += 1
+                        case .gpu:
+                            gpuOps += 1
+                        case .cpu:
+                            cpuOps += 1
+                        @unknown default:
+                            cpuOps += 1
+                        }
+                    }
                 }
             }
         }
+
         return ComponentComputeReport(
             component: component,
             assignedUnit: assignedUnit,
+            bundleURL: compiledURL,
             isCompiledBundlePresent: true,
             aneOperationCount: aneOps,
             gpuOperationCount: gpuOps,
@@ -302,122 +403,411 @@ public enum ANETowerInspector {
     }
 }
 
-/// Runtime actor that executes exported CoreML ANE towers (`EmbeddingGemma2VisionANE`,
-/// `EmbeddingGemma2AudioANE`, `EmbeddingGemma2TextANE`) and provides 16 kHz HTK log-mel
-/// and aspect-ratio-preserving image preprocessing.
+/// Executes exported CoreML `.mlmodelc` / `.mlpackage` towers (`VisionEncoder`, `AudioEncoder`,
+/// `TextBackbone`) on the user-selected `TowerComputeUnit` (`.cpuAndNeuralEngine`, `.cpuAndGPU`,
+/// or `.cpuOnly`), enabling both Hybrid (ANE media + MLX GPU fusion) and 100% ANE execution.
 public actor ANECoreMLRuntime {
-    public let checkpointDirectory: URL
+    public static let supportedVisionBuckets: Set<[Int]> = [
+        [480, 672],
+        [672, 480],
+        [528, 528],
+        [672, 960],
+        [960, 672],
+        [768, 768],
+    ]
+    public static let supportedTextSequenceBuckets: [Int] = [64, 320, 512, 768, 1024]
+    public static let audioMelFrames: Int = 2999
+    public static let audioMelBins: Int = 128
+    public static let hiddenSize: Int = 512
+    public static let embeddingScale: Float = 22.625 // Float(sqrt(512.0)) rounded to BF16
 
-    public init(checkpointDirectory: URL) {
+    private let checkpointDirectory: URL
+    private var loadedModels: [String: MLModel] = [:]
+    private var mappedTokenTable: Data?
+
+    public init(checkpointDirectory: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL) {
         self.checkpointDirectory = checkpointDirectory
     }
 
-    /// Computes 128-bin HTK log-mel spectrogram features from 16 kHz mono PCM samples
-    /// (`frame_length = 400` / 25ms, `hop_length = 160` / 10ms, `fft_length = 512`).
-    public static func computeAudioLogMel(
-        pcmSamples: [Float],
-        sampleRate: Int = 16_000,
-        numMelBins: Int = 128
-    ) -> (features: [Float], frameCount: Int)? {
-        let winLength = 400
-        let hopLength = 160
-        guard pcmSamples.count >= winLength else { return nil }
-        let frameCount = 1 + (pcmSamples.count - winLength) / hopLength
-        guard frameCount > 0 else { return nil }
+    private func model(for component: EmbeddingComponent, unit: TowerComputeUnit) async throws -> MLModel? {
+        guard unit != .mlxGPU else { return nil }
+        let cacheKey = "\(component.rawValue):\(unit.rawValue)"
+        if let existing = loadedModels[cacheKey] {
+            return existing
+        }
+        guard let bundleURL = ANETowerInspector.locateBundle(for: component, in: checkpointDirectory) else {
+            return nil
+        }
+        let compiledURL: URL
+        if bundleURL.pathExtension == "mlpackage" {
+            compiledURL = try await MLModel.compileModel(at: bundleURL)
+        } else {
+            compiledURL = bundleURL
+        }
+        let config = MLModelConfiguration()
+        config.computeUnits = unit.mlComputeUnits
+        let loaded = try MLModel(contentsOf: compiledURL, configuration: config)
+        loadedModels[cacheKey] = loaded
+        return loaded
+    }
 
-        var features = [Float](repeating: 0, count: frameCount * numMelBins)
-        for f in 0..<frameCount {
-            let start = f * hopLength
-            let slice = Array(pcmSamples[start..<(start + winLength)])
-            var energy: Float = 0
-            vDSP_svesq(slice, 1, &energy, vDSP_Length(winLength))
-            let baseLog = log(max(1e-6, energy / Float(winLength)))
-            for b in 0..<numMelBins {
-                let freqMod = cos(Float(b + 1) * 0.05)
-                features[f * numMelBins + b] = baseLog + 0.1 * freqMod
+    private func tokenEmbeddingTable() -> Data? {
+        if let mappedTokenTable { return mappedTokenTable }
+        let candidates = [
+            checkpointDirectory.appendingPathComponent("coreml/embed_tokens_fp16.bin"),
+            checkpointDirectory.appendingPathComponent("ane/embed_tokens_fp16.bin"),
+            checkpointDirectory.appendingPathComponent("embed_tokens_fp16.bin"),
+        ]
+        for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+            if let data = try? Data(contentsOf: url, options: .mappedIfSafe) {
+                self.mappedTokenTable = data
+                return data
             }
         }
-        return (features, frameCount)
+        return nil
     }
 
-    public static func prepareImagePixels(
-        from url: URL,
-        forVideoBudget: Bool
-    ) -> (pixels: [Float], height: Int, width: Int)? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil)
-        else { return nil }
-        return prepareImagePixels(from: cg, forVideoBudget: forVideoBudget)
-    }
-
-    public static func prepareImagePixels(
-        from cgImage: CGImage,
-        forVideoBudget: Bool
-    ) -> (pixels: [Float], height: Int, width: Int)? {
-        let targetH = forVideoBudget ? 480 : 672
-        let targetW = forVideoBudget ? 672 : 672
-        var rgba = [UInt8](repeating: 0, count: targetH * targetW * 4)
-        let cs = CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: &rgba,
-            width: targetW,
-            height: targetH,
-            bitsPerComponent: 8,
-            bytesPerRow: targetW * 4,
-            space: cs,
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ) else { return nil }
-        ctx.interpolationQuality = .high
-        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
-
-        var chw = [Float](repeating: 0, count: 3 * targetH * targetW)
-        let plane = targetH * targetW
-        for i in 0..<plane {
-            chw[i] = Float(rgba[i * 4]) / 255.0
-            chw[plane + i] = Float(rgba[i * 4 + 1]) / 255.0
-            chw[2 * plane + i] = Float(rgba[i * 4 + 2]) / 255.0
-        }
-        return (chw, targetH, targetW)
-    }
-
+    /// Runs `EmbeddingGemma2VisionANE` on `[1, 3, height, width]` pixels in `[0, 1]`.
+    /// Returns flattened `[softTokenCount * 512]` floats and `softTokenCount`, or `nil` if the
+    /// bundle is absent or `(height, width)` is outside the enumerated ANE buckets.
     public func encodeVision(
         pixels: [Float],
         height: Int,
         width: Int,
         unit: TowerComputeUnit
     ) async throws -> (softTokens: [Float], tokenCount: Int)? {
-        guard ANETowerInspector.compiledBundleURL(for: .visionEncoder, in: checkpointDirectory) != nil else {
+        guard Self.supportedVisionBuckets.contains([height, width]),
+              pixels.count == 3 * height * width,
+              let visionModel = try await model(for: .visionEncoder, unit: unit)
+        else {
             return nil
         }
-        let tokenCount = (height / 14) * (width / 14) / 4
-        return ([Float](repeating: 0, count: tokenCount * 512), tokenCount)
+        let shape: [NSNumber] = [1, 3, NSNumber(value: height), NSNumber(value: width)]
+        let inputArray = try MLMultiArray(shape: shape, dataType: .float32)
+        let dstPtr = inputArray.dataPointer.bindMemory(to: Float.self, capacity: pixels.count)
+        pixels.withUnsafeBufferPointer { src in
+            guard let base = src.baseAddress else { return }
+            dstPtr.update(from: base, count: pixels.count)
+        }
+        let provider = try MLDictionaryFeatureProvider(dictionary: ["pixels": inputArray])
+        let outFeatures = try Self.runSyncPrediction(model: visionModel, provider: provider)
+        guard let outArray = outFeatures.featureValue(for: "soft_tokens")?.multiArrayValue else {
+            return nil
+        }
+        let floats = Self.extractFloatArray(from: outArray)
+        let tokenCount = floats.count / Self.hiddenSize
+        return (floats, tokenCount)
     }
 
+    /// Selects the closest aspect-preserving `(height, width)` bucket in `supportedVisionBuckets`
+    /// and decodes upright sRGB `[1, 3, height, width]` pixels in `[0, 1]`.
+    public static func prepareImagePixels(
+        from imageURL: URL,
+        forVideoBudget: Bool = false
+    ) -> (pixels: [Float], height: Int, width: Int)? {
+        guard let src = CGImageSourceCreateWithURL(imageURL as CFURL, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil)
+        else {
+            return nil
+        }
+        return prepareImagePixels(from: cgImage, forVideoBudget: forVideoBudget)
+    }
+
+    public static func prepareImagePixels(
+        from cgImage: CGImage,
+        forVideoBudget: Bool = false
+    ) -> (pixels: [Float], height: Int, width: Int)? {
+        let srcW = max(1, cgImage.width)
+        let srcH = max(1, cgImage.height)
+        let aspect = Double(srcW) / Double(srcH)
+
+        let (targetH, targetW): (Int, Int)
+        if forVideoBudget {
+            if aspect > 1.15 {
+                (targetH, targetW) = (480, 672)
+            } else if aspect < 0.87 {
+                (targetH, targetW) = (672, 480)
+            } else {
+                (targetH, targetW) = (528, 528)
+            }
+        } else {
+            if aspect > 1.15 {
+                (targetH, targetW) = (672, 960)
+            } else if aspect < 0.87 {
+                (targetH, targetW) = (960, 672)
+            } else {
+                (targetH, targetW) = (768, 768)
+            }
+        }
+
+        var rgba = [UInt8](repeating: 0, count: targetW * targetH * 4)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        rgba.withUnsafeMutableBytes { rawPtr in
+            guard let base = rawPtr.baseAddress,
+                  let ctx = CGContext(
+                      data: base,
+                      width: targetW,
+                      height: targetH,
+                      bitsPerComponent: 8,
+                      bytesPerRow: targetW * 4,
+                      space: colorSpace,
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  )
+            else { return }
+            ctx.interpolationQuality = .high
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
+        }
+
+        let planeSize = targetH * targetW
+        var chw = [Float](repeating: 0, count: 3 * planeSize)
+        let inv255: Float = 1.0 / 255.0
+        for i in 0..<planeSize {
+            chw[i] = Float(rgba[i * 4 + 0]) * inv255
+            chw[planeSize + i] = Float(rgba[i * 4 + 1]) * inv255
+            chw[2 * planeSize + i] = Float(rgba[i * 4 + 2]) * inv255
+        }
+        return (chw, targetH, targetW)
+    }
+
+    /// Computes `[frameCount, 128]` 16 kHz HTK log-mel spectrogram features matching `Gemma4AudioProcessor`
+    /// (`frameLength = 400`, `hopLength = 160`, `fftLength = 512`, `125..7600 Hz`, `preemphasis = 0.97`,
+    /// periodic Hann window, `log(mel + 1e-6)`), capped at `30s` (`480,000` samples -> `2,999` frames).
+    public static func computeAudioLogMel(
+        pcmSamples: [Float]
+    ) -> (features: [Float], frameCount: Int)? {
+        let maxSamples = 480_000 // 30s at 16 kHz
+        let frameLength = 400
+        let hopLength = 160
+        let fftLength = 512
+        let specBins = fftLength / 2 + 1 // 257
+        let melBins = Self.audioMelBins  // 128
+
+        let count = min(pcmSamples.count, maxSamples)
+        guard count >= frameLength else { return nil }
+        let frameCount = min(Self.audioMelFrames, 1 + (count - frameLength) / hopLength)
+        guard frameCount > 0 else { return nil }
+
+        // Periodic Hann window of length 400
+        var window = [Float](repeating: 0, count: frameLength)
+        let twoPiOverN = 2.0 * Float.pi / Float(frameLength)
+        for i in 0..<frameLength {
+            window[i] = 0.5 - 0.5 * cos(twoPiOverN * Float(i))
+        }
+
+        // HTK mel filterbank [specBins=257, melBins=128] over 125..7600 Hz
+        func hzToMel(_ f: Float) -> Float { 2595.0 * log10(1.0 + f / 700.0) }
+        func melToHz(_ m: Float) -> Float { 700.0 * (pow(10.0, m / 2595.0) - 1.0) }
+        let melMin = hzToMel(125.0)
+        let melMax = hzToMel(7600.0)
+        let edges = (0...(melBins + 1)).map { i -> Float in
+            melToHz(melMin + (melMax - melMin) * Float(i) / Float(melBins + 1))
+        }
+        let binFreqs = (0..<specBins).map { k in Float(k) * 16_000.0 / Float(fftLength) }
+
+        var filters = [Float](repeating: 0, count: specBins * melBins)
+        for m in 0..<melBins {
+            let fLeft = edges[m]
+            let fCenter = edges[m + 1]
+            let fRight = edges[m + 2]
+            for k in 0..<specBins {
+                let f = binFreqs[k]
+                if f >= fLeft && f <= fCenter && fCenter > fLeft {
+                    filters[k * melBins + m] = (f - fLeft) / (fCenter - fLeft)
+                } else if f > fCenter && f <= fRight && fRight > fCenter {
+                    filters[k * melBins + m] = (fRight - f) / (fRight - fCenter)
+                }
+            }
+        }
+
+        guard let fftSetup = vDSP_create_fftsetup(vDSP_Length(9), FFTRadix(kFFTRadix2)) else {
+            return nil
+        }
+        defer { vDSP_destroy_fftsetup(fftSetup) }
+
+        var powerSpec = [Float](repeating: 0, count: frameCount * specBins)
+        var realPart = [Float](repeating: 0, count: fftLength / 2)
+        var imagPart = [Float](repeating: 0, count: fftLength / 2)
+        var paddedFrame = [Float](repeating: 0, count: fftLength)
+
+        for frameIdx in 0..<frameCount {
+            let start = frameIdx * hopLength
+            for i in 0..<frameLength {
+                let cur = pcmSamples[start + i]
+                let prev = (i == 0) ? cur : pcmSamples[start + i - 1]
+                paddedFrame[i] = (cur - 0.97 * prev) * window[i]
+            }
+            for i in frameLength..<fftLength {
+                paddedFrame[i] = 0
+            }
+
+            realPart.withUnsafeMutableBufferPointer { rBuf in
+                imagPart.withUnsafeMutableBufferPointer { iBuf in
+                    var split = DSPSplitComplex(realp: rBuf.baseAddress!, imagp: iBuf.baseAddress!)
+                    paddedFrame.withUnsafeBufferPointer { fBuf in
+                        fBuf.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: fftLength / 2) { cPtr in
+                            vDSP_ctoz(cPtr, 2, &split, 1, vDSP_Length(fftLength / 2))
+                        }
+                    }
+                    vDSP_fft_zrip(fftSetup, &split, 1, vDSP_Length(9), FFTDirection(kFFTDirection_Forward))
+                    let rowBase = frameIdx * specBins
+                    powerSpec[rowBase + 0] = (rBuf[0] * rBuf[0]) * 0.25
+                    powerSpec[rowBase + fftLength / 2] = (iBuf[0] * iBuf[0]) * 0.25
+                    for k in 1..<(fftLength / 2) {
+                        powerSpec[rowBase + k] = (rBuf[k] * rBuf[k] + iBuf[k] * iBuf[k]) * 0.25
+                    }
+                }
+            }
+        }
+
+        var melOut = [Float](repeating: 0, count: frameCount * melBins)
+        vDSP_mmul(
+            powerSpec, 1,
+            filters, 1,
+            &melOut, 1,
+            vDSP_Length(frameCount),
+            vDSP_Length(melBins),
+            vDSP_Length(specBins)
+        )
+        for i in 0..<melOut.count {
+            melOut[i] = log(max(0, melOut[i]) + 1e-6)
+        }
+        return (melOut, frameCount)
+    }
+
+    /// Convenience 2D row view (`[[Float]]` of `[frameCount][128]`) over `computeAudioLogMel(pcmSamples:)`.
+    public static func computeAudioLogMel(
+        samples: [Float],
+        sampleRate: Int = 16_000,
+        nMels: Int = 128
+    ) -> [[Float]] {
+        guard let res = computeAudioLogMel(pcmSamples: samples) else { return [] }
+        return (0..<res.frameCount).map { row in
+            let offset = row * Self.audioMelBins
+            return Array(res.features[offset..<(offset + Self.audioMelBins)])
+        }
+    }
+
+    /// Runs `EmbeddingGemma2AudioANE` on `[frameCount, 128]` log-mel features (padded/capped to `2999` frames).
     public func encodeAudio(
         melFeatures: [Float],
         frameCount: Int,
         unit: TowerComputeUnit
     ) async throws -> (softTokens: [Float], tokenCount: Int)? {
-        guard ANETowerInspector.compiledBundleURL(for: .audioEncoder, in: checkpointDirectory) != nil else {
+        guard frameCount > 0,
+              melFeatures.count == frameCount * Self.audioMelBins,
+              let audioModel = try await model(for: .audioEncoder, unit: unit)
+        else {
             return nil
         }
-        let tokenCount = max(1, frameCount / 4)
-        return ([Float](repeating: 0, count: tokenCount * 512), tokenCount)
+        let shape: [NSNumber] = [1, NSNumber(value: Self.audioMelFrames), NSNumber(value: Self.audioMelBins)]
+        let inputArray = try MLMultiArray(shape: shape, dataType: .float32)
+        let totalFloats = Self.audioMelFrames * Self.audioMelBins
+        let dstPtr = inputArray.dataPointer.bindMemory(to: Float.self, capacity: totalFloats)
+        dstPtr.initialize(repeating: 0, count: totalFloats)
+        let copyFrames = min(frameCount, Self.audioMelFrames)
+        let copyCount = copyFrames * Self.audioMelBins
+        melFeatures.withUnsafeBufferPointer { src in
+            guard let base = src.baseAddress else { return }
+            dstPtr.update(from: base, count: copyCount)
+        }
+        let provider = try MLDictionaryFeatureProvider(dictionary: ["mel_features": inputArray])
+        let outFeatures = try Self.runSyncPrediction(model: audioModel, provider: provider)
+        guard let outArray = outFeatures.featureValue(for: "soft_tokens")?.multiArrayValue else {
+            return nil
+        }
+        let allFloats = Self.extractFloatArray(from: outArray)
+        let afterConv0 = (copyFrames + 1) / 2
+        let validTokens = min(750, max(1, (afterConv0 + 1) / 2))
+        let sliced = Array(allFloats.prefix(validTokens * Self.hiddenSize))
+        return (sliced, validTokens)
     }
 
+    /// Runs `EmbeddingGemma2TextANE` on `tokenIDs` (splicing in any `softTokens` at `softTokenIDs`),
+    /// returning the L2-normalized embedding truncated to `dimensions`.
     public func encodeTextAndFuse(
         tokenIDs: [Int],
-        softTokens: [Float]?,
+        softTokens: [Float]? = nil,
+        softTokenIDs: Set<Int> = [258880, 258884, 258881],
         unit: TowerComputeUnit,
-        dimensions: Int
+        dimensions: Int = Matryoshka.gemma2NativeDimensions
     ) async throws -> [Float]? {
-        guard ANETowerInspector.compiledBundleURL(for: .textBackbone, in: checkpointDirectory) != nil else {
+        guard !tokenIDs.isEmpty,
+              let bucketLen = Self.supportedTextSequenceBuckets.first(where: { tokenIDs.count <= $0 }),
+              let tokData = tokenEmbeddingTable(),
+              let textModel = try await model(for: .textBackbone, unit: unit)
+        else {
             return nil
         }
-        var raw = [Float](repeating: 0, count: Matryoshka.gemma2NativeDimensions)
-        for (idx, tok) in tokenIDs.enumerated() {
-            raw[(tok + idx) % raw.count] += 1.0
+
+        let packedWidth = Self.hiddenSize + 1 // 512 embeds + 1 attention_mask
+        let packedShape: [NSNumber] = [1, NSNumber(value: bucketLen), NSNumber(value: packedWidth)]
+        let packedArray = try MLMultiArray(shape: packedShape, dataType: .float32)
+
+        let totalPackedFloats = bucketLen * packedWidth
+        let packedPtr = packedArray.dataPointer.bindMemory(to: Float.self, capacity: totalPackedFloats)
+        packedPtr.initialize(repeating: 0, count: totalPackedFloats)
+
+        let rowBytes = Self.hiddenSize * MemoryLayout<UInt16>.size
+        var softCursor = 0
+        let totalSoftRows = (softTokens?.count ?? 0) / Self.hiddenSize
+
+        tokData.withUnsafeBytes { rawTokBuffer in
+            guard let fp16Base = rawTokBuffer.baseAddress?.assumingMemoryBound(to: Float16.self) else {
+                return
+            }
+            let maxVocab = rawTokBuffer.count / rowBytes
+            for (pos, tokID) in tokenIDs.enumerated() {
+                let dstRow = packedPtr.advanced(by: pos * packedWidth)
+                dstRow[Self.hiddenSize] = 1.0 // attention_mask = 1.0
+                if softTokenIDs.contains(tokID), let softTokens, softCursor < totalSoftRows {
+                    let srcOffset = softCursor * Self.hiddenSize
+                    for d in 0..<Self.hiddenSize {
+                        dstRow[d] = softTokens[srcOffset + d]
+                    }
+                    softCursor += 1
+                } else if tokID >= 0 && tokID < maxVocab {
+                    let srcRow = fp16Base.advanced(by: tokID * Self.hiddenSize)
+                    for d in 0..<Self.hiddenSize {
+                        dstRow[d] = Float(srcRow[d]) * Self.embeddingScale
+                    }
+                }
+            }
         }
-        return Matryoshka.project(raw, dimensions: dimensions)
+
+        let provider = try MLDictionaryFeatureProvider(dictionary: [
+            "packed_input": packedArray
+        ])
+        let outFeatures = try Self.runSyncPrediction(model: textModel, provider: provider)
+        guard let outArray = outFeatures.featureValue(for: "embedding")?.multiArrayValue else {
+            return nil
+        }
+        let rawVec = Self.extractFloatArray(from: outArray)
+        return Matryoshka.project(rawVec, dimensions: dimensions)
+    }
+
+    nonisolated private static func runSyncPrediction(
+        model: MLModel,
+        provider: MLDictionaryFeatureProvider
+    ) throws -> any MLFeatureProvider {
+        try model.prediction(from: provider)
+    }
+
+    private static func extractFloatArray(from multiArray: MLMultiArray) -> [Float] {
+        let count = multiArray.count
+        guard count > 0 else { return [] }
+        switch multiArray.dataType {
+        case .float32:
+            let ptr = multiArray.dataPointer.bindMemory(to: Float.self, capacity: count)
+            return Array(UnsafeBufferPointer(start: ptr, count: count))
+        case .float16:
+            let ptr = multiArray.dataPointer.bindMemory(to: Float16.self, capacity: count)
+            var out = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                out[i] = Float(ptr[i])
+            }
+            return out
+        default:
+            return (0..<count).map { multiArray[$0].floatValue }
+        }
     }
 }

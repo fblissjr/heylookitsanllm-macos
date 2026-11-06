@@ -167,11 +167,13 @@ struct HeylookTests {
         let split1 = options.memorySplitMB
         #expect(split1.aneMB == 335 + 611)
         #expect(split1.gpuMB == 542)
+        #expect(options.preset == .hybridANETowers)
 
         options = .allNeuralEngine
         let split2 = options.memorySplitMB
         #expect(split2.aneMB == 335 + 611 + 542)
         #expect(split2.gpuMB == 0)
+        #expect(options.preset == .allNeuralEngine)
 
         // Verify 1 second of 16 kHz sine wave produces 98 frames x 128 mel bins
         let samples = (0..<16_000).map { i in sin(Float(i) * 2 * .pi * 440.0 / 16_000.0) }
@@ -179,6 +181,89 @@ struct HeylookTests {
         #expect(mel != nil)
         #expect(mel?.frameCount == 98)
         #expect(mel?.features.count == 98 * 128)
+
+        let mel2D = ANECoreMLRuntime.computeAudioLogMel(samples: samples, sampleRate: 16_000, nMels: 128)
+        #expect(mel2D.count == 98)
+        #expect(mel2D.first?.count == 128)
+    }
+
+    @Test("IndexCoordinator indexes folders, deduplicates unchanged files, prunes deleted files, and searches spans")
+    func testIndexCoordinatorPipelineAndHeylookBatchPlanner() async throws {
+        let fm = FileManager.default
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_index_test_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let dbURL = tempDir.appendingPathComponent("vectors.sqlite")
+        let corpusDir = tempDir.appendingPathComponent("corpus", isDirectory: true)
+        try fm.createDirectory(at: corpusDir, withIntermediateDirectories: true)
+
+        let doc1URL = corpusDir.appendingPathComponent("ane_architecture.md")
+        let doc2URL = corpusDir.appendingPathComponent("ComputeScheduler.swift")
+        try "Apple Neural Engine co-residency keeps vision and audio towers hot in 192 GB unified RAM.".write(to: doc1URL, atomically: true, encoding: .utf8)
+        try "public actor ComputeScheduler { public func withComputeLease() async throws {} }".write(to: doc2URL, atomically: true, encoding: .utf8)
+
+        let store = try VectorStore(databaseURL: dbURL)
+        let engine = DeterministicHashEmbeddingEngine()
+        let coordinator = IndexCoordinator(engine: engine, store: store)
+
+        let res1 = try await coordinator.indexURLs([corpusDir])
+        #expect(res1.indexed == 2)
+
+        // Second pass skips unchanged files via ContentFingerprint
+        let res2 = try await coordinator.indexURLs([corpusDir])
+        #expect(res2.indexed == 0)
+
+        let stats1 = try store.stats()
+        #expect(stats1.countsByKind[.text] == 1)
+        #expect(stats1.countsByKind[.code] == 1)
+
+        let watched = try store.listWatchedFolders()
+        #expect(watched.contains(where: { $0.path == corpusDir.standardizedFileURL.path }))
+
+        // Search across indexed spans
+        let hits = try await coordinator.search(
+            queryText: "Apple Neural Engine co-residency",
+            dimensions: 256,
+            taskOverride: .query,
+            limit: 5
+        )
+        #expect(hits.count == 2)
+        #expect(hits.first?.spanMatches.first?.scoresByDimension[256] != nil)
+
+        // Delete one file and re-index to verify pruning of missing artifacts
+        try fm.removeItem(at: doc2URL)
+        _ = try await coordinator.indexURLs([corpusDir])
+        let stats2 = try store.stats()
+        #expect(stats2.countsByKind[.text] == 1)
+        #expect((stats2.countsByKind[.code] ?? 0) == 0)
+
+        // Verify HeylookMLXEngine adaptive sub-batching and maskedMeanPoolAndNormalize
+        let batchItems = (0..<10).map { i in
+            EmbeddingInput(
+                parts: [
+                    .text("item \(i)"),
+                    .media(kind: .image, mimeType: "image/png", data: Data(repeating: 0xAA, count: 600_000))
+                ],
+                task: .document
+            )
+        }
+        let batches = HeylookMLXEngine.planBatches(batchItems, maxItems: 4, maxRequestMediaBytes: 2_000_000)
+        #expect(batches.count == 5) // Each batch holds at most 2 items (1.2 MB <= 1.5 MB raw budget)
+
+        let pooled = NativeMLXEmbeddingGemma2.maskedMeanPoolAndNormalize(
+            projectedTokens: [
+                [1.0, 0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0, 0.0],
+                [99.0, 99.0, 99.0, 99.0]
+            ],
+            attentionMask: [1, 1, 0],
+            dimensions: 2
+        )
+        #expect(pooled.count == 2)
+        #expect(abs(pooled[0] - 1.0) < 1e-4)
+        #expect(abs(pooled[1] - 0.0) < 1e-4)
     }
 
     @Test("GGUFHeaderReader parses valid GGUF v3 binary header")
