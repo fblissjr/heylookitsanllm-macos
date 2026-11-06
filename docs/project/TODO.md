@@ -40,7 +40,7 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 ---
 
-## Phase 3: Workbench & Mobile (`iOS 27.2+`) Polish (Next)
+## Phase 3: Workbench & Mobile (`iOS 27.2+`) Polish (Done)
 
-- [ ] **3.1 Bonjour (`_heylook._tcp`) Auto-Discovery Picker on iOS 27.2**: Zero-config `NWBrowser` service picker in `HeylookWorkbenchViewModel` so the iPhone/iPad app auto-connects to the Mac Studio when its embedded server toggle is on.
-- [ ] **3.2 Multimodal Chat Composer & Keyboard Shortcuts**: Image/audio attachment pills in Chat composer, per-slider provenance badges (`derived` vs `configured`), and shared hotkeys (`Cmd+Enter` to send, `Escape` to stop).
+- [x] **3.1 Bonjour (`_heylook._tcp`) Auto-Discovery Picker (`iOS 27.2+` & macOS)**: Wired `BonjourServiceBrowser` (`NWBrowser` for `_heylook._tcp`) and `DiscoveredHeylookServer` into `HeylookWorkbenchViewModel` (`startBonjourDiscovery()`, `connectToRemoteServer(_:)`) and `PerfServerSurface` so mobile and remote clients auto-discover and connect to the Mac Studio in one click.
+- [x] **3.2 Multimodal Chat Composer, Provenance Badges & Keyboard Shortcuts**: Added `MessagesRequest.MediaAttachment` with dual string/block-array `MessageTurn` `Codable` encoding, HTTP `422` capability gating on `POST /v1/messages`, image/audio attachment pills + drag-and-drop + capability warnings in `ChatWorkbenchSurface`, per-slider `SamplerProvenancePill` (`derived` / `configured` / `request`) + `Reset Overrides` in `LoadAndSamplerPanelSheet`, and keyboard shortcuts (`Cmd+Return` to send, `Escape` to stop, `Cmd+N` for new chat, `Cmd+Shift+P` for prompt preview).

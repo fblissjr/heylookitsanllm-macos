@@ -778,4 +778,97 @@ struct HeylookTests {
         #expect(mlxDrafter.draftModelPath == mlxAssistant.standardizedFileURL.path)
         #expect(mlxDrafter.specType == "draft-model")
     }
+
+    @Test("Bonjour _heylook._tcp endpoint resolution, multimodal MessageTurn block encoding, and HTTP 422 capability gating")
+    func testBonjourMultimodalTurnAndCapabilityGate() async throws {
+        // 1. Bonjour _heylook._tcp service name -> .local baseURL resolution
+        let peer = DiscoveredHeylookServer.fromBonjourService(
+            name: "Mac Studio M2 Ultra",
+            type: "_heylook._tcp",
+            domain: "local.",
+            defaultPort: 8000
+        )
+        #expect(peer.baseURLString == "http://Mac-Studio-M2-Ultra.local:8000")
+        #expect(peer.isBonjour == true)
+
+        // 2. Multimodal MessageTurn round-trip (Anthropic image/audio content block array)
+        let imgFile = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("test_img_\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: imgFile) }
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: imgFile)
+
+        let attachment = try MessagesRequest.MediaAttachment.fromFileURL(imgFile)
+        #expect(attachment.kind == "image")
+        #expect(attachment.mediaType == "image/png")
+
+        let turn = MessagesRequest.MessageTurn(
+            role: "user",
+            content: "What is in this diagram?",
+            attachments: [attachment]
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        let encodedTurn = try encoder.encode(turn)
+        let jsonString = String(decoding: encodedTurn, as: UTF8.self)
+        #expect(jsonString.contains("\"type\":\"image\""))
+        #expect(jsonString.contains("\"media_type\":\"image/png\""))
+
+        let decodedTurn = try JSONDecoder().decode(MessagesRequest.MessageTurn.self, from: encodedTurn)
+        #expect(decodedTurn.content == "What is in this diagram?")
+        #expect(decodedTurn.attachments.count == 1)
+        #expect(decodedTurn.attachments.first?.mediaType == "image/png")
+
+        // 3. HTTP 422 capability gating on text-only model vs 200 on vision-capable model
+        let dbURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase3_\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: dbURL) }
+        let store = try SQLiteStore(databaseURL: dbURL)
+        let scheduler = ComputeScheduler()
+
+        let textOnlyDesc = EngineDescription(
+            modelID: "qwen3-text-only",
+            provider: .mlx,
+            modelPath: "/tmp/qwen3-text",
+            architecture: ProvenanceField(value: "qwen3", provenance: .derived),
+            quantization: ProvenanceField(value: "8bit", provenance: .derived),
+            computePlacement: ProvenanceField(value: .mlxGPU, provenance: .derived),
+            contextSize: ProvenanceField(value: 32768, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: false, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+        let visionDesc = EngineDescription(
+            modelID: "gemma4-vision",
+            provider: .mlx,
+            modelPath: "/tmp/gemma4-vision",
+            architecture: ProvenanceField(value: "gemma4", provenance: .derived),
+            quantization: ProvenanceField(value: "4bit", provenance: .derived),
+            computePlacement: ProvenanceField(value: .hybridANEGPU, provenance: .derived),
+            contextSize: ProvenanceField(value: 32768, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: true, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+        await scheduler.register(provider: MLXSwiftProvider(description: textOnlyDesc), description: textOnlyDesc)
+        await scheduler.register(provider: MLXSwiftProvider(description: visionDesc), description: visionDesc)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        let badReq = MessagesRequest(model: "qwen3-text-only", messages: [turn])
+        let badResp = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(badReq)
+        )
+        #expect(badResp.status == 422)
+
+        let okReq = MessagesRequest(model: "gemma4-vision", messages: [turn])
+        let okResp = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(okReq)
+        )
+        #expect(okResp.status == 200)
+    }
 }

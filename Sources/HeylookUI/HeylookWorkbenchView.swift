@@ -66,6 +66,7 @@ public final class HeylookWorkbenchViewModel {
     public var currentMessages: [MessageRecord] = []
     public var draftPrompt: String = ""
     public var draftSystemPrompt: String = ""
+    public var draftAttachments: [MessagesRequest.MediaAttachment] = []
     public var isGenerating: Bool = false
     public var activeRequestID: String?
     public var streamingThinking: String = ""
@@ -78,10 +79,14 @@ public final class HeylookWorkbenchViewModel {
     public var selectedPresetName: String = "Balanced Daily Driver"
     public var temperatureOverride: Double = 0.7
     public var topPOverride: Double = 0.95
+    public var topKOverride: Int = 40
+    public var minPOverride: Double = 0.05
     public var maxTokensOverride: Int = 2048
     public var thinkingEnabled: Bool = true
+    public var thinkingBudgetOverride: Int = 4096
     public var thinkingDepth: String = "medium"
     public var seedOverride: String = ""
+    public var userOverriddenSamplerKeys: Set<String> = []
 
     // Message Edit State
     public var editingMessageID: String?
@@ -177,11 +182,16 @@ public final class HeylookWorkbenchViewModel {
         return loadAudioFromVideo ? "\(samplingText) + 16 kHz Soundtrack" : samplingText
     }
 
-    // Server State
+    // Server & Bonjour Remote Connection State
     public var isServerRunning: Bool = false
     public var serverPort: UInt16 = 8000
     public var statusBanner: String?
+    public var discoveredServers: [DiscoveredHeylookServer] = []
+    public var isBrowsingBonjour: Bool = false
+    public var remoteServerURLString: String = "http://mac-studio.local:8000"
+    public var connectedRemoteServerURL: String?
 
+    private let bonjourBrowser = BonjourServiceBrowser()
     private let hashEmbeddingEngine = DeterministicHashEmbeddingEngine()
     private var activeEmbeddingEngine: any EmbeddingEngine
     private var indexCoordinator: IndexCoordinator
@@ -402,16 +412,91 @@ public final class HeylookWorkbenchViewModel {
 
     public func applyPreset(_ preset: PresetRecord) {
         selectedPresetName = preset.name
+        userOverriddenSamplerKeys.removeAll()
         if let t = preset.settings.temperature { temperatureOverride = t }
         if let p = preset.settings.topP { topPOverride = p }
+        if let k = preset.settings.topK { topKOverride = k }
+        if let mp = preset.settings.minP { minPOverride = mp }
         if let m = preset.settings.maxTokens { maxTokensOverride = m }
         if let th = preset.settings.thinking { thinkingEnabled = th }
+        if let tb = preset.settings.thinkingBudget { thinkingBudgetOverride = tb }
+    }
+
+    public func resetSamplerOverrides() {
+        userOverriddenSamplerKeys.removeAll()
+        if let activePreset = presets.first(where: { $0.name == selectedPresetName }) {
+            applyPreset(activePreset)
+        } else {
+            temperatureOverride = SamplerSettings.builtinDefaults.temperature ?? 0.7
+            topPOverride = SamplerSettings.builtinDefaults.topP ?? 0.95
+            topKOverride = SamplerSettings.builtinDefaults.topK ?? 40
+            minPOverride = SamplerSettings.builtinDefaults.minP ?? 0.05
+            maxTokensOverride = SamplerSettings.builtinDefaults.maxTokens ?? 2048
+            thinkingEnabled = SamplerSettings.builtinDefaults.thinking ?? true
+            thinkingBudgetOverride = SamplerSettings.builtinDefaults.thinkingBudget ?? 4096
+        }
+    }
+
+    public var activeModelDescription: EngineDescription? {
+        registeredModels.first(where: { $0.modelID == selectedModelID }) ?? registeredModels.first
+    }
+
+    public var currentResolvedSamplers: SamplerCascade.ResolvedSampling {
+        let activePreset = presets.first(where: { $0.name == selectedPresetName })?.settings
+        var modelSidecarSettings: SamplerSettings?
+        if let desc = activeModelDescription {
+            let sidecarURL = URL(fileURLWithPath: desc.modelPath).appendingPathComponent("model.heylook.toml")
+            if let text = try? String(contentsOf: sidecarURL, encoding: .utf8) {
+                modelSidecarSettings = ModelSidecarConfig.parseTOML(text).sampling
+            }
+        }
+        let requestOverlay = SamplerSettings(
+            temperature: userOverriddenSamplerKeys.contains("temperature") ? temperatureOverride : nil,
+            topP: userOverriddenSamplerKeys.contains("top_p") ? topPOverride : nil,
+            topK: userOverriddenSamplerKeys.contains("top_k") ? topKOverride : nil,
+            minP: userOverriddenSamplerKeys.contains("min_p") ? minPOverride : nil,
+            maxTokens: userOverriddenSamplerKeys.contains("max_tokens") ? maxTokensOverride : nil,
+            thinking: userOverriddenSamplerKeys.contains("thinking") ? thinkingEnabled : nil,
+            thinkingBudget: userOverriddenSamplerKeys.contains("thinking_budget") ? thinkingBudgetOverride : nil
+        )
+        return SamplerCascade.resolve(
+            modelSidecar: modelSidecarSettings,
+            preset: activePreset,
+            request: requestOverlay
+        )
+    }
+
+    public func attachChatMedia(from urls: [URL]) {
+        for url in urls {
+            if let attachment = try? MessagesRequest.MediaAttachment.fromFileURL(url) {
+                draftAttachments.append(attachment)
+            }
+        }
+    }
+
+    public func removeChatAttachment(id: String) {
+        draftAttachments.removeAll { $0.id == id }
+    }
+
+    public var chatAttachmentCapabilityWarning: String? {
+        guard let desc = activeModelDescription, !draftAttachments.isEmpty else { return nil }
+        let hasImage = draftAttachments.contains { $0.kind == "image" }
+        let hasAudio = draftAttachments.contains { $0.kind == "audio" }
+        if hasImage && !desc.supportsVision.value {
+            return "Model '\(desc.modelID)' does not support image inputs (supports_vision = false)."
+        }
+        if hasAudio && !desc.supportsAudio.value {
+            return "Model '\(desc.modelID)' does not support audio inputs (supports_audio = false)."
+        }
+        return nil
     }
 
     public func sendChatPrompt() async {
         let promptText = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !promptText.isEmpty, !isGenerating else { return }
+        guard (!promptText.isEmpty || !draftAttachments.isEmpty), !isGenerating else { return }
+        let pendingAttachments = draftAttachments
         draftPrompt = ""
+        draftAttachments = []
 
         if selectedConversationID == nil {
             createNewConversation()
@@ -420,27 +505,36 @@ public final class HeylookWorkbenchViewModel {
 
         do {
             let nextPos = (currentMessages.map(\.position).max() ?? -1) + 1
+            let attachmentSummary = pendingAttachments.isEmpty
+                ? ""
+                : pendingAttachments.map { "[\($0.kind.uppercased()): \($0.filename ?? $0.mediaType)]" }.joined(separator: " ")
+            let storedContent = [attachmentSummary, promptText]
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
             let userMsg = MessageRecord(
                 conversationID: convID,
                 position: nextPos,
                 role: "user",
-                content: promptText,
+                content: storedContent,
                 modelID: selectedModelID
             )
             try store.appendMessage(userMsg)
             currentMessages = try store.listMessages(conversationID: convID)
             if var conv = try store.getConversation(id: convID), conv.title == "New Chat" {
-                conv.title = String(promptText.prefix(38))
+                conv.title = String(storedContent.prefix(38))
                 try store.upsertConversation(conv)
                 conversations = try store.listConversations()
             }
-            await streamAssistantReply(for: convID)
+            await streamAssistantReply(for: convID, latestAttachments: pendingAttachments)
         } catch {
             statusBanner = "Chat error: \(error.localizedDescription)"
         }
     }
 
-    public func streamAssistantReply(for convID: String) async {
+    public func streamAssistantReply(
+        for convID: String,
+        latestAttachments: [MessagesRequest.MediaAttachment] = []
+    ) async {
         isGenerating = true
         streamingThinking = ""
         streamingContent = ""
@@ -450,7 +544,14 @@ public final class HeylookWorkbenchViewModel {
         let modelID = selectedModelID.isEmpty ? "gemma-4-26b-a4b-it-mlx" : selectedModelID
         do {
             let provider = try await scheduler.provider(for: modelID)
-            let turns = currentMessages.map { MessagesRequest.MessageTurn(role: $0.role, content: $0.content) }
+            let lastIdx = currentMessages.indices.last
+            let turns = currentMessages.enumerated().map { idx, msg in
+                MessagesRequest.MessageTurn(
+                    role: msg.role,
+                    content: msg.content,
+                    attachments: idx == lastIdx ? latestAttachments : []
+                )
+            }
             let req = MessagesRequest(
                 model: modelID,
                 messages: turns,
@@ -458,10 +559,13 @@ public final class HeylookWorkbenchViewModel {
                 maxTokens: maxTokensOverride,
                 temperature: temperatureOverride,
                 topP: topPOverride,
+                topK: topKOverride,
+                minP: minPOverride,
                 stream: true,
-                thinking: thinkingEnabled
+                thinking: thinkingEnabled,
+                thinkingBudget: thinkingBudgetOverride
             )
-            let resolved = SamplerCascade.resolve(request: req.samplerOverlay)
+            let resolved = currentResolvedSamplers
             await registry.register(requestID: reqID, conversationID: convID, modelID: modelID)
 
             let finalChunk = try await scheduler.withComputeLease(for: modelID) { [registry] () throws -> GenerationChunk in
@@ -900,7 +1004,7 @@ public final class HeylookWorkbenchViewModel {
         labMetrics = (try? await EmbeddingLabRunner.evaluate(coordinator: indexCoordinator, cases: cases)) ?? []
     }
 
-    // MARK: - Server Lifecycle
+    // MARK: - Server Lifecycle & Bonjour Remote Discovery
 
     public func toggleServer() async {
         do {
@@ -916,6 +1020,86 @@ public final class HeylookWorkbenchViewModel {
         } catch {
             statusBanner = "Server toggle error: \(error.localizedDescription)"
         }
+    }
+
+    public func startBonjourDiscovery() {
+        isBrowsingBonjour = true
+        bonjourBrowser.start { [weak self] servers in
+            Task { @MainActor [weak self] in
+                self?.discoveredServers = servers
+            }
+        }
+    }
+
+    public func stopBonjourDiscovery() {
+        bonjourBrowser.stop()
+        isBrowsingBonjour = false
+    }
+
+    public func connectToRemoteServer(_ urlString: String) async {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let baseURL = URL(string: trimmed) else {
+            statusBanner = "Invalid remote server URL: \(urlString)"
+            return
+        }
+        remoteServerURLString = trimmed
+        embeddingServerURLString = trimmed
+        connectedRemoteServerURL = trimmed
+
+        // Query /v1/models on the remote Mac Studio if reachable; register RemoteHeylookProvider
+        var remoteDescriptions: [EngineDescription] = []
+        let modelsURL = baseURL.appendingPathComponent("v1/models")
+        if let (data, resp) = try? await URLSession.shared.data(from: modelsURL),
+           let http = resp as? HTTPURLResponse,
+           http.statusCode == 200,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let list = json["data"] as? [[String: Any]] {
+            for item in list {
+                if let id = item["id"] as? String {
+                    let remoteDesc = EngineDescription(
+                        modelID: id,
+                        provider: .remote,
+                        modelPath: trimmed,
+                        architecture: ProvenanceField(value: "remote-heylook", provenance: .observed),
+                        quantization: ProvenanceField(value: "remote", provenance: .observed),
+                        computePlacement: ProvenanceField(value: .remote, provenance: .observed),
+                        contextSize: ProvenanceField(value: 32768, provenance: .observed),
+                        flashAttention: ProvenanceField(value: true, provenance: .observed),
+                        supportsVision: ProvenanceField(value: true, provenance: .observed),
+                        supportsThinking: ProvenanceField(value: true, provenance: .observed),
+                        tags: ["remote", "bonjour"]
+                    )
+                    remoteDescriptions.append(remoteDesc)
+                }
+            }
+        }
+
+        if remoteDescriptions.isEmpty {
+            let fallbackDesc = EngineDescription(
+                modelID: "remote-mac-studio-default",
+                provider: .remote,
+                modelPath: trimmed,
+                architecture: ProvenanceField(value: "remote-heylook", provenance: .configured),
+                quantization: ProvenanceField(value: "remote", provenance: .configured),
+                computePlacement: ProvenanceField(value: .remote, provenance: .configured),
+                contextSize: ProvenanceField(value: 32768, provenance: .configured),
+                flashAttention: ProvenanceField(value: true, provenance: .configured),
+                supportsVision: ProvenanceField(value: true, provenance: .configured),
+                supportsThinking: ProvenanceField(value: true, provenance: .configured),
+                tags: ["remote", "bonjour"]
+            )
+            remoteDescriptions = [fallbackDesc]
+        }
+
+        for desc in remoteDescriptions {
+            let provider = RemoteHeylookProvider(baseURL: baseURL, description: desc)
+            await scheduler.register(provider: provider, description: desc)
+        }
+        registeredModels = await scheduler.listModels()
+        if let firstRemote = remoteDescriptions.first {
+            selectedModelID = firstRemote.modelID
+        }
+        statusBanner = "Connected to remote Mac Studio at \(trimmed) (\(remoteDescriptions.count) models)."
     }
 }
 
@@ -1014,6 +1198,8 @@ struct ChatWorkbenchSurface: View {
                         Image(systemName: "square.and.pencil")
                     }
                     .buttonStyle(.borderless)
+                    .keyboardShortcut("n", modifiers: [.command])
+                    .help("New Conversation (⌘N)")
                 }
                 .padding(12)
 
@@ -1067,6 +1253,7 @@ struct ChatWorkbenchSurface: View {
                     Toggle("Prompt Preview", isOn: $viewModel.showPromptPreview)
                         .toggleStyle(.button)
                         .controlSize(.small)
+                        .keyboardShortcut("p", modifiers: [.command, .shift])
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
@@ -1107,30 +1294,126 @@ struct ChatWorkbenchSurface: View {
 
                 Divider()
 
-                HStack(alignment: .bottom, spacing: 10) {
-                    TextField("Ask anything or drop images/audio...", text: $viewModel.draftPrompt, axis: .vertical)
-                        .lineLimit(1...6)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit {
-                            Task { await viewModel.sendChatPrompt() }
+                VStack(alignment: .leading, spacing: 8) {
+                    if let warning = viewModel.chatAttachmentCapabilityWarning {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            Text(warning)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                            Spacer()
                         }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                    }
 
-                    if viewModel.isGenerating {
-                        Button("Stop", role: .destructive) {
-                            Task { await viewModel.cancelGeneration() }
+                    if !viewModel.draftAttachments.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(viewModel.draftAttachments) { att in
+                                    HStack(spacing: 6) {
+                                        Image(systemName: att.kind == "audio" ? "waveform" : "photo")
+                                            .font(.caption)
+                                            .foregroundStyle(.tint)
+                                        Text(att.filename ?? att.mediaType)
+                                            .font(.caption.weight(.medium))
+                                            .lineLimit(1)
+                                        Text(att.mediaType)
+                                            .font(.caption2.monospaced())
+                                            .foregroundStyle(.secondary)
+                                        Button {
+                                            viewModel.removeChatAttachment(id: att.id)
+                                        } label: {
+                                            Image(systemName: "xmark.circle.fill")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                                }
+                            }
                         }
-                        .buttonStyle(.borderedProminent)
-                    } else {
-                        Button("Send") {
-                            Task { await viewModel.sendChatPrompt() }
+                    }
+
+                    HStack(alignment: .bottom, spacing: 10) {
+                        #if os(macOS)
+                        Button {
+                            pickChatAttachments()
+                        } label: {
+                            Image(systemName: "paperclip")
+                                .font(.system(size: 14, weight: .semibold))
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(viewModel.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .buttonStyle(.bordered)
+                        .help("Attach image or audio files")
+                        #endif
+
+                        TextField("Ask anything or drop images/audio (⌘↩ to send)...", text: $viewModel.draftPrompt, axis: .vertical)
+                            .lineLimit(1...6)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit {
+                                Task { await viewModel.sendChatPrompt() }
+                            }
+
+                        if viewModel.isGenerating {
+                            Button("Stop", role: .destructive) {
+                                Task { await viewModel.cancelGeneration() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.escape, modifiers: [])
+                            .help("Cancel generation (Esc)")
+                        } else {
+                            Button("Send") {
+                                Task { await viewModel.sendChatPrompt() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.return, modifiers: [.command])
+                            .disabled(
+                                viewModel.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                    && viewModel.draftAttachments.isEmpty
+                            )
+                            .help("Send message (⌘↩)")
+                        }
                     }
                 }
                 .padding(12)
+                .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                    handleDroppedChatFiles(providers)
+                }
             }
         }
+    }
+
+    #if os(macOS)
+    private func pickChatAttachments() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.image, .audio]
+        if panel.runModal() == .OK {
+            viewModel.attachChatMedia(from: panel.urls)
+        }
+    }
+    #endif
+
+    private func handleDroppedChatFiles(_ providers: [NSItemProvider]) -> Bool {
+        var handled = false
+        for provider in providers where provider.canLoadObject(ofClass: URL.self) {
+            handled = true
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                if let url {
+                    Task { @MainActor in
+                        viewModel.attachChatMedia(from: [url])
+                    }
+                }
+            }
+        }
+        return handled
     }
 }
 
@@ -2604,6 +2887,75 @@ struct PerfServerSurface: View {
                     }
                     .padding(8)
                 }
+
+                GroupBox("Bonjour (_heylook._tcp) Auto-Discovery & Remote Mac Studio Connection (iOS 27.2+ / LAN / Tailscale)") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Label(
+                                viewModel.isBrowsingBonjour ? "Scanning LAN for _heylook._tcp peers..." : "Bonjour Auto-Discovery",
+                                systemImage: "antenna.radiowaves.left.and.right"
+                            )
+                            .font(.subheadline.weight(.medium))
+                            Spacer()
+                            Button(viewModel.isBrowsingBonjour ? "Stop Scan" : "Scan Bonjour") {
+                                if viewModel.isBrowsingBonjour {
+                                    viewModel.stopBonjourDiscovery()
+                                } else {
+                                    viewModel.startBonjourDiscovery()
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+
+                        if !viewModel.discoveredServers.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(viewModel.discoveredServers) { peer in
+                                    HStack {
+                                        Image(systemName: "desktopcomputer")
+                                            .foregroundStyle(.tint)
+                                        Text(peer.name)
+                                            .font(.caption.weight(.semibold))
+                                        Text(peer.baseURLString)
+                                            .font(.caption2.monospaced())
+                                            .foregroundStyle(.secondary)
+                                        Spacer()
+                                        Button("Connect") {
+                                            Task { await viewModel.connectToRemoteServer(peer.baseURLString) }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.mini)
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                                }
+                            }
+                        }
+
+                        HStack(spacing: 8) {
+                            TextField("http://mac-studio.local:8000 or Tailscale URL", text: $viewModel.remoteServerURLString)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.caption.monospaced())
+                            Button("Connect Remote") {
+                                Task { await viewModel.connectToRemoteServer(viewModel.remoteServerURLString) }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+
+                        if let connected = viewModel.connectedRemoteServerURL {
+                            HStack(spacing: 6) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                                Text("Connected to remote Mac Studio: \(connected)")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(8)
+                }
             }
             .padding(16)
         }
@@ -2615,19 +2967,153 @@ struct LoadAndSamplerPanelSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        let resolved = viewModel.currentResolvedSamplers
         VStack(alignment: .leading, spacing: 14) {
-            Text("Sampler Cascade & Thinking Controls")
-                .font(.headline)
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Sampler Cascade & Thinking Controls")
+                        .font(.headline)
+                    Text("Precedence: builtin → model.heylook.toml → preset (\(viewModel.selectedPresetName)) → request")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Reset Overrides") {
+                    viewModel.resetSamplerOverrides()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(viewModel.userOverriddenSamplerKeys.isEmpty)
+            }
 
-            HStack {
-                Text("Temperature: \(String(format: "%.2f", viewModel.temperatureOverride))")
-                Slider(value: $viewModel.temperatureOverride, in: 0...2)
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Temperature: \(String(format: "%.2f", viewModel.temperatureOverride))")
+                        .font(.subheadline.monospacedDigit())
+                    Spacer()
+                    SamplerProvenancePill(
+                        source: resolved.provenanceByField[.temperature] ?? .derived,
+                        isRequestOverride: viewModel.userOverriddenSamplerKeys.contains("temperature")
+                    )
+                }
+                Slider(
+                    value: Binding(
+                        get: { viewModel.temperatureOverride },
+                        set: {
+                            viewModel.temperatureOverride = $0
+                            viewModel.userOverriddenSamplerKeys.insert("temperature")
+                        }
+                    ),
+                    in: 0...2
+                )
+
+                HStack {
+                    Text("Top-P: \(String(format: "%.2f", viewModel.topPOverride))")
+                        .font(.subheadline.monospacedDigit())
+                    Spacer()
+                    SamplerProvenancePill(
+                        source: resolved.provenanceByField[.topP] ?? .derived,
+                        isRequestOverride: viewModel.userOverriddenSamplerKeys.contains("top_p")
+                    )
+                }
+                Slider(
+                    value: Binding(
+                        get: { viewModel.topPOverride },
+                        set: {
+                            viewModel.topPOverride = $0
+                            viewModel.userOverriddenSamplerKeys.insert("top_p")
+                        }
+                    ),
+                    in: 0.05...1.0
+                )
+
+                HStack {
+                    Stepper(
+                        "Top-K: \(viewModel.topKOverride)",
+                        value: Binding(
+                            get: { viewModel.topKOverride },
+                            set: {
+                                viewModel.topKOverride = $0
+                                viewModel.userOverriddenSamplerKeys.insert("top_k")
+                            }
+                        ),
+                        in: 1...200,
+                        step: 5
+                    )
+                    .font(.subheadline.monospacedDigit())
+                    Spacer()
+                    SamplerProvenancePill(
+                        source: resolved.provenanceByField[.topK] ?? .derived,
+                        isRequestOverride: viewModel.userOverriddenSamplerKeys.contains("top_k")
+                    )
+                }
+
+                HStack {
+                    Text("Min-P: \(String(format: "%.2f", viewModel.minPOverride))")
+                        .font(.subheadline.monospacedDigit())
+                    Spacer()
+                    SamplerProvenancePill(
+                        source: resolved.provenanceByField[.minP] ?? .derived,
+                        isRequestOverride: viewModel.userOverriddenSamplerKeys.contains("min_p")
+                    )
+                }
+                Slider(
+                    value: Binding(
+                        get: { viewModel.minPOverride },
+                        set: {
+                            viewModel.minPOverride = $0
+                            viewModel.userOverriddenSamplerKeys.insert("min_p")
+                        }
+                    ),
+                    in: 0.0...0.5
+                )
+
+                HStack {
+                    Stepper(
+                        "Max Output Tokens: \(viewModel.maxTokensOverride)",
+                        value: Binding(
+                            get: { viewModel.maxTokensOverride },
+                            set: {
+                                viewModel.maxTokensOverride = $0
+                                viewModel.userOverriddenSamplerKeys.insert("max_tokens")
+                            }
+                        ),
+                        in: 64...32768,
+                        step: 256
+                    )
+                    .font(.subheadline.monospacedDigit())
+                    Spacer()
+                    SamplerProvenancePill(
+                        source: resolved.provenanceByField[.maxTokens] ?? .derived,
+                        isRequestOverride: viewModel.userOverriddenSamplerKeys.contains("max_tokens")
+                    )
+                }
+
+                HStack {
+                    Stepper(
+                        "Thinking Budget: \(viewModel.thinkingBudgetOverride) tokens",
+                        value: Binding(
+                            get: { viewModel.thinkingBudgetOverride },
+                            set: {
+                                viewModel.thinkingBudgetOverride = $0
+                                viewModel.userOverriddenSamplerKeys.insert("thinking_budget")
+                            }
+                        ),
+                        in: 256...32768,
+                        step: 512
+                    )
+                    .font(.subheadline.monospacedDigit())
+                    Spacer()
+                    SamplerProvenancePill(
+                        source: resolved.provenanceByField[.thinkingBudget] ?? .derived,
+                        isRequestOverride: viewModel.userOverriddenSamplerKeys.contains("thinking_budget")
+                    )
+                }
             }
-            HStack {
-                Text("Top-P: \(String(format: "%.2f", viewModel.topPOverride))")
-                Slider(value: $viewModel.topPOverride, in: 0.05...1.0)
-            }
-            Stepper("Max Output Tokens: \(viewModel.maxTokensOverride)", value: $viewModel.maxTokensOverride, in: 64...32768, step: 256)
+
+            Divider()
 
             TextField("System Prompt Override", text: $viewModel.draftSystemPrompt, axis: .vertical)
                 .lineLimit(2...5)
@@ -2637,9 +3123,39 @@ struct LoadAndSamplerPanelSheet: View {
                 Spacer()
                 Button("Done") { dismiss() }
                     .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
-        .frame(minWidth: 420)
+        .frame(minWidth: 480)
+    }
+}
+
+private struct SamplerProvenancePill: View {
+    let source: ProvenanceSource
+    let isRequestOverride: Bool
+
+    var body: some View {
+        let label = isRequestOverride ? "request" : source.rawValue
+        Text(label)
+            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(pillColor.opacity(0.16), in: Capsule())
+            .foregroundStyle(pillColor)
+    }
+
+    private var pillColor: Color {
+        if isRequestOverride {
+            return .orange
+        }
+        switch source {
+        case .configured:
+            return .purple
+        case .observed, .observedCached:
+            return .green
+        case .derived, .unknown, .notApplicable:
+            return .secondary
+        }
     }
 }

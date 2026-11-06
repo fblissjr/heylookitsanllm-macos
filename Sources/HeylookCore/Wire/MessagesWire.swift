@@ -2,13 +2,143 @@ import Foundation
 
 /// Anthropic Messages-conformant `/v1/messages` request payload.
 public struct MessagesRequest: Codable, Sendable, Equatable {
+    /// Multimodal attachment block (`image` or `audio`) carried inside a `MessageTurn`.
+    public struct MediaAttachment: Codable, Sendable, Equatable, Identifiable {
+        public let id: String
+        /// `"image"` or `"audio"`
+        public let kind: String
+        /// MIME type (`"image/jpeg"`, `"image/png"`, `"audio/wav"`, etc.)
+        public let mediaType: String
+        /// Base64-encoded payload bytes
+        public let dataBase64: String
+        /// Display filename for UI pills
+        public let filename: String?
+
+        public init(
+            id: String = UUID().uuidString,
+            kind: String,
+            mediaType: String,
+            dataBase64: String,
+            filename: String? = nil
+        ) {
+            self.id = id
+            self.kind = kind
+            self.mediaType = mediaType
+            self.dataBase64 = dataBase64
+            self.filename = filename
+        }
+
+        /// Loads a local image or audio file into a `MediaAttachment`.
+        public static func fromFileURL(_ url: URL) throws -> MediaAttachment {
+            let data = try Data(contentsOf: url)
+            let ext = url.pathExtension.lowercased()
+            let (kind, mime): (String, String)
+            switch ext {
+            case "png":
+                (kind, mime) = ("image", "image/png")
+            case "webp":
+                (kind, mime) = ("image", "image/webp")
+            case "gif":
+                (kind, mime) = ("image", "image/gif")
+            case "jpg", "jpeg", "heic":
+                (kind, mime) = ("image", "image/jpeg")
+            case "wav":
+                (kind, mime) = ("audio", "audio/wav")
+            case "mp3":
+                (kind, mime) = ("audio", "audio/mp3")
+            case "m4a", "aac":
+                (kind, mime) = ("audio", "audio/mp4")
+            case "flac":
+                (kind, mime) = ("audio", "audio/flac")
+            default:
+                (kind, mime) = ("image", "image/jpeg")
+            }
+            return MediaAttachment(
+                kind: kind,
+                mediaType: mime,
+                dataBase64: data.base64EncodedString(),
+                filename: url.lastPathComponent
+            )
+        }
+    }
+
     public struct MessageTurn: Codable, Sendable, Equatable {
         public let role: String
         public let content: String
+        public var attachments: [MediaAttachment]
 
-        public init(role: String, content: String) {
+        public init(role: String, content: String, attachments: [MediaAttachment] = []) {
             self.role = role
             self.content = content
+            self.attachments = attachments
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case role
+            case content
+        }
+
+        private struct WireContentBlock: Codable {
+            struct Source: Codable {
+                let type: String
+                let media_type: String?
+                let data: String?
+            }
+            let type: String
+            let text: String?
+            let source: Source?
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.role = try container.decode(String.self, forKey: .role)
+            if let plainText = try? container.decode(String.self, forKey: .content) {
+                self.content = plainText
+                self.attachments = []
+            } else if let blocks = try? container.decode([WireContentBlock].self, forKey: .content) {
+                var textParts: [String] = []
+                var media: [MediaAttachment] = []
+                for block in blocks {
+                    if block.type == "text", let t = block.text {
+                        textParts.append(t)
+                    } else if (block.type == "image" || block.type == "audio"),
+                              let src = block.source,
+                              let b64 = src.data {
+                        media.append(
+                            MediaAttachment(
+                                kind: block.type,
+                                mediaType: src.media_type ?? (block.type == "audio" ? "audio/wav" : "image/jpeg"),
+                                dataBase64: b64
+                            )
+                        )
+                    }
+                }
+                self.content = textParts.joined(separator: "\n")
+                self.attachments = media
+            } else {
+                self.content = ""
+                self.attachments = []
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(role, forKey: .role)
+            if attachments.isEmpty {
+                try container.encode(content, forKey: .content)
+            } else {
+                var blocks: [WireContentBlock] = attachments.map { att in
+                    WireContentBlock(
+                        type: att.kind,
+                        text: nil,
+                        source: .init(type: "base64", media_type: att.mediaType, data: att.dataBase64)
+                    )
+                }
+                if !content.isEmpty {
+                    blocks.append(WireContentBlock(type: "text", text: content, source: nil))
+                }
+                try container.encode(blocks, forKey: .content)
+            }
         }
     }
 
