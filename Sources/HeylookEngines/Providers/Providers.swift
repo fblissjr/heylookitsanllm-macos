@@ -841,6 +841,50 @@ public struct GGUFSpawnConfig: Codable, Sendable, Equatable {
         self.cacheRAMMiB = cacheRAMMiB
         self.extraArgs = extraArgs
     }
+
+    /// Auto-sizes `-ub` (`2048` when headroom >= 16 GB, else `512`), `-cram` (`cacheRAMMiB` from
+    /// unified memory headroom clamped to `[8192, 32768]` MiB), the 4-rung chat template ladder,
+    /// and paired MTP drafter (`gguf.md`).
+    public static func autoSized(
+        for description: EngineDescription,
+        headroomGB: Double? = nil,
+        sidecar: ModelSidecarConfig? = nil
+    ) -> GGUFSpawnConfig {
+        let snap = HardwareMemoryMonitor.snapshot()
+        let modelGB = Double(description.estimatedMemoryMB) / 1024.0
+        let workingSetGB = snap.metalRecommendedMaxWorkingSetGB > 0
+            ? snap.metalRecommendedMaxWorkingSetGB
+            : snap.totalPhysicalRAMGB * 0.75
+        let effectiveHeadroomGB = headroomGB ?? max(0, workingSetGB - modelGB)
+
+        let thinHeadroomGB = 16.0
+        let autoUbatch = effectiveHeadroomGB >= thinHeadroomGB ? 2048 : 512
+        let autoCacheRAMMiB: Int? = if effectiveHeadroomGB >= thinHeadroomGB {
+            min(32768, max(8192, Int(effectiveHeadroomGB / 2.0) * 1024))
+        } else {
+            nil
+        }
+
+        let dirURL = URL(fileURLWithPath: description.modelPath)
+        let resolvedSidecar = sidecar ?? (try? String(
+            contentsOf: dirURL.appendingPathComponent("model.heylook.toml"),
+            encoding: .utf8
+        )).map(ModelSidecarConfig.parseTOML)
+
+        let templateResolution = HeylookConfig.resolveGGUFTemplate(in: dirURL, sidecar: resolvedSidecar)
+        let drafter = HeylookConfig.discoverDrafter(in: dirURL, provider: .gguf, sidecar: resolvedSidecar)
+
+        return GGUFSpawnConfig(
+            modelPath: description.modelPath,
+            ctxSize: description.contextSize.value,
+            flashAttention: description.flashAttention.value,
+            ubatchSize: autoUbatch,
+            chatTemplateFile: templateResolution.resolvedFilePath,
+            draftModelPath: drafter.draftModelPath,
+            specType: drafter.specType,
+            cacheRAMMiB: autoCacheRAMMiB
+        )
+    }
 }
 
 /// Tier 3 Provider (macOS): Out-of-process `llama-server` subprocess (`-np 1`) for `.gguf` models.
@@ -898,11 +942,7 @@ public actor GGUFSubprocessProvider: InferenceProvider {
     public init(description: EngineDescription, spawnConfig: GGUFSpawnConfig? = nil) {
         self.modelID = description.modelID
         self.descriptionState = description
-        self.spawnConfig = spawnConfig ?? GGUFSpawnConfig(
-            modelPath: description.modelPath,
-            ctxSize: description.contextSize.value,
-            flashAttention: description.flashAttention.value
-        )
+        self.spawnConfig = spawnConfig ?? GGUFSpawnConfig.autoSized(for: description)
     }
 
     /// Builds the `llama-server` CLI flag array matching `llama_server_provider.py`.

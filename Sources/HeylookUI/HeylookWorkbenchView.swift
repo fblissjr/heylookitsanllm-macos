@@ -200,7 +200,7 @@ public final class HeylookWorkbenchViewModel {
         let vecDbURL = heylookDir.appendingPathComponent("heylook_vectors.sqlite")
         let tomlURL = heylookDir.appendingPathComponent("heylook.toml")
 
-        let cfg = (try? String(contentsOf: tomlURL, encoding: .utf8)).map(HeylookConfig.parseTOML) ?? HeylookConfig()
+        let cfg = (try? String(contentsOf: tomlURL, encoding: .utf8)).map(HeylookConfig.parseTOML) ?? HeylookConfig.loadDefault()
         self.config = cfg
         self.store = (try? SQLiteStore(databaseURL: dbURL))
             ?? (try! SQLiteStore(databaseURL: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("heylook_fallback.sqlite")))
@@ -208,11 +208,16 @@ public final class HeylookWorkbenchViewModel {
             ?? (try! VectorStore(databaseURL: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("heylook_vec_fallback.sqlite")))
         self.scheduler = ComputeScheduler(maxLoadedGPUModels: cfg.maxLoadedModels, maxQueueDepth: cfg.maxQueueDepth)
         self.registry = RequestRegistry()
+        let initialEngine = NativeMLXEmbeddingGemma2.makeBestAvailableEngine(computeOptions: .hybridANETowers)
+        self.activeEmbeddingEngine = initialEngine
+        self.indexCoordinator = IndexCoordinator(engine: initialEngine, store: self.vectorStore)
         self.router = HeylookRouter(
             store: self.store,
             scheduler: self.scheduler,
             registry: self.registry,
-            bindHost: cfg.serverHost
+            embeddingEngine: initialEngine,
+            bindHost: cfg.serverHost,
+            allowedHosts: cfg.allowedHosts
         )
         self.server = HeylookHTTPServer(
             router: self.router,
@@ -220,9 +225,6 @@ public final class HeylookWorkbenchViewModel {
             port: UInt16(cfg.serverPort)
         )
         self.serverPort = UInt16(cfg.serverPort)
-        let initialEngine = NativeMLXEmbeddingGemma2.makeBestAvailableEngine(computeOptions: .hybridANETowers)
-        self.activeEmbeddingEngine = initialEngine
-        self.indexCoordinator = IndexCoordinator(engine: initialEngine, store: self.vectorStore)
 
         Task {
             await bootstrap()

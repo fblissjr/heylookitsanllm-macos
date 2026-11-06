@@ -37,33 +37,45 @@ public struct HeylookHTTPResponse: Sendable, Equatable {
 }
 
 /// Authoritative `/v1/*` API router implementing the `heylook` Messages wire,
-/// disconnect-resilient `/v1/conversations/{id}/generate`, `/v1/models`, `/v1/requests/{id}`,
-/// `/v1/conversations/*`, `/v1/presets/*`, and `/v1/system/metrics`.
+/// disconnect-resilient `/v1/conversations/{id}/generate`, `/v1/embeddings`, `/v1/capabilities`,
+/// `/v1/models`, `/v1/requests/{id}`, `/v1/conversations/*`, `/v1/presets/*`, and `/v1/system/metrics`.
 public actor HeylookRouter {
     public let store: SQLiteStore
     public let scheduler: ComputeScheduler
     public let registry: RequestRegistry
+    public let embeddingEngine: any EmbeddingEngine
     public let bindHost: String
+    public let allowedHosts: Set<String>
 
     public init(
         store: SQLiteStore,
         scheduler: ComputeScheduler,
         registry: RequestRegistry = RequestRegistry(),
-        bindHost: String = "127.0.0.1"
+        embeddingEngine: any EmbeddingEngine = DeterministicHashEmbeddingEngine(),
+        bindHost: String = "127.0.0.1",
+        allowedHosts: [String] = []
     ) {
         self.store = store
         self.scheduler = scheduler
         self.registry = registry
+        self.embeddingEngine = embeddingEngine
         self.bindHost = bindHost
+        self.allowedHosts = Set(allowedHosts.map { $0.lowercased() })
     }
 
-    /// Validates `Host` header against DNS rebinding when bound to loopback.
+    /// Validates `Host` header against DNS rebinding on loopback / Tailscale (`allowed_hosts`).
     public nonisolated func isAllowedHostHeader(_ hostHeader: String?) -> Bool {
-        let isLoopbackBind = (bindHost == "127.0.0.1" || bindHost == "localhost" || bindHost == "::1")
-        guard isLoopbackBind else { return true }
+        if allowedHosts.contains("*") { return true }
         guard let hostHeader, !hostHeader.isEmpty else { return true }
         let hostOnly = hostHeader.split(separator: ":").first.map(String.init)?.lowercased() ?? ""
-        return hostOnly == "127.0.0.1" || hostOnly == "localhost" || hostOnly == "[::1]"
+        if hostOnly == "127.0.0.1" || hostOnly == "localhost" || hostOnly == "[::1]" {
+            return true
+        }
+        if allowedHosts.contains(hostOnly) {
+            return true
+        }
+        let isLoopbackBind = (bindHost == "127.0.0.1" || bindHost == "localhost" || bindHost == "::1")
+        return !isLoopbackBind
     }
 
     public func handle(
@@ -91,6 +103,42 @@ public actor HeylookRouter {
                 let models = await scheduler.listModels()
                 return try .json(ModelsEnvelope(data: models))
 
+            case ("GET", "/v1/capabilities"):
+                struct CapabilitiesEnvelope: Encodable {
+                    let deviceName: String
+                    let totalPhysicalRAMGB: Double
+                    let metalWorkingSetGB: Double
+                    let maxRequestMediaBytes: Int
+                    let endpoints: [String]
+
+                    enum CodingKeys: String, CodingKey {
+                        case deviceName = "device_name"
+                        case totalPhysicalRAMGB = "total_physical_ram_gb"
+                        case metalWorkingSetGB = "metal_working_set_gb"
+                        case maxRequestMediaBytes = "max_request_media_bytes"
+                        case endpoints
+                    }
+                }
+                let snap = HardwareMemoryMonitor.snapshot()
+                return try .json(
+                    CapabilitiesEnvelope(
+                        deviceName: snap.deviceName,
+                        totalPhysicalRAMGB: snap.totalPhysicalRAMGB,
+                        metalWorkingSetGB: snap.metalRecommendedMaxWorkingSetGB,
+                        maxRequestMediaBytes: 24 * 1024 * 1024,
+                        endpoints: [
+                            "/v1/messages",
+                            "/v1/embeddings",
+                            "/v1/conversations",
+                            "/v1/models",
+                            "/v1/presets",
+                            "/v1/notebooks",
+                            "/v1/system/metrics",
+                            "/v1/capabilities",
+                        ]
+                    )
+                )
+
             case ("GET", "/v1/system/metrics"):
                 struct SystemMetricsEnvelope: Encodable {
                     let memory: HardwareMemoryMonitor.MemorySnapshot
@@ -104,6 +152,9 @@ public actor HeylookRouter {
                 let req = try JSONDecoder().decode(MessagesRequest.self, from: body)
                 let reqID = headers["X-Request-ID"] ?? headers["x-request-id"] ?? "req_\(UUID().uuidString)"
                 return try await handleMessages(requestID: reqID, request: req)
+
+            case ("POST", "/v1/embeddings"):
+                return try await handleEmbeddings(body: body)
 
             case ("GET", "/v1/conversations"):
                 let list = try store.listConversations()
@@ -192,6 +243,62 @@ public actor HeylookRouter {
         }
     }
 
+    private func handleEmbeddings(body: Data) async throws -> HeylookHTTPResponse {
+        guard let json = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            return .error(status: 400, type: "invalid_request_error", message: "Invalid JSON body for /v1/embeddings")
+        }
+        let modelName = (json["model"] as? String) ?? "embedding-gemma2"
+        let requestedDim = (json["dimensions"] as? Int) ?? Matryoshka.gemma2NativeDimensions
+        let taskRaw = (json["task"] as? String) ?? "document"
+        let task = EmbeddingTask(rawValue: taskRaw) ?? .document
+
+        var inputs: [EmbeddingInput] = []
+        if let singleText = json["input"] as? String {
+            inputs = [.text(singleText, task: task)]
+        } else if let textList = json["input"] as? [String] {
+            inputs = textList.map { .text($0, task: task) }
+        } else if let partArrays = json["input"] as? [[[String: Any]]] {
+            for partArray in partArrays {
+                var parts: [EmbeddingPart] = []
+                for partDict in partArray {
+                    let pType = (partDict["type"] as? String) ?? "text"
+                    if pType == "text", let txt = partDict["text"] as? String {
+                        parts.append(.text(txt))
+                    } else if let urlStr = (partDict["image_url"] as? [String: Any])?["url"] as? String
+                        ?? (partDict["audio_url"] as? [String: Any])?["url"] as? String {
+                        if let commaIdx = urlStr.firstIndex(of: ",") {
+                            let b64 = String(urlStr[urlStr.index(after: commaIdx)...])
+                            if let data = Data(base64Encoded: b64) {
+                                let kind: ArtifactKind = pType.contains("audio") ? .audio : .image
+                                parts.append(.media(kind: kind, mimeType: kind == .audio ? "audio/wav" : "image/jpeg", data: data))
+                            }
+                        }
+                    }
+                }
+                inputs.append(EmbeddingInput(parts: parts.isEmpty ? [.text("")] : parts, task: task))
+            }
+        } else {
+            return .error(status: 400, type: "invalid_request_error", message: "Missing or unsupported 'input' field in /v1/embeddings")
+        }
+
+        let outputs = try await embeddingEngine.embedBatch(inputs, dimensions: requestedDim)
+        struct EmbeddingItem: Encodable {
+            let object = "embedding"
+            let index: Int
+            let embedding: [Float]
+        }
+        struct EmbeddingsResponseEnvelope: Encodable {
+            let object = "list"
+            let model: String
+            let data: [EmbeddingItem]
+        }
+
+        let items = outputs.enumerated().map { idx, out in
+            EmbeddingItem(index: idx, embedding: out.vector)
+        }
+        return try .json(EmbeddingsResponseEnvelope(model: modelName, data: items))
+    }
+
     private func handleMessages(
         requestID: String,
         request: MessagesRequest
@@ -204,9 +311,28 @@ public actor HeylookRouter {
             defer {
                 Task { await registry.finish(requestID: requestID) }
             }
+            let useStream = request.stream ?? false
             var fullText = ""
             var fullThinking = ""
             var finalChunk = GenerationChunk()
+            var sseLines: [String] = []
+
+            if useStream {
+                let startPayload: [String: Any] = [
+                    "type": "message_start",
+                    "message": [
+                        "id": requestID,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": request.model,
+                        "content": [],
+                    ],
+                ]
+                if let startData = try? JSONSerialization.data(withJSONObject: startPayload),
+                   let startStr = String(data: startData, encoding: .utf8) {
+                    sseLines.append("event: message_start\ndata: \(startStr)\n\n")
+                }
+            }
 
             let stream = await provider.generate(
                 requestID: requestID,
@@ -215,9 +341,88 @@ public actor HeylookRouter {
                 registry: registry
             )
             for try await chunk in stream {
-                fullText.append(chunk.text)
-                fullThinking.append(chunk.thinking)
+                if !chunk.thinking.isEmpty {
+                    fullThinking.append(chunk.thinking)
+                    if useStream {
+                        let deltaObj: [String: Any] = [
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": [
+                                "type": "thinking_delta",
+                                "thinking": chunk.thinking,
+                            ],
+                        ]
+                        if let d = try? JSONSerialization.data(withJSONObject: deltaObj),
+                           let s = String(data: d, encoding: .utf8) {
+                            sseLines.append("event: content_block_delta\ndata: \(s)\n\n")
+                        }
+                    }
+                }
+                if !chunk.text.isEmpty {
+                    fullText.append(chunk.text)
+                    if useStream {
+                        let deltaObj: [String: Any] = [
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": [
+                                "type": "text_delta",
+                                "text": chunk.text,
+                            ],
+                        ]
+                        if let d = try? JSONSerialization.data(withJSONObject: deltaObj),
+                           let s = String(data: d, encoding: .utf8) {
+                            sseLines.append("event: content_block_delta\ndata: \(s)\n\n")
+                        }
+                    }
+                }
                 finalChunk = chunk
+            }
+
+            let perfExt = MessagesResponse.PerformanceExtension(
+                generationTPS: finalChunk.generationTPS,
+                promptTPS: finalChunk.promptTPS,
+                computePlacement: finalChunk.activeComputePlacement,
+                cache: finalChunk.cacheReport,
+                speculative: finalChunk.speculativeReport
+            )
+
+            if useStream {
+                struct MessageDeltaFrame: Encodable {
+                    struct DeltaBody: Encodable {
+                        let stopReason: StopReason
+                        enum CodingKeys: String, CodingKey {
+                            case stopReason = "stop_reason"
+                        }
+                    }
+                    let type = "message_delta"
+                    let delta: DeltaBody
+                    let usage: MessagesResponse.Usage
+                    let performance: MessagesResponse.PerformanceExtension
+                }
+                let msgDelta = MessageDeltaFrame(
+                    delta: .init(stopReason: finalChunk.stopReason ?? .endTurn),
+                    usage: MessagesResponse.Usage(
+                        inputTokens: finalChunk.cacheReport?.processedTokens ?? finalChunk.promptTokens,
+                        outputTokens: finalChunk.tokenCount,
+                        cacheReadInputTokens: finalChunk.cacheReport?.cachedTokens
+                    ),
+                    performance: perfExt
+                )
+                if let deltaData = try? JSONEncoder().encode(msgDelta),
+                   let deltaStr = String(data: deltaData, encoding: .utf8) {
+                    sseLines.append("event: message_delta\ndata: \(deltaStr)\n\n")
+                }
+                sseLines.append("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+
+                return HeylookHTTPResponse(
+                    status: 200,
+                    headers: [
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                    ],
+                    body: Data(sseLines.joined().utf8)
+                )
             }
 
             var blocks: [MessagesResponse.ContentBlock] = []
@@ -227,6 +432,7 @@ public actor HeylookRouter {
             blocks.append(.text(fullText))
 
             let response = MessagesResponse(
+                id: requestID,
                 model: request.model,
                 content: blocks,
                 stopReason: finalChunk.stopReason ?? .endTurn,
@@ -235,13 +441,7 @@ public actor HeylookRouter {
                     outputTokens: finalChunk.tokenCount,
                     cacheReadInputTokens: finalChunk.cacheReport?.cachedTokens
                 ),
-                performance: MessagesResponse.PerformanceExtension(
-                    generationTPS: finalChunk.generationTPS,
-                    promptTPS: finalChunk.promptTPS,
-                    computePlacement: finalChunk.activeComputePlacement,
-                    cache: finalChunk.cacheReport,
-                    speculative: finalChunk.speculativeReport
-                )
+                performance: perfExt
             )
             return try HeylookHTTPResponse.json(response)
         }
@@ -403,7 +603,7 @@ public actor HeylookHTTPServer {
         let routerRef = self.router
         nwListener.newConnectionHandler = { connection in
             connection.start(queue: .global(qos: .userInitiated))
-            Self.receiveHTTPRequest(on: connection, router: routerRef)
+            Self.receiveHTTPRequest(on: connection, accumulated: Data(), router: routerRef)
         }
         nwListener.start(queue: .global(qos: .userInitiated))
         self.listener = nwListener
@@ -416,14 +616,52 @@ public actor HeylookHTTPServer {
         isRunning = false
     }
 
-    private nonisolated static func receiveHTTPRequest(on connection: NWConnection, router: HeylookRouter) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 4 * 1024 * 1024) { data, _, _, error in
-            guard let data, error == nil, !data.isEmpty else {
+    /// Assembles multi-frame HTTP requests up to the full `Content-Length` body before dispatching
+    /// so large base64 image/video/audio payloads are never truncated across TCP reads.
+    public nonisolated static func expectedTotalBytes(for rawData: Data) -> Int? {
+        let separator = Data("\r\n\r\n".utf8)
+        guard let range = rawData.range(of: separator) else { return nil }
+        let headerData = rawData.subdata(in: 0..<range.lowerBound)
+        let headerText = String(decoding: headerData, as: UTF8.self)
+        var contentLength = 0
+        for line in headerText.components(separatedBy: "\r\n").dropFirst() {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            if parts.count == 2,
+               parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length",
+               let len = Int(parts[1].trimmingCharacters(in: .whitespaces)) {
+                contentLength = max(0, len)
+                break
+            }
+        }
+        return range.upperBound + contentLength
+    }
+
+    private nonisolated static func receiveHTTPRequest(
+        on connection: NWConnection,
+        accumulated: Data,
+        router: HeylookRouter
+    ) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4 * 1024 * 1024) { chunk, _, isComplete, error in
+            var buffer = accumulated
+            if let chunk, !chunk.isEmpty {
+                buffer.append(chunk)
+            }
+            if error != nil || (buffer.isEmpty && isComplete) {
                 connection.cancel()
                 return
             }
+            if let expected = Self.expectedTotalBytes(for: buffer), buffer.count < expected, !isComplete {
+                Self.receiveHTTPRequest(on: connection, accumulated: buffer, router: router)
+                return
+            }
+            if Self.expectedTotalBytes(for: buffer) == nil && !isComplete {
+                Self.receiveHTTPRequest(on: connection, accumulated: buffer, router: router)
+                return
+            }
+
+            let finalBuffer = buffer
             Task {
-                let response = await Self.parseAndDispatch(rawData: data, router: router)
+                let response = await Self.parseAndDispatch(rawData: finalBuffer, router: router)
                 let serialized = Self.serializeHTTPResponse(response)
                 connection.send(content: serialized, completion: .contentProcessed { _ in
                     connection.cancel()

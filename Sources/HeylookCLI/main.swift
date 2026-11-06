@@ -91,12 +91,13 @@ struct HeylookCLI {
     }
 
     static func runModels() {
-        let cfg = HeylookConfig()
+        let cfg = HeylookConfig.loadDefault()
         let folderURLs = cfg.scanFolders.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
         let found = HeylookConfig.discoverModels(in: folderURLs)
-        print("Discovered \(found.count) models across \(cfg.scanFolders.count) configured folders.")
+        print("Discovered \(found.count) models across \(cfg.scanFolders.count) configured folders (\(cfg.explicitModels.count) explicit entries in heylook.toml).")
         for m in found {
-            print("- [\(m.provider.rawValue)] \(m.modelID) (\(m.modelPath))")
+            let mtpBadge = m.tags.contains("mtp") ? " [MTP]" : ""
+            print("- [\(m.provider.rawValue)] \(m.modelID)\(mtpBadge) ctx=\(m.contextSize.value) template=\(m.templateSource.value) (\(m.modelPath))")
         }
     }
 

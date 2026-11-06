@@ -561,4 +561,159 @@ struct HeylookTests {
         )
         #expect(remoteDelta?.textDelta == "Native Swift")
     }
+
+    @Test("HeylookConfig parses Python [scan] folders, [[models]], 4-rung GGUF template ladder, drafters, and 192 GB auto-sizing")
+    func testPythonHeylookTOMLAndGGUFTemplateLadderAndDrafter() throws {
+        let pythonTOML = """
+        default_model = "Qwen3.8-27B"
+        max_loaded_models = 4
+
+        [scan]
+        folders = [
+          "models/mlx",
+          "models/gguf",
+        ]
+
+        [[models]]
+        id = "Qwen3.8-27B"
+        provider = "gguf"
+        model_path = "models/gguf/Qwen3.8-27B.gguf"
+        ctx_size = 32768
+        """
+        let parsed = HeylookConfig.parseTOML(pythonTOML)
+        #expect(parsed.defaultModel == "Qwen3.8-27B")
+        #expect(parsed.scanFolders == ["models/mlx", "models/gguf"])
+        #expect(parsed.explicitModels.count == 1)
+        #expect(parsed.explicitModels.first?.id == "Qwen3.8-27B")
+        #expect(parsed.explicitModels.first?.provider == .gguf)
+        #expect(parsed.explicitModels.first?.sidecar.ctxSize == 32768)
+
+        let fm = FileManager.default
+        let modelDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("gguf_ladder_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: modelDir.appendingPathComponent("MTP"), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: modelDir) }
+
+        // Rung 4: Embedded fallback when no jinja files exist
+        let rung4 = HeylookConfig.resolveGGUFTemplate(in: modelDir, sidecar: nil)
+        #expect(rung4.source.value == "gguf_embedded")
+        #expect(rung4.source.provenance == .derived)
+
+        // Rung 3: chat_template.jinja sidecar
+        try "{{ messages }}".write(to: modelDir.appendingPathComponent("chat_template.jinja"), atomically: true, encoding: .utf8)
+        let rung3 = HeylookConfig.resolveGGUFTemplate(in: modelDir, sidecar: nil)
+        #expect(rung3.source.value == "chat_template.jinja")
+        #expect(rung3.source.provenance == .derived)
+
+        // Rung 2: chat_template.heylook.jinja operator override beats chat_template.jinja
+        try "{{ operator }}".write(to: modelDir.appendingPathComponent("chat_template.heylook.jinja"), atomically: true, encoding: .utf8)
+        let rung2 = HeylookConfig.resolveGGUFTemplate(in: modelDir, sidecar: nil)
+        #expect(rung2.source.value == "chat_template.heylook.jinja")
+        #expect(rung2.source.provenance == .configured)
+
+        // Drafter discovery in MTP/ subfolder + unset override
+        let drafterFile = modelDir.appendingPathComponent("MTP/mtp-qwen3.gguf")
+        try Data("GGUF".utf8).write(to: drafterFile)
+        let foundDrafter = HeylookConfig.discoverDrafter(in: modelDir, provider: .gguf, sidecar: nil)
+        #expect(foundDrafter.draftModelPath == drafterFile.standardizedFileURL.path)
+
+        var unsetSidecar = ModelSidecarConfig()
+        unsetSidecar.unsetKeys = ["draft_model_path", "spec_type"]
+        let suppressedDrafter = HeylookConfig.discoverDrafter(in: modelDir, provider: .gguf, sidecar: unsetSidecar)
+        #expect(suppressedDrafter.draftModelPath == nil)
+
+        // 192 GB RAM headroom auto-sizing (-ub 2048 and -cram >= 8192 MiB)
+        let desc = EngineDescription(
+            modelID: "qwen3.8-27b-gguf",
+            provider: .gguf,
+            modelPath: modelDir.path,
+            architecture: ProvenanceField(value: "qwen3", provenance: .derived),
+            quantization: ProvenanceField(value: "Q8_0", provenance: .derived),
+            computePlacement: ProvenanceField(value: .ggufSubprocess, provenance: .derived),
+            contextSize: ProvenanceField(value: 32768, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: false, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived),
+            estimatedMemoryMB: 28_000
+        )
+        let sized = GGUFSpawnConfig.autoSized(for: desc, headroomGB: 96.0)
+        #expect(sized.ubatchSize == 2048)
+        #expect(sized.cacheRAMMiB == 32768)
+        #expect(sized.draftModelPath == drafterFile.standardizedFileURL.path)
+    }
+
+    @Test("HeylookRouter serves GET /v1/capabilities, POST /v1/embeddings, streaming POST /v1/messages SSE, and multi-frame HTTP Content-Length")
+    func testStreamingMessagesEmbeddingsAndCapabilitiesRoutes() async throws {
+        let dbURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase2a_\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: dbURL) }
+        let store = try SQLiteStore(databaseURL: dbURL)
+        let scheduler = ComputeScheduler()
+        let desc = EngineDescription(
+            modelID: "qwen3.5-mlx",
+            provider: .mlx,
+            modelPath: "/tmp/qwen3.5",
+            architecture: ProvenanceField(value: "qwen3_5", provenance: .derived),
+            quantization: ProvenanceField(value: "8bit", provenance: .derived),
+            computePlacement: ProvenanceField(value: .mlxGPU, provenance: .derived),
+            contextSize: ProvenanceField(value: 32768, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: true, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+        await scheduler.register(provider: MLXSwiftProvider(description: desc), description: desc)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        // 1. GET /v1/capabilities
+        let capResp = await router.handle(method: "GET", path: "/v1/capabilities", headers: ["Host": "127.0.0.1:8000"])
+        #expect(capResp.status == 200)
+        let capJSON = try JSONSerialization.jsonObject(with: capResp.body) as? [String: Any]
+        #expect((capJSON?["max_request_media_bytes"] as? Int) == 24 * 1024 * 1024)
+
+        // 2. POST /v1/embeddings with Matryoshka 256d truncation
+        let embPayload = try JSONSerialization.data(withJSONObject: [
+            "model": "embedding-gemma2",
+            "input": ["Apple Neural Engine vision tower", "Metal GPU decode lane"],
+            "dimensions": 256,
+            "task": "query",
+        ])
+        let embResp = await router.handle(
+            method: "POST",
+            path: "/v1/embeddings",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: embPayload
+        )
+        #expect(embResp.status == 200)
+        let embJSON = try JSONSerialization.jsonObject(with: embResp.body) as? [String: Any]
+        let embData = embJSON?["data"] as? [[String: Any]]
+        #expect(embData?.count == 2)
+        let firstVec = embData?.first?["embedding"] as? [Double]
+        #expect(firstVec?.count == 256)
+
+        // 3. Streaming POST /v1/messages (stream: true)
+        let streamReq = MessagesRequest(
+            model: "qwen3.5-mlx",
+            messages: [MessagesRequest.MessageTurn(role: "user", content: "Stream SSE tokens")],
+            stream: true,
+            thinking: true
+        )
+        let streamResp = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(streamReq)
+        )
+        #expect(streamResp.status == 200)
+        #expect(streamResp.headers["Content-Type"] == "text/event-stream")
+        let sseText = String(decoding: streamResp.body, as: UTF8.self)
+        #expect(sseText.contains("event: message_start"))
+        #expect(sseText.contains("event: content_block_delta"))
+        #expect(sseText.contains("event: message_delta"))
+        #expect(sseText.contains("event: message_stop"))
+
+        // 4. Multi-frame HTTP Content-Length calculation
+        let rawHTTP = Data("POST /v1/embeddings HTTP/1.1\r\nHost: 127.0.0.1:8000\r\nContent-Length: 1024\r\n\r\nhello".utf8)
+        let expectedBytes = HeylookHTTPServer.expectedTotalBytes(for: rawHTTP)
+        #expect(expectedBytes == rawHTTP.count - 5 + 1024)
+    }
 }

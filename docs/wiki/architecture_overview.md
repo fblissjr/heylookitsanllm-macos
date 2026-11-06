@@ -4,12 +4,15 @@
 
 ---
 
-## 1. System Topology
+## 1. Execution Model: Direct In-Process Desktop vs. Optional Embedded Server
+
+- **On macOS (`HeylookApp`)**: All 5 workbench surfaces (**Chat**, **Notebook**, **Embeddings & Media Studio**, **Models**, and **Perf**) invoke `ComputeScheduler`, `MLXSwiftProvider`, `CoreAIProvider`, `GGUFSubprocessProvider`, `IndexCoordinator`, and `SQLiteStore` **directly in-process in Swift memory**. No separate Python server or background HTTP daemon is required to use the desktop app.
+- **Optional Embedded HTTP/SSE Listener (`HeylookHTTPServer`)**: Built directly into `HeylookApp` (as a Menu Bar / Perf tab toggle) and `heylook-cli serve`. Turning it on exposes the full `/v1/*` API (`POST /v1/messages`, `POST /v1/conversations/{id}/generate`, `POST /v1/embeddings`, `GET /v1/capabilities`, `GET /v1/models`) and advertises `_heylook._tcp` via Bonjour so the native **`iOS 27.2+` app** or external CLI scripts can drive the Mac Studio over LAN or Tailscale.
 
 ```mermaid
 flowchart TB
-    subgraph Clients["Native & Web Clients"]
-        MacDesktop["HeylookApp (macOS 27.2 Desktop + MenuBar)"]
+    subgraph Clients["Native & External Clients"]
+        MacDesktop["HeylookApp (macOS 27.2 Desktop — Direct In-Process)"]
         IOSClient["HeylookApp (iOS 27.2 Native App)"]
         CLI["heylook-cli (Command Line)"]
     end
@@ -17,22 +20,22 @@ flowchart TB
     subgraph SharedUI["HeylookUI (SwiftUI Multiplatform)"]
         ChatSurface["Chat Workbench"]
         NotebookSurface["Notebook"]
-        MediaSurface["Embeddings & Media Finder Studio"]
+        MediaSurface["Embeddings & Media Finder Studio (3-Column mbed)"]
         ModelsSurface["Models & EngineDescription Inspector"]
         PerfSurface["192 GB Memory, ANE/GPU & Server Monitor"]
     end
 
-    subgraph ServerLayer["HeylookServer (Hummingbird 2, macOS)"]
-        Router["/v1/* HTTP + SSE Router"]
-        GenCoord["ConversationGenerationCoordinator\n(Disconnect-Resilient Task + heylook_saved)"]
+    subgraph ServerLayer["HeylookServer (Optional Embedded Listener, macOS)"]
+        Router["/v1/* HTTP + SSE Router\n(/v1/messages, /v1/embeddings, /v1/capabilities)"]
+        GenCoord["Disconnect-Resilient Generation\n(/v1/conversations/{id}/generate + heylook_saved)"]
     end
 
     subgraph EngineLayer["HeylookEngines (Heterogeneous Compute)"]
         Sched["ComputeScheduler\n(GPU GenerationGate FIFO + ANE Co-Resident Lane)"]
-        MLX["MLXSwiftProvider\n(mlx-swift + mlx-swift-lm)"]
-        CoreAI["CoreAIProvider\n(coreai-models + argmax-oss-swift)"]
-        GGUF["GGUFSubprocessProvider\n(llama-server -np 1)"]
-        Remote["RemoteHeylookProvider\n(URLSession SSE Client)"]
+        MLX["MLXSwiftProvider\n(mlx-swift + mlx-swift-lm + PrefixCacheTracker)"]
+        CoreAI["CoreAIProvider\n(coreai-models .aimodel + SpeculativeReport)"]
+        GGUF["GGUFSubprocessProvider\n(llama-server -np 1 + 4-Rung Template + Auto-MTP)"]
+        Remote["RemoteHeylookProvider\n(URLSession SSE Client for iOS)"]
     end
 
     subgraph EmbeddingLayer["HeylookEmbeddings (Folded from mbed)"]
@@ -80,7 +83,7 @@ flowchart TB
    - `value`: effective value in force,
    - `provenance`: `derived` | `configured` | `observed` | `observed_cached` | `unknown` | `not_applicable`,
    - `effect`: `per_request` | `reload` | `restart`,
-   - `computeUnit`: `mlx_gpu` | `ane` | `cpu_and_gpu` | `cpu_only` | `gguf_subprocess` | `remote`.
+   - `computePlacement`: `mlx_gpu` | `ane` | `hybrid_ane_gpu` | `cpu_and_gpu` | `cpu_only` | `gguf_subprocess` | `remote`.
 2. **Heterogeneous GPU + ANE Co-Residency (`ComputeScheduler`)**:
    - **GPU Lane (`GenerationGate`)**: Serializes Metal GPU LLM/VLM generation with bounded FIFO queue depth (`max_queue_depth`), answering `503 model_overloaded` on overflow.
    - **ANE Co-Resident Lane (`ANELane`)**: Runs ANE-assigned models and towers (`TowerComputeUnit.cpuAndNeuralEngine`) concurrently on the Apple Neural Engine without acquiring the GPU gate or evicting pinned GPU models.
