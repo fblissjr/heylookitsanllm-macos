@@ -11,6 +11,7 @@ import MLX
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
+import MLXNN
 import Tokenizers
 #endif
 
@@ -654,9 +655,12 @@ public actor MLXSwiftProvider: InferenceProvider {
     private var unloadCount: Int = 0
 
     #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
+    private final class MLXKVCacheBox: @unchecked Sendable {
+        var caches: [KVCache]? = nil
+    }
     private var loadedContainer: ModelContainer?
-    private var loadedTokenizer: (any Tokenizer)?
-    private var cachedKVCaches: [KVCache]?
+    private var loadedTokenizer: (any MLXLMCommon.Tokenizer)?
+    private let kvCacheBox = MLXKVCacheBox()
     #endif
 
     private var effectiveTokenCounter: (@Sendable (String) -> Int)? {
@@ -736,7 +740,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
         loadedContainer = nil
         loadedTokenizer = nil
-        cachedKVCaches = nil
+        kvCacheBox.caches = nil
         MLX.Memory.clearCache()
         #endif
     }
@@ -772,7 +776,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
         if Self.hasSafetensorsWeights(at: descriptionState.modelPath) {
             if cacheReport.outcome == .miss {
-                cachedKVCaches = nil
+                kvCacheBox.caches = nil
             }
             return generateWithMLXContainer(
                 requestID: requestID,
@@ -913,63 +917,74 @@ public actor MLXSwiftProvider: InferenceProvider {
             Task {
                 do {
                     let container = try await self.ensureContainerLoaded()
-                    var chatMessages: [Chat.Message] = []
-                    if let sys = request.system, !sys.isEmpty {
-                        chatMessages.append(.system(sys))
-                    }
-                    for m in request.messages {
-                        switch m.role.lowercased() {
-                        case "assistant":
-                            chatMessages.append(.assistant(m.content))
-                        case "system":
-                            chatMessages.append(.system(m.content))
-                        default:
-                            var turnImages: [UserInput.Image] = []
-                            #if canImport(CoreImage)
-                            for att in m.attachments where att.kind == "image" {
-                                if let data = Data(base64Encoded: att.dataBase64),
-                                   let ciImg = CIImage(data: data) {
-                                    turnImages.append(.ciImage(ciImg))
-                                }
-                            }
-                            #endif
-                            chatMessages.append(.user(m.content, images: turnImages))
-                        }
-                    }
-
-                    var additionalContext: [String: any Sendable] = [:]
+                    var additionalContextDraft: [String: any Sendable] = [:]
                     let switchKey = self.templateInfo.thinkingControls.switchVariable ?? "enable_thinking"
-                    additionalContext[switchKey] = enableThinking
+                    additionalContextDraft[switchKey] = enableThinking
                     if let depthVar = self.templateInfo.thinkingControls.depthVariable,
                        let depthVal = effectiveSampling.thinkingDepth ?? request.thinkingDepth,
                        !depthVal.isEmpty {
-                        additionalContext[depthVar] = depthVal
+                        additionalContextDraft[depthVar] = depthVal
                     }
-                    let userInput = UserInput(
-                        chat: chatMessages,
-                        additionalContext: additionalContext
-                    )
-                    let lmInput = try await container.prepare(input: userInput)
-                    let genParams = GenerateParameters(
+                    let additionalContext = additionalContextDraft
+                    var genParamsDraft = GenerateParameters(
                         maxTokens: effectiveSampling.maxTokens ?? 2048,
                         temperature: Float(effectiveSampling.temperature ?? 0.7),
-                        topP: Float(effectiveSampling.topP ?? 0.95),
-                        repetitionPenalty: effectiveSampling.repetitionPenalty.map(Float.init),
-                        repetitionContextSize: effectiveSampling.repetitionContextSize ?? 64
+                        topP: Float(effectiveSampling.topP ?? 0.95)
                     )
+                    genParamsDraft.topK = effectiveSampling.topK ?? 0
+                    genParamsDraft.minP = Float(effectiveSampling.minP ?? 0)
+                    if let seed = effectiveSampling.seed {
+                        genParamsDraft.seed = UInt64(bitPattern: Int64(seed))
+                    }
+                    if let repPen = effectiveSampling.repetitionPenalty {
+                        genParamsDraft.repetitionPenalty = Float(repPen)
+                    }
+                    genParamsDraft.repetitionContextSize = effectiveSampling.repetitionContextSize ?? 64
+                    if let presPen = effectiveSampling.presencePenalty {
+                        genParamsDraft.presencePenalty = Float(presPen)
+                    }
+                    let genParams = genParamsDraft
 
-                    let totalPromptTokens = lmInput.text.tokens.size
-                    let existingCaches = self.cachedKVCaches
-                    let (stream, updatedCaches): (AsyncStream<Generation>, [KVCache]) = try await container.perform { context in
+                    let cacheBox = self.kvCacheBox
+                    let (stream, totalPromptTokens): (AsyncStream<Generation>, Int) = try await container.perform { context in
+                        var chatMessages: [Chat.Message] = []
+                        if let sys = request.system, !sys.isEmpty {
+                            chatMessages.append(.system(sys))
+                        }
+                        for m in request.messages {
+                            switch m.role.lowercased() {
+                            case "assistant":
+                                chatMessages.append(.assistant(m.content))
+                            case "system":
+                                chatMessages.append(.system(m.content))
+                            default:
+                                var turnImages: [UserInput.Image] = []
+                                #if canImport(CoreImage)
+                                for att in m.attachments where att.kind == "image" {
+                                    if let data = Data(base64Encoded: att.dataBase64),
+                                       let ciImg = CIImage(data: data) {
+                                        turnImages.append(.ciImage(ciImg))
+                                    }
+                                }
+                                #endif
+                                chatMessages.append(.user(m.content, images: turnImages))
+                            }
+                        }
+                        let userInput = UserInput(
+                            chat: chatMessages,
+                            additionalContext: additionalContext
+                        )
+                        let lmInput = try await context.processor.prepare(input: userInput)
+                        let promptTokenCount = lmInput.text.tokens.size
                         let activeCaches: [KVCache]
                         let effectiveInput: LMInput
                         if cacheReport.outcome == .reused,
-                           let existingCaches,
+                           let existingCaches = cacheBox.caches,
                            lmInput.image == nil,
                            lmInput.video == nil,
                            lmInput.audio == nil,
                            cacheReport.cachedTokens > 0,
-                           cacheReport.cachedTokens < totalPromptTokens
+                           cacheReport.cachedTokens < promptTokenCount
                         {
                             for cache in existingCaches where cache.isTrimmable && cache.offset > cacheReport.cachedTokens {
                                 _ = cache.trim(cache.offset - cacheReport.cachedTokens)
@@ -977,18 +992,18 @@ public actor MLXSwiftProvider: InferenceProvider {
                             activeCaches = existingCaches
                             effectiveInput = LMInput(text: lmInput.text[cacheReport.cachedTokens...])
                         } else {
-                            activeCaches = context.model.newCache(parameters: genParams)
+                            activeCaches = try context.model.newCache(parameters: genParams)
                             effectiveInput = lmInput
                         }
+                        cacheBox.caches = activeCaches
                         let genStream = try MLXLMCommon.generate(
                             input: effectiveInput,
                             cache: activeCaches,
                             parameters: genParams,
                             context: context
                         )
-                        return (genStream, activeCaches)
+                        return (genStream, promptTokenCount)
                     }
-                    self.cachedKVCaches = updatedCaches
                     self.kvSession.cachedTokenCount = max(cacheReport.cachedTokens, totalPromptTokens)
 
                     var reasoningParser = ReasoningParser(
@@ -1136,7 +1151,7 @@ public actor CoreAIProvider: InferenceProvider {
 
     #if canImport(CoreAILanguageModels)
     private var loadedCoreAIBundle: LanguageModelBundle?
-    private var loadedCoreAITokenizer: (any Tokenizer)?
+    private var loadedCoreAITokenizer: (any Tokenizers.Tokenizer)?
     private var loadedCoreAIEngine: (any InferenceEngine)?
     #endif
 
@@ -1291,7 +1306,7 @@ public actor CoreAIProvider: InferenceProvider {
     }
 
     #if canImport(CoreAILanguageModels)
-    private func ensureCoreAILoaded() async throws -> (LanguageModelBundle, any Tokenizer, any InferenceEngine) {
+    private func ensureCoreAILoaded() async throws -> (LanguageModelBundle, any Tokenizers.Tokenizer, any InferenceEngine) {
         if let b = loadedCoreAIBundle, let t = loadedCoreAITokenizer, let e = loadedCoreAIEngine {
             return (b, t, e)
         }
@@ -2831,7 +2846,7 @@ public enum MLXModelConverter {
         from sourceDirectory: URL,
         to outputDirectory: URL,
         spec: MLXConversionSpec = .init(),
-        progressHandler: @Sendable (String) -> Void = { _ in }
+        progressHandler: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> (plan: MLXConversionPlan, weightsURLs: [URL]) {
         let plan = try planConversion(from: sourceDirectory, to: outputDirectory, spec: spec)
 

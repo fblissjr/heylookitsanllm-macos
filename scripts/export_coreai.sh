@@ -21,8 +21,7 @@ resolve_coreai_repo() {
     return 0
   fi
   for candidate in \
-    "${HOME}/mlx/apple-coreai/coreai-models" \
-    "${HOME}/mlx/apple-coreai/coreai/coreai-models" \
+    "./coreai-models" \
     "../coreai-models"; do
     if [[ -d "${candidate}" ]]; then
       (cd "${candidate}" && pwd)

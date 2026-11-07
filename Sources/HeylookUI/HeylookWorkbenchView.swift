@@ -133,6 +133,12 @@ public final class HeylookWorkbenchViewModel {
     public var compareRightText: String = "Running MLX and CoreML ANE vision towers concurrently on Mac Studio"
     public var compareCosineScore: Float?
     public var aneInspectionReports: [ANETowerInspector.ComponentComputeReport] = []
+    public var benchmarkCases: [EmbeddingLabRunner.BenchmarkCase] = [
+        .init(query: "Apple Neural Engine co-residency", expectedArtifactID: "doc-vision"),
+        .init(query: "evict 70B LLM background indexing", expectedArtifactID: "doc-scheduler"),
+        .init(query: "Matryoshka 768d to 128d truncation", expectedArtifactID: "doc-towers"),
+        .init(query: "heylook_saved SQLite WAL mobile lock screen", expectedArtifactID: "doc-sse")
+    ]
     public var labMetrics: [EmbeddingLabRunner.DimensionMetrics] = []
     public var evalLabSuiteReport: EvalLabSuite.SuiteReport?
     public var isRunningEvalLab: Bool = false
@@ -1096,13 +1102,35 @@ public final class HeylookWorkbenchViewModel {
     }
 
     public func runEmbeddingLabEvaluation() async {
-        let cases: [EmbeddingLabRunner.BenchmarkCase] = [
-            .init(query: "Apple Neural Engine co-residency", expectedArtifactID: "doc-vision"),
-            .init(query: "evict 70B LLM background indexing", expectedArtifactID: "doc-scheduler"),
-            .init(query: "Matryoshka 768d to 128d truncation", expectedArtifactID: "doc-towers"),
-            .init(query: "heylook_saved SQLite WAL mobile lock screen", expectedArtifactID: "doc-sse")
-        ]
-        labMetrics = (try? await EmbeddingLabRunner.evaluate(coordinator: indexCoordinator, cases: cases)) ?? []
+        labMetrics = (try? await EmbeddingLabRunner.evaluate(coordinator: indexCoordinator, cases: benchmarkCases)) ?? []
+    }
+
+    public func sendHitToPairwiseCompare(_ hit: SearchHit) {
+        let q = embeddingQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        compareLeftText = q.isEmpty ? hit.artifact.title : q
+        compareRightText = hit.previewText ?? hit.artifact.title
+        showEvalLabDrawer = true
+        runPairwiseCompare()
+    }
+
+    public func pinHitToRetrievalLab(_ hit: SearchHit) async {
+        let q = embeddingQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let queryText = q.isEmpty ? hit.artifact.title : q
+        if !benchmarkCases.contains(where: { $0.query == queryText && $0.expectedArtifactID == hit.artifact.id }) {
+            benchmarkCases.append(.init(query: queryText, expectedArtifactID: hit.artifact.id))
+        }
+        showEvalLabDrawer = true
+        await runEmbeddingLabEvaluation()
+    }
+
+    public func promoteComparePairToRetrievalLab() async {
+        guard let hit = selectedHit ?? searchHits.first else { return }
+        let queryText = compareLeftText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !queryText.isEmpty else { return }
+        if !benchmarkCases.contains(where: { $0.query == queryText && $0.expectedArtifactID == hit.artifact.id }) {
+            benchmarkCases.append(.init(query: queryText, expectedArtifactID: hit.artifact.id))
+        }
+        await runEmbeddingLabEvaluation()
     }
 
     @discardableResult
@@ -1904,7 +1932,13 @@ struct EmbeddingsStudioSurface: View {
 
             EmbeddingsInspectorView(
                 hit: viewModel.selectedHit,
-                selectedDimension: viewModel.selectedDimension
+                selectedDimension: viewModel.selectedDimension,
+                onSendToCompare: { hit in
+                    viewModel.sendHitToPairwiseCompare(hit)
+                },
+                onPinToLab: { hit in
+                    Task { await viewModel.pinHitToRetrievalLab(hit) }
+                }
             )
             .frame(minWidth: 340, idealWidth: 400)
         }
@@ -1915,7 +1949,13 @@ struct EmbeddingsStudioSurface: View {
                 EmbeddingsSearchAndResultsView(viewModel: viewModel)
                 EmbeddingsInspectorView(
                     hit: viewModel.selectedHit,
-                    selectedDimension: viewModel.selectedDimension
+                    selectedDimension: viewModel.selectedDimension,
+                    onSendToCompare: { hit in
+                        viewModel.sendHitToPairwiseCompare(hit)
+                    },
+                    onPinToLab: { hit in
+                        Task { await viewModel.pinHitToRetrievalLab(hit) }
+                    }
                 )
             }
             .padding(12)
@@ -2485,6 +2525,16 @@ private struct EmbeddingsSearchAndResultsView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
 
+                        Button {
+                            Task { await viewModel.promoteComparePairToRetrievalLab() }
+                        } label: {
+                            Label("Add to Lab (\(viewModel.benchmarkCases.count))", systemImage: "plus.square.on.square")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(viewModel.selectedHit == nil && viewModel.searchHits.isEmpty)
+                        .help("Promote Left query + selected artifact into the Retrieval Lab benchmark suite")
+
                         if let score = viewModel.compareCosineScore {
                             Text(String(format: "%dd Cosine: %.4f", viewModel.selectedDimension, score))
                                 .font(.caption.monospaced().weight(.bold))
@@ -2750,6 +2800,8 @@ private struct ThumbnailBadge: View {
 private struct EmbeddingsInspectorView: View {
     let hit: SearchHit?
     let selectedDimension: Int
+    var onSendToCompare: ((SearchHit) -> Void)? = nil
+    var onPinToLab: ((SearchHit) -> Void)? = nil
     @State private var player: AVPlayer?
     @State private var selectedChunkID: String?
 
@@ -2783,6 +2835,31 @@ private struct EmbeddingsInspectorView: View {
                             }
                         }
                         Spacer()
+                    }
+
+                    // Compare-to-Lab Bridge Actions
+                    if onSendToCompare != nil || onPinToLab != nil {
+                        HStack(spacing: 8) {
+                            if let onSendToCompare {
+                                Button {
+                                    onSendToCompare(hit)
+                                } label: {
+                                    Label("Compare in Lab", systemImage: "arrow.left.and.right.square")
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                            if let onPinToLab {
+                                Button {
+                                    onPinToLab(hit)
+                                } label: {
+                                    Label("Pin to Retrieval Lab", systemImage: "chart.bar.doc.horizontal")
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                            Spacer()
+                        }
                     }
 
                     Divider()

@@ -148,10 +148,11 @@ struct HeylookCLI {
             print("Error: missing path to index. Usage: heylook-cli index <path> [--sampling fps|content|off] [--audio-from-video] [--compute all_gpu|hybrid_ane|all_ane]")
             return
         }
-        var sampling: VideoWindowSampling = .content
+        var sampling: VideoWindowSampling = .fps
         if let sIdx = args.firstIndex(of: "--sampling"), sIdx + 1 < args.count {
             let val = args[sIdx + 1].lowercased()
             if val == "fps" { sampling = .fps }
+            else if val == "content" { sampling = .content }
             else if val == "off" { sampling = .off }
         }
         let includeAudio = args.contains("--audio-from-video") || !args.contains("--no-audio-from-video")

@@ -318,32 +318,66 @@ public actor HeylookRouter {
                     )
                 }
                 if segments.count == 4 && segments[3] == "prompt" && method.uppercased() == "POST" {
+                    struct PromptRequest: Decodable {
+                        var model: String?
+                        var system: String?
+                        var thinking: Bool?
+                        var thinking_depth: String?
+                        var reasoning_effort: String?
+                    }
                     struct PromptResponse: Encodable {
                         let conversation_id: String
                         let prompt: String
                         let template_source: String
                         let message_count: Int
+                        let thinking_enabled: Bool
+                        let thinking_depth: String?
                     }
+                    let promptReq = body.isEmpty ? nil : (try? JSONDecoder().decode(PromptRequest.self, from: body))
                     let conv = try store.getConversation(id: convID)
                     let msgs = try store.listMessages(conversationID: convID)
-                    var modelDirURL: URL?
-                    if let defaultModelID = conv?.defaultModelID,
-                       let desc = await scheduler.modelDescription(for: defaultModelID) {
-                        modelDirURL = URL(fileURLWithPath: desc.modelPath)
+                    let requestedModelID = promptReq?.model ?? conv?.defaultModelID
+                    var modelDesc: EngineDescription?
+                    if let requestedModelID,
+                       let desc = await scheduler.modelDescription(for: requestedModelID) {
+                        modelDesc = desc
                     } else if let firstModel = await scheduler.listModels().first {
-                        modelDirURL = URL(fileURLWithPath: firstModel.modelPath)
+                        modelDesc = firstModel
                     }
+                    let modelDirURL = modelDesc.map { URL(fileURLWithPath: $0.modelPath) }
+                    let requestOverlay = SamplerSettings(
+                        thinking: promptReq?.thinking,
+                        thinkingDepth: promptReq?.thinking_depth ?? promptReq?.reasoning_effort
+                    )
+                    let resolvedSamplers = HeylookConfig.resolveEffectiveSampling(
+                        modelPath: modelDesc?.modelPath,
+                        request: requestOverlay
+                    )
+                    let effectiveThinking = promptReq?.thinking
+                        ?? resolvedSamplers.effective.thinking
+                        ?? modelDesc?.thinkingControls?.defaultEnabled
+                        ?? modelDesc?.supportsThinking.value
+                        ?? true
+                    let effectiveDepth = (promptReq?.thinking_depth ?? promptReq?.reasoning_effort)
+                        ?? resolvedSamplers.effective.thinkingDepth
+                        ?? (modelDesc?.thinkingControls?.depthValues.contains("medium") == true
+                            ? "medium"
+                            : modelDesc?.thinkingControls?.depthValues.first)
                     let rendered = HeylookConfig.renderPromptPreview(
                         in: modelDirURL,
-                        system: conv?.systemPrompt,
-                        messages: msgs.map { (role: $0.role, content: $0.content, thinking: $0.thinking) }
+                        system: promptReq?.system ?? conv?.systemPrompt,
+                        messages: msgs.map { (role: $0.role, content: $0.content, thinking: $0.thinking) },
+                        thinkingEnabled: effectiveThinking,
+                        thinkingDepth: effectiveDepth
                     )
                     return try .json(
                         PromptResponse(
                             conversation_id: convID,
                             prompt: rendered.prompt,
                             template_source: rendered.source,
-                            message_count: msgs.count
+                            message_count: msgs.count,
+                            thinking_enabled: effectiveThinking,
+                            thinking_depth: effectiveDepth
                         )
                     )
                 }

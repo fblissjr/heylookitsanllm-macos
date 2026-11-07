@@ -207,7 +207,7 @@ public struct EngineDescription: Codable, Identifiable, Sendable, Equatable {
     public var isLoaded: Bool
     public let contextSize: ProvenanceField<Int>
     public let flashAttention: ProvenanceField<Bool>
-    public let supportsVision: ProvenanceField<Bool>
+    public var supportsVision: ProvenanceField<Bool>
     public let supportsAudio: ProvenanceField<Bool>
     public let supportsEmbeddings: ProvenanceField<Bool>
     public let supportsThinking: ProvenanceField<Bool>

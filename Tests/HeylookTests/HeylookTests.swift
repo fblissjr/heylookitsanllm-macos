@@ -2067,5 +2067,48 @@ struct HeylookTests {
                 spec: MLXConversionSpec()
             )
         }
+
+        // 13. POST /v1/conversations/{id}/prompt forwards effective `thinking_enabled` & `thinking_depth`
+        let promptDbURL = tempRoot.appendingPathComponent("prompt_preview.sqlite")
+        let promptStore = try SQLiteStore(databaseURL: promptDbURL)
+        let promptScheduler = ComputeScheduler()
+        let harmonyDesc = EngineDescription(
+            modelID: "gpt-oss-harmony",
+            provider: .mlx,
+            modelPath: harmonyDir.path,
+            reasoningFormat: ProvenanceField(value: "harmony", provenance: .derived),
+            thinkingControls: ThinkingControls(
+                supportsThinking: true,
+                canDisableThinking: true,
+                defaultEnabled: true,
+                depthVariable: "reasoning_effort",
+                depthValues: ["low", "medium", "high"]
+            )
+        )
+        await promptScheduler.register(provider: MLXSwiftProvider(description: harmonyDesc), description: harmonyDesc)
+        let promptRouter = HeylookRouter(store: promptStore, scheduler: promptScheduler)
+        let harmonyConv = ConversationRecord(
+            id: "conv_harmony_prompt",
+            title: "Harmony Prompt Inspector",
+            systemPrompt: "Be precise.",
+            defaultModelID: "gpt-oss-harmony"
+        )
+        try promptStore.upsertConversation(harmonyConv)
+        _ = try promptStore.appendMessage(
+            MessageRecord(conversationID: "conv_harmony_prompt", position: 0, role: "user", content: "Inspect reasoning effort")
+        )
+
+        let highEffortPromptResp = await promptRouter.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_harmony_prompt/prompt",
+            headers: ["Host": "127.0.0.1:8000", "Content-Type": "application/json"],
+            body: try JSONSerialization.data(withJSONObject: ["reasoning_effort": "high"])
+        )
+        #expect(highEffortPromptResp.status == 200)
+        let highEffortJSON = try JSONSerialization.jsonObject(with: highEffortPromptResp.body) as? [String: Any]
+        #expect((highEffortJSON?["thinking_enabled"] as? Bool) == true)
+        #expect((highEffortJSON?["thinking_depth"] as? String) == "high")
+        let renderedHighEffortPrompt = (highEffortJSON?["prompt"] as? String) ?? ""
+        #expect(renderedHighEffortPrompt.contains("# reasoning_effort = high"))
     }
 }
