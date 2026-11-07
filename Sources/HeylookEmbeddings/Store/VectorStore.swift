@@ -969,7 +969,7 @@ public enum EmbeddingLabRunner {
         }
     }
 
-    public struct DimensionMetrics: Sendable, Equatable {
+    public struct DimensionMetrics: Codable, Sendable, Equatable {
         public let dimensions: Int
         public let recallAt1: Double
         public let recallAt3: Double

@@ -520,6 +520,16 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                let mt = cfgJSON["model_type"] as? String {
                 modelType = mt.lowercased()
             }
+            if templateText.isEmpty, let ggufURL = firstGGUFFile(in: candidateDir),
+               let ggufHeader = GGUFHeaderReader.readFileHeader(at: ggufURL) {
+                if let embedded = ggufHeader.embeddedChatTemplate, !embedded.isEmpty {
+                    templateText = embedded
+                    source = "gguf_embedded"
+                }
+                if modelType.isEmpty, let arch = ggufHeader.architecture {
+                    modelType = arch.lowercased()
+                }
+            }
         }
 
         let usesGemmaTurnMarkers = templateText.contains("<start_of_turn>")
@@ -701,8 +711,10 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 let placementValue = sidecar?.computePlacement ?? defaultPlacement
                 let placementProv: ProvenanceSource = sidecar?.computePlacement != nil ? .configured : .derived
 
+                let ggufHeader = primaryGGUFURL.flatMap { GGUFHeaderReader.readFileHeader(at: $0) }
                 let archString = (configJSON?["model_type"] as? String)
                     ?? (configJSON?["architectures"] as? [String])?.first
+                    ?? ggufHeader?.architecture
                     ?? provider.rawValue
                 let isEmbedding = modelID.localizedCaseInsensitiveContains("embed")
                     || archString.localizedCaseInsensitiveContains("embedding")
@@ -716,6 +728,7 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 let hasAudio = configJSON?["audio_config"] != nil || isEmbedding
                 let ctxValue = sidecar?.ctxSize
                     ?? (configJSON?["max_position_embeddings"] as? Int)
+                    ?? ggufHeader?.contextLength
                     ?? 8192
 
                 let templateField: ProvenanceField<String>
@@ -809,6 +822,18 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
         return obj
+    }
+
+    private static func firstGGUFFile(in candidateDir: URL) -> URL? {
+        if candidateDir.pathExtension.lowercased() == "gguf" {
+            return candidateDir
+        }
+        guard let items = try? FileManager.default.contentsOfDirectory(at: candidateDir, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+        return items
+            .sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+            .first(where: { $0.pathExtension.lowercased() == "gguf" && !$0.lastPathComponent.lowercased().contains("mmproj") })
     }
 
     private static func inferQuantization(from modelID: String, configJSON: [String: Any]?) -> String {
@@ -962,5 +987,211 @@ enum SimpleTOML {
             result.append(ch)
         }
         return result
+    }
+}
+
+/// Pure-Swift GGUF v2/v3 binary header reader that inspects magic bytes, version,
+/// tensor/KV counts, and string/integer metadata without spawning a C++ process.
+public enum GGUFHeaderReader {
+    public struct HeaderSummary: Sendable, Equatable {
+        public let version: UInt32
+        public let tensorCount: UInt64
+        public let metadataKVCount: UInt64
+        public let stringMetadata: [String: String]
+        public let uintMetadata: [String: UInt64]
+
+        public init(
+            version: UInt32,
+            tensorCount: UInt64,
+            metadataKVCount: UInt64,
+            stringMetadata: [String: String] = [:],
+            uintMetadata: [String: UInt64] = [:]
+        ) {
+            self.version = version
+            self.tensorCount = tensorCount
+            self.metadataKVCount = metadataKVCount
+            self.stringMetadata = stringMetadata
+            self.uintMetadata = uintMetadata
+        }
+
+        public var architecture: String? {
+            stringMetadata["general.architecture"]
+        }
+
+        public var embeddedChatTemplate: String? {
+            stringMetadata["tokenizer.chat_template"]
+        }
+
+        public var contextLength: Int? {
+            if let arch = architecture, let val = uintMetadata["\(arch).context_length"] {
+                return Int(val)
+            }
+            if let entry = uintMetadata.first(where: { $0.key.hasSuffix(".context_length") }) {
+                return Int(entry.value)
+            }
+            return nil
+        }
+    }
+
+    public static func readFileHeader(at url: URL, maxBytes: Int = 262_144) -> HeaderSummary? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: maxBytes) else { return nil }
+        return readHeader(from: data)
+    }
+
+    public static func readHeader(from data: Data) -> HeaderSummary? {
+        guard data.count >= 24 else { return nil }
+        let magic = String(decoding: data.prefix(4), as: UTF8.self)
+        guard magic == "GGUF" else { return nil }
+
+        let version = data.subdata(in: 4..<8).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
+        guard version == 2 || version == 3 else { return nil }
+        let tensorCount = data.subdata(in: 8..<16).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
+        let kvCount = data.subdata(in: 16..<24).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
+
+        var offset = 24
+        var strings: [String: String] = [:]
+        var uints: [String: UInt64] = [:]
+
+        func readUInt32() -> UInt32? {
+            guard offset + 4 <= data.count else { return nil }
+            let val = data.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
+                $0.loadUnaligned(as: UInt32.self).littleEndian
+            }
+            offset += 4
+            return val
+        }
+
+        func readUInt64() -> UInt64? {
+            guard offset + 8 <= data.count else { return nil }
+            let val = data.subdata(in: offset..<(offset + 8)).withUnsafeBytes {
+                $0.loadUnaligned(as: UInt64.self).littleEndian
+            }
+            offset += 8
+            return val
+        }
+
+        func readString() -> String? {
+            guard let len = readUInt64() else { return nil }
+            guard len <= 1_048_576, offset + Int(len) <= data.count else { return nil }
+            let strData = data.subdata(in: offset..<(offset + Int(len)))
+            offset += Int(len)
+            return String(decoding: strData, as: UTF8.self)
+        }
+
+        func skipOrReadValue(type: UInt32, key: String?) -> Bool {
+            switch type {
+            case 0: // UINT8
+                guard offset + 1 <= data.count else { return false }
+                let b = data[offset]
+                offset += 1
+                if let key { uints[key] = UInt64(b) }
+                return true
+            case 1, 7: // INT8, BOOL
+                guard offset + 1 <= data.count else { return false }
+                offset += 1
+                return true
+            case 2: // UINT16
+                guard offset + 2 <= data.count else { return false }
+                let v = data.subdata(in: offset..<(offset + 2)).withUnsafeBytes {
+                    $0.loadUnaligned(as: UInt16.self).littleEndian
+                }
+                offset += 2
+                if let key { uints[key] = UInt64(v) }
+                return true
+            case 3: // INT16
+                guard offset + 2 <= data.count else { return false }
+                offset += 2
+                return true
+            case 4: // UINT32
+                guard let v = readUInt32() else { return false }
+                if let key { uints[key] = UInt64(v) }
+                return true
+            case 5, 6: // INT32, FLOAT32
+                guard offset + 4 <= data.count else { return false }
+                offset += 4
+                return true
+            case 8: // STRING
+                guard let str = readString() else { return false }
+                if let key { strings[key] = str }
+                return true
+            case 9: // ARRAY
+                guard let elemType = readUInt32(), let count = readUInt64(), count <= 65536 else { return false }
+                for _ in 0..<count {
+                    if !skipOrReadValue(type: elemType, key: nil) { return false }
+                }
+                return true
+            case 10: // UINT64
+                guard let v = readUInt64() else { return false }
+                if let key { uints[key] = v }
+                return true
+            case 11, 12: // INT64, FLOAT64
+                guard offset + 8 <= data.count else { return false }
+                offset += 8
+                return true
+            default:
+                return false
+            }
+        }
+
+        let maxEntries = min(kvCount, 2048)
+        for _ in 0..<maxEntries {
+            guard offset < data.count else { break }
+            guard let key = readString(), let valType = readUInt32() else { break }
+            if !skipOrReadValue(type: valType, key: key) {
+                break
+            }
+        }
+
+        return HeaderSummary(
+            version: version,
+            tensorCount: tensorCount,
+            metadataKVCount: kvCount,
+            stringMetadata: strings,
+            uintMetadata: uints
+        )
+    }
+
+    /// Builds a valid GGUF v2/v3 binary header with embedded string and uint32 KV entries.
+    public static func buildMinimalGGUF(
+        version: UInt32 = 3,
+        tensorCount: UInt64 = 0,
+        stringMetadata: [String: String] = [:],
+        uint32Metadata: [String: UInt32] = [:]
+    ) -> Data {
+        var data = Data("GGUF".utf8)
+        var verLE = version.littleEndian
+        var tcLE = tensorCount.littleEndian
+        let totalKV = UInt64(stringMetadata.count + uint32Metadata.count)
+        var kvLE = totalKV.littleEndian
+
+        withUnsafeBytes(of: &verLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &tcLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &kvLE) { data.append(contentsOf: $0) }
+
+        func appendString(_ s: String) {
+            let utf8 = Array(s.utf8)
+            var lenLE = UInt64(utf8.count).littleEndian
+            withUnsafeBytes(of: &lenLE) { data.append(contentsOf: $0) }
+            data.append(contentsOf: utf8)
+        }
+
+        func appendUInt32(_ v: UInt32) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+
+        for (k, v) in stringMetadata.sorted(by: { $0.key < $1.key }) {
+            appendString(k)
+            appendUInt32(8) // STRING
+            appendString(v)
+        }
+        for (k, v) in uint32Metadata.sorted(by: { $0.key < $1.key }) {
+            appendString(k)
+            appendUInt32(4) // UINT32
+            appendUInt32(v)
+        }
+        return data
     }
 }

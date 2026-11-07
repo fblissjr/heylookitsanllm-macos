@@ -36,6 +36,34 @@ public struct HeylookHTTPResponse: Sendable, Equatable {
     }
 }
 
+/// Request payload for `POST /v1/conversations/{id}/voice-generate` (hands-free iOS/macOS ANE
+/// speech transcription + disconnect-resilient server-owned generation handoff).
+public struct ConversationVoiceGenerateRequest: Codable, Sendable, Equatable {
+    public var model: String
+    public var audioBase64: String
+    public var languageHint: String?
+    public var sampling: SamplerSettings?
+
+    public enum CodingKeys: String, CodingKey {
+        case model
+        case audioBase64 = "audio_base64"
+        case languageHint = "language_hint"
+        case sampling
+    }
+
+    public init(
+        model: String,
+        audioBase64: String,
+        languageHint: String? = "en",
+        sampling: SamplerSettings? = nil
+    ) {
+        self.model = model
+        self.audioBase64 = audioBase64
+        self.languageHint = languageHint
+        self.sampling = sampling
+    }
+}
+
 /// Authoritative `/v1/*` API router implementing the `heylook` Messages wire,
 /// disconnect-resilient `/v1/conversations/{id}/generate`, `/v1/embeddings`, `/v1/capabilities`,
 /// `/v1/models`, `/v1/requests/{id}`, `/v1/conversations/*`, `/v1/presets/*`, and `/v1/system/metrics`.
@@ -241,6 +269,52 @@ public actor HeylookRouter {
                         conversationID: convID,
                         generateRequest: genReq,
                         onSSEFrame: onSSEFrame
+                    )
+                }
+                if segments.count == 4 && segments[3] == "voice-generate" && method.uppercased() == "POST" {
+                    let voiceReq = try JSONDecoder().decode(ConversationVoiceGenerateRequest.self, from: body)
+                    guard let wavData = Data(base64Encoded: voiceReq.audioBase64) else {
+                        return .error(status: 400, type: "invalid_request_error", message: "Invalid base64 audio payload in voice-generate.")
+                    }
+                    let aneProvider = CoreAIProvider(
+                        description: EngineDescription(
+                            modelID: "ane-speech-whisper",
+                            provider: .coreai,
+                            modelPath: "models/ane-speech-whisper.aimodel",
+                            computePlacement: ProvenanceField(
+                                value: .ane,
+                                provenance: .derived,
+                                effect: .reload,
+                                computePlacement: .ane
+                            )
+                        )
+                    )
+                    let transcript = try await aneProvider.transcribeAudio(
+                        wavData: wavData,
+                        languageHint: voiceReq.languageHint ?? "en"
+                    )
+                    let transcriptJSON = (try? String(data: JSONEncoder().encode(transcript), encoding: .utf8)) ?? "{}"
+                    let voiceFrame = "event: heylook_voice_transcribed\ndata: \(transcriptJSON)\n\n"
+                    if let onSSEFrame {
+                        await onSSEFrame(voiceFrame)
+                    }
+                    let reqID = headers["X-Request-ID"] ?? headers["x-request-id"] ?? "req_\(UUID().uuidString)"
+                    let genResp = try await handleConversationGenerate(
+                        requestID: reqID,
+                        conversationID: convID,
+                        generateRequest: ConversationGenerateRequest(
+                            model: voiceReq.model,
+                            content: transcript.text,
+                            sampling: voiceReq.sampling
+                        ),
+                        onSSEFrame: onSSEFrame
+                    )
+                    var combinedBody = Data(voiceFrame.utf8)
+                    combinedBody.append(genResp.body)
+                    return HeylookHTTPResponse(
+                        status: genResp.status,
+                        headers: genResp.headers,
+                        body: combinedBody
                     )
                 }
                 if segments.count == 4 && segments[3] == "prompt" && method.uppercased() == "POST" {
@@ -1073,5 +1147,218 @@ public final class BonjourServiceBrowser: @unchecked Sendable {
     public func stop() {
         browser?.cancel()
         browser = nil
+    }
+}
+
+/// Automated multi-turn KV prefix cache chain probe (`chain_probe`), VLM vision parity probe
+/// (`vlm_parity_probe`), and Matryoshka `768d`/`512d`/`256d`/`128d` `Recall@K` & `MRR` benchmark
+/// (`matryoshka_recall_probe`) executed by `heylook-cli eval-lab` and the contract test suite.
+public enum EvalLabSuite {
+    public struct ProbeSummary: Codable, Sendable, Equatable {
+        public let name: String
+        public let passed: Bool
+        public let detail: String
+
+        public init(name: String, passed: Bool, detail: String) {
+            self.name = name
+            self.passed = passed
+            self.detail = detail
+        }
+    }
+
+    public struct SuiteReport: Codable, Sendable, Equatable {
+        public let allPassed: Bool
+        public let probes: [ProbeSummary]
+        public let matryoshkaBenchmarks: [EmbeddingLabRunner.DimensionMetrics]
+
+        public init(
+            allPassed: Bool,
+            probes: [ProbeSummary],
+            matryoshkaBenchmarks: [EmbeddingLabRunner.DimensionMetrics]
+        ) {
+            self.allPassed = allPassed
+            self.probes = probes
+            self.matryoshkaBenchmarks = matryoshkaBenchmarks
+        }
+    }
+
+    public static func runAll() async throws -> SuiteReport {
+        var probes: [ProbeSummary] = []
+
+        // 1. chain_probe: Multi-turn KV prefix cache reuse, branch truncation slicing, and system invalidation
+        let mlxProvider = MLXSwiftProvider(
+            description: EngineDescription(
+                modelID: "eval-qwen3.5-mtp",
+                provider: .mlx,
+                modelPath: "models/eval-qwen3.5-mtp",
+                tags: ["mtp"]
+            ),
+            allowSyntheticFallback: true,
+            tokenCounter: { text in max(2, text.split(whereSeparator: \.isWhitespace).count * 3) }
+        )
+        let reg = RequestRegistry()
+        var lastChunk1 = GenerationChunk()
+        for try await c in await mlxProvider.generate(
+            requestID: "chain_1",
+            request: MessagesRequest(
+                model: "eval-qwen3.5-mtp",
+                messages: [.init(role: "user", content: "Explain prefix caching")],
+                system: "You are a helpful coding assistant."
+            ),
+            effectiveSampling: .builtinDefaults,
+            registry: reg
+        ) {
+            lastChunk1 = c
+        }
+        var lastChunk2 = GenerationChunk()
+        for try await c in await mlxProvider.generate(
+            requestID: "chain_2",
+            request: MessagesRequest(
+                model: "eval-qwen3.5-mtp",
+                messages: [
+                    .init(role: "user", content: "Explain prefix caching"),
+                    .init(role: "assistant", content: "[eval-qwen3.5-mtp] Processed: Explain prefix caching"),
+                    .init(role: "user", content: "Now add KV slicing details"),
+                ],
+                system: "You are a helpful coding assistant."
+            ),
+            effectiveSampling: .builtinDefaults,
+            registry: reg
+        ) {
+            lastChunk2 = c
+        }
+        var lastChunk3 = GenerationChunk()
+        for try await c in await mlxProvider.generate(
+            requestID: "chain_3_branch",
+            request: MessagesRequest(
+                model: "eval-qwen3.5-mtp",
+                messages: [
+                    .init(role: "user", content: "Explain prefix caching"),
+                    .init(role: "assistant", content: "[eval-qwen3.5-mtp] Processed: Explain prefix caching"),
+                    .init(role: "user", content: "Edited branch turn two"),
+                ],
+                system: "You are a helpful coding assistant."
+            ),
+            effectiveSampling: .builtinDefaults,
+            registry: reg
+        ) {
+            lastChunk3 = c
+        }
+        let kvState = await mlxProvider.kvSessionState()
+        let chainPassed = lastChunk1.cacheReport?.outcome == .miss
+            && lastChunk1.cacheReport?.cause == "cold"
+            && lastChunk2.cacheReport?.outcome == .reused
+            && (lastChunk2.cacheReport?.cachedTokens ?? 0) > 0
+            && lastChunk3.cacheReport?.outcome == .reused
+            && kvState.sliceTruncations == 1
+            && lastChunk3.speculativeReport?.mode == "draft-mtp"
+        probes.append(
+            ProbeSummary(
+                name: "chain_probe",
+                passed: chainPassed,
+                detail: "cold->reused(\(lastChunk2.cacheReport?.cachedTokens ?? 0)t)->branch_slice(trunc=\(kvState.sliceTruncations), spec=\(lastChunk3.speculativeReport?.mode ?? "none"))"
+            )
+        )
+        await mlxProvider.unload()
+
+        // 2. vlm_parity_probe: Model-derived image-plan token budget & HTTP 422 vision capability gate
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_eval_vlm_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try """
+        {
+          "image_processor": {
+            "max_soft_tokens": 256
+          }
+        }
+        """.write(to: tempDir.appendingPathComponent("processor_config.json"), atomically: true, encoding: .utf8)
+
+        let store = try SQLiteStore(databaseURL: tempDir.appendingPathComponent("eval.sqlite"))
+        let scheduler = ComputeScheduler()
+        let vlmDesc = EngineDescription(
+            modelID: "eval-vlm",
+            provider: .mlx,
+            modelPath: tempDir.path,
+            isLoaded: true,
+            supportsVision: ProvenanceField(value: true, provenance: .derived, effect: .reload)
+        )
+        let txtDesc = EngineDescription(
+            modelID: "eval-text-only",
+            provider: .mlx,
+            modelPath: tempDir.path,
+            isLoaded: true,
+            supportsVision: ProvenanceField(value: false, provenance: .derived, effect: .reload)
+        )
+        await scheduler.register(provider: MLXSwiftProvider(description: vlmDesc), description: vlmDesc)
+        await scheduler.register(provider: MLXSwiftProvider(description: txtDesc), description: txtDesc)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        let planResp = await router.handle(method: "POST", path: "/v1/models/eval-vlm/image-plan", body: Data("{}".utf8))
+        let planJSON = (try? JSONSerialization.jsonObject(with: planResp.body) as? [String: Any]) ?? [:]
+        let tokensPerImg = (planJSON["tokens_per_image"] as? NSNumber)?.intValue ?? 0
+
+        let imgTurn = MessagesRequest.MessageTurn(
+            role: "user",
+            content: "Describe image",
+            attachments: [.init(kind: "image", mediaType: "image/png", dataBase64: "iVBORw0KGgo=")]
+        )
+        let gate422 = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            body: try JSONEncoder().encode(MessagesRequest(model: "eval-text-only", messages: [imgTurn]))
+        )
+        let gate200 = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            body: try JSONEncoder().encode(MessagesRequest(model: "eval-vlm", messages: [imgTurn]))
+        )
+        let vlmPassed = tokensPerImg == 256 && gate422.status == 422 && gate200.status == 200
+        probes.append(
+            ProbeSummary(
+                name: "vlm_parity_probe",
+                passed: vlmPassed,
+                detail: "tokens_per_image=\(tokensPerImg), text_only_status=\(gate422.status), vlm_status=\(gate200.status)"
+            )
+        )
+
+        // 3. matryoshka_recall_probe: 768d / 512d / 256d / 128d Recall@1 and MRR verification
+        let vecStore = try VectorStore(databaseURL: tempDir.appendingPathComponent("eval_vectors.sqlite"))
+        let engine = DeterministicHashEmbeddingEngine()
+        let coordinator = IndexCoordinator(engine: engine, store: vecStore)
+        let corpusDir = tempDir.appendingPathComponent("corpus", isDirectory: true)
+        try FileManager.default.createDirectory(at: corpusDir, withIntermediateDirectories: true)
+        let fileA = corpusDir.appendingPathComponent("ane_scheduler.md")
+        let fileB = corpusDir.appendingPathComponent("gguf_subprocesses.md")
+        try "Apple Neural Engine co-residency and CoreML MLComputePlan scheduling".write(to: fileA, atomically: true, encoding: .utf8)
+        try "Out-of-process llama-server subprocess lifecycle and dynamic port pool".write(to: fileB, atomically: true, encoding: .utf8)
+        _ = try await coordinator.indexURLs([corpusDir])
+        let hitsA = try await coordinator.search(queryText: "Apple Neural Engine co-residency and CoreML MLComputePlan scheduling", limit: 2)
+        let hitsB = try await coordinator.search(queryText: "Out-of-process llama-server subprocess lifecycle and dynamic port pool", limit: 2)
+        var cases: [EmbeddingLabRunner.BenchmarkCase] = []
+        if let idA = hitsA.first?.artifact.id {
+            cases.append(.init(query: "Apple Neural Engine co-residency and CoreML MLComputePlan scheduling", expectedArtifactID: idA))
+        }
+        if let idB = hitsB.first?.artifact.id {
+            cases.append(.init(query: "Out-of-process llama-server subprocess lifecycle and dynamic port pool", expectedArtifactID: idB))
+        }
+        let mrlReports = try await EmbeddingLabRunner.evaluate(
+            coordinator: coordinator,
+            cases: cases
+        )
+        let mrlPassed = mrlReports.count == 4 && mrlReports.allSatisfy { $0.recallAt1 == 1.0 && $0.mrr == 1.0 }
+        probes.append(
+            ProbeSummary(
+                name: "matryoshka_recall_probe",
+                passed: mrlPassed,
+                detail: mrlReports.map { "\($0.dimensions)d:R@1=\(Int($0.recallAt1 * 100))%" }.joined(separator: ", ")
+            )
+        )
+
+        return SuiteReport(
+            allPassed: probes.allSatisfy(\.passed),
+            probes: probes,
+            matryoshkaBenchmarks: mrlReports
+        )
     }
 }

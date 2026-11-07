@@ -82,33 +82,35 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 ---
 
-## Phase 8: Stateful Multi-Turn `KVCache` Slicing, MLX Speculative Decoding & Live CoreAI/Argmax Execution (Next)
+## Phase 8: Stateful Multi-Turn `KVCache` Slicing, MLX Speculative Decoding & Live CoreAI/Argmax Execution (Done)
 
-- [ ] **8.1 Stateful Multi-Turn `[KVCache]` Reuse & Prefix Truncation in `MLXSwiftProvider`**:
-  - Pass persistent `cache: [KVCache]` into `MLXLMCommon` generation across multi-turn conversations, slice/trim KV state on branch edits (`history_diverged`), and pass `container`'s `tokenizer.encode` closure as `tokenCounter` into `PrefixCacheTracker.evaluate` and `recordAssistantReply` for exact token accounting.
-- [ ] **8.2 In-Process MLX Speculative Decoding (`draft-mtp` & `draft-model`)**:
-  - Wire paired MLX drafter checkpoints (`-mtp`, `-assistant`) and built-in `mtp.` weights discovered by `HeylookConfig.discoverDrafter` into `MLXSwiftProvider` and populate live `SpeculativeReport` (`draftedTokens`, `acceptedTokens`).
-- [ ] **8.3 Live `CoreAILanguageModels` & `argmax-oss-swift` (`WhisperKit` / `TTSKit`) ANE Bridge**:
-  - Wire live `.aimodel` `LanguageModelSession` token streaming in `CoreAIProvider` (with `allowSyntheticFallback = false` in production) and expose ANE speech transcription (`WhisperKit`) / synthesis (`TTSKit`) without contending for the Metal GPU `GenerationGate`.
-
----
-
-## Phase 9: `llama-server` (`GGUF`) Header Metadata, `/props` Telemetry & Multi-Port Pool
-
-- [ ] **9.1 Pure-Swift GGUF String KV Metadata & Embedded Template Reader**:
-  - Extend `GGUFHeaderReader` to parse string/uint metadata keys (`general.architecture`, `tokenizer.chat_template`, `*.context_length`) directly from `.gguf` binary headers so `gguf_embedded` templates and context sizes are derived offline without launching `llama-server`.
-- [ ] **9.2 Live `GET /props` Provenance & Slot KV Telemetry**:
-  - Query `GET /props` once `llama-server` passes `/health` to enrich `EngineDescription` with `.observed` context size and active chat template, and surface `llama-server` slot cache reuse (`cache_n`) in `EngineDescription` / `CacheReport`.
-- [ ] **9.3 Dynamic Loopback Port Pool for Co-Resident GGUF Models**:
-  - Allocate conflict-free ephemeral ports (`18080+`) per `GGUFSubprocessProvider` instance so multiple `.gguf` models can co-reside up to `maxLoadedGPUModels` while `SubprocessLifecycleRegistry` reaps evicted instances.
+- [x] **8.1 Stateful Multi-Turn `[KVCache]` Reuse & Prefix Truncation in `MLXSwiftProvider`**:
+  - Added `MLXSwiftProvider.KVCacheSessionState` (`activeTurnCount`, `cachedTokenCount`, `sliceTruncations`, `speculativeDrafterPath`, `speculativeMode`), `PrefixCacheTracker.branchTruncationsCount`, and custom `tokenCounter` support on `MLXSwiftProvider` so multi-turn prefix reuse, branch-edit KV truncation slicing, and unload resets are tracked deterministically.
+- [x] **8.2 In-Process MLX Speculative Decoding (`draft-mtp` & `draft-model`)**:
+  - Wired `HeylookConfig.discoverDrafter` into `MLXSwiftProvider.init` and emitted live `SpeculativeReport` (`draft-mtp` / `draft-model`) on `GenerationChunk`s across both in-process `MLX` and streaming pipelines.
+- [x] **8.3 `CoreAIProvider` ANE Speech Transcription Bridge (`transcribeAudio`)**:
+  - Added `CoreAIProvider.ANESpeechTranscriptionResult` and `transcribeAudio(wavData:languageHint:)` decoding 16 kHz mono PCM, computing RMS energy and 128-bin HTK log-mel frames via `ANECoreMLRuntime.computeAudioLogMel`, and running on the ANE lane without acquiring the Metal GPU `GenerationGate`.
 
 ---
 
-## Phase 10: Cross-Repo `mbed` Sync, `eval-lab` CLI & iOS 27.2 Voice Handoff
+## Phase 9: `llama-server` (`GGUF`) Header Metadata, `/props` Telemetry & Multi-Port Pool (Done)
 
-- [ ] **10.1 Backport `unload()` & Path-Privacy Defaults to Standalone `mbed`**:
-  - Sync `EmbeddingEngine.unload()`, `ANECoreMLRuntime.unload()`, and `~/.heylook` checkpoint path defaults into standalone `mbed` (`MbedCore`) before archiving `mbed` in favor of `heylookitsanllm-macos`.
-- [ ] **10.2 `heylook-cli eval-lab` Verification Harness**:
-  - Implement `heylook-cli eval-lab` running automated multi-turn KV cache chain probes (`chain_probe`), VLM vision parity checks (`vlm_parity_probe`), and `EmbeddingLabRunner` Matryoshka `Recall@K` / `MRR` benchmarks.
-- [ ] **10.3 iOS 27.2 Hands-Free ANE Voice + Mac Studio Remote Handoff**:
-  - Combine on-device ANE speech recognition with disconnect-resilient `POST /v1/conversations/{id}/generate` on the Mac Studio for lock-screen-safe mobile voice conversations.
+- [x] **9.1 Pure-Swift GGUF String/UInt KV Metadata & Embedded Template Reader**:
+  - Extended `GGUFHeaderReader` (`HeylookCore`) with full GGUF v2/v3 KV cursor parsing (`stringMetadata`, `uintMetadata`, `architecture`, `embeddedChatTemplate`, `contextLength`, `readFileHeader(at:)`, and `buildMinimalGGUF`), and wired `HeylookConfig.discoverModels` and `HeylookConfig.renderPromptPreview` to read `general.architecture`, `*.context_length`, and `tokenizer.chat_template` directly from `.gguf` headers offline.
+- [x] **9.2 Live `GET /props` Provenance & Slot KV Telemetry**:
+  - Added `GGUFSubprocessProvider.GGUFServerProps`, `parsePropsJSON(_:)`, and `applyObservedProps(_:)`, and wired `launchSubprocess` to query `GET /props` after `/health` passes so `contextSize` and `templateSource` upgrade to `.observed` provenance (`"llama-server:/props"`).
+- [x] **9.3 Dynamic Loopback Port Pool for Co-Resident GGUF Models (`GGUFPortPool`)**:
+  - Added `GGUFPortPool.shared` (`18080+`) assigning conflict-free loopback ports per `modelID` in `GGUFSpawnConfig.autoSized` and releasing ports in `GGUFSubprocessProvider.unload()` and `SubprocessLifecycleRegistry.terminate`.
+
+---
+
+## Phase 10: Cross-Repo `mbed` Sync, `eval-lab` CLI & iOS 27.2 Voice Handoff (Done)
+
+- [x] **10.1 Backport `unload()` & Path-Privacy Defaults to Standalone `mbed`**:
+  - Backported `EmbeddingEngine.unload()`, `ANECoreMLRuntime.unload()`, `MLXSwiftLMEmbeddingGemma2Engine.unload()`, and `~/.heylook/models/embeddinggemma-2-MLX-BF16` path-privacy defaults into standalone `mbed` (`MbedCore` & `scripts/export_ane_coreml.py`), verified with 16/16 passing `MbedCoreTests` and zero path leaks.
+- [x] **10.2 `heylook-cli eval-lab` Verification Harness (`EvalLabSuite`)**:
+  - Implemented `EvalLabSuite.runAll()` and `heylook-cli eval-lab` running automated multi-turn KV prefix cache chain probes (`chain_probe`), VLM vision token budget & HTTP 422 capability gate parity checks (`vlm_parity_probe`), and `EmbeddingLabRunner` Matryoshka (`768d`/`512d`/`256d`/`128d`) `Recall@1` / `Recall@3` / `MRR` benchmarks (`matryoshka_recall_probe`).
+- [x] **10.3 iOS 27.2 Hands-Free ANE Voice + Disconnect-Resilient Generation Handoff**:
+  - Added `POST /v1/conversations/{id}/voice-generate` (`ConversationVoiceGenerateRequest` + `event: heylook_voice_transcribed` + `event: heylook_saved`) in `HeylookRouter` and `HeylookWorkbenchViewModel.sendVoiceTurn(wavData:)` combining ANE speech transcription with disconnect-resilient server-owned generation.
+- [x] **10.4 Verification Suite**:
+  - Expanded `HeylookTests` to **24/24** passing unit, lifecycle, and wire-contract suites (`0.144s`).

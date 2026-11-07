@@ -32,6 +32,8 @@ struct HeylookCLI {
             await runServe(port: port)
         case "chat":
             await runChat(args: Array(args.dropFirst()))
+        case "eval-lab":
+            await runEvalLab()
         default:
             printUsage()
         }
@@ -448,6 +450,35 @@ struct HeylookCLI {
         }
     }
 
+    static func runEvalLab() async {
+        print("=== Heylook Evaluation Lab (chain_probe + vlm_parity_probe + matryoshka_recall_probe) ===")
+        do {
+            let report = try await EvalLabSuite.runAll()
+            for probe in report.probes {
+                let badge = probe.passed ? "PASS" : "FAIL"
+                print("- [\(badge)] \(probe.name.padding(toLength: 24, withPad: " ", startingAt: 0)) : \(probe.detail)")
+            }
+            print("--- Matryoshka Representation Learning (MRL) Recall@1 / Recall@3 / MRR ---")
+            for bench in report.matryoshkaBenchmarks {
+                print(
+                    String(
+                        format: "  %4dd | Recall@1=%.2f | Recall@3=%.2f | MRR=%.2f",
+                        bench.dimensions,
+                        bench.recallAt1,
+                        bench.recallAt3,
+                        bench.mrr
+                    )
+                )
+            }
+            if !report.allPassed {
+                exit(1)
+            }
+        } catch {
+            print("Eval lab error: \(error)")
+            exit(1)
+        }
+    }
+
     static func printUsage() {
         print("""
         Usage: heylook-cli <command> [args]
@@ -461,6 +492,7 @@ struct HeylookCLI {
           watched                                       List FSEvents-watched folders in the vector store
           inspect-ane [dir]                             Inspect CoreML ANE tower packages and op compatibility
           inspect-checkpoint [dir]                      Inspect local EmbeddingGemma-2-2B safetensors checkpoint
+          eval-lab                                      Run multi-turn KV chain, VLM parity, and MRL Recall@K probes
           chat <prompt>                                 Stream a chat completion with thinking traces
           serve [port]                                  Run the embedded /v1/messages & /v1/embeddings server
         """)

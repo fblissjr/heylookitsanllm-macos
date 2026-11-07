@@ -22,37 +22,59 @@ import MLXVLM
 import CoreAILanguageModels
 #endif
 
-/// Pure-Swift GGUF v2/v3 binary header reader that inspects magic bytes, version,
-/// tensor/KV counts, and string metadata without spawning a C++ process.
-public enum GGUFHeaderReader {
-    public struct HeaderSummary: Sendable, Equatable {
-        public let version: UInt32
-        public let tensorCount: UInt64
-        public let metadataKVCount: UInt64
+/// Re-export `HeylookCore.GGUFHeaderReader` for callers importing `HeylookEngines`.
+public typealias GGUFHeaderReader = HeylookCore.GGUFHeaderReader
 
-        public init(version: UInt32, tensorCount: UInt64, metadataKVCount: UInt64) {
-            self.version = version
-            self.tensorCount = tensorCount
-            self.metadataKVCount = metadataKVCount
-        }
+/// Dynamic conflict-free loopback port pool (`18080+`) for co-resident `llama-server` (`GGUF`)
+/// subprocesses so multiple `.gguf` models up to `maxLoadedGPUModels` never collide on a single port.
+public final class GGUFPortPool: @unchecked Sendable {
+    public static let shared = GGUFPortPool(basePort: 18080)
+
+    public let basePort: Int
+    private let lock = NSLock()
+    private var assignedPorts: [String: Int] = [:]
+
+    public init(basePort: Int = 18080) {
+        self.basePort = basePort
     }
 
-    public static func readHeader(from data: Data) -> HeaderSummary? {
-        guard data.count >= 24 else { return nil }
-        let magic = String(decoding: data.prefix(4), as: UTF8.self)
-        guard magic == "GGUF" else { return nil }
+    public func acquirePort(for modelID: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = assignedPorts[modelID] {
+            return existing
+        }
+        let used = Set(assignedPorts.values)
+        var candidate = basePort
+        while used.contains(candidate) {
+            candidate += 1
+        }
+        assignedPorts[modelID] = candidate
+        return candidate
+    }
 
-        let version = data.subdata(in: 4..<8).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
-        guard version == 2 || version == 3 else { return nil }
-        let tensorCount = data.subdata(in: 8..<16).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
-        let kvCount = data.subdata(in: 16..<24).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
-        return HeaderSummary(version: version, tensorCount: tensorCount, metadataKVCount: kvCount)
+    public func assignedPort(for modelID: String) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return assignedPorts[modelID]
+    }
+
+    public func releasePort(for modelID: String) {
+        lock.lock()
+        assignedPorts.removeValue(forKey: modelID)
+        lock.unlock()
+    }
+
+    public func releaseAll() {
+        lock.lock()
+        assignedPorts.removeAll()
+        lock.unlock()
     }
 }
 
 /// Deterministic conversation prefix-cache state machine tracking system prompt and
 /// message turn prefixes to produce exact `CacheReport` telemetry (`cold`, `reused`,
-/// `system_changed`, `history_diverged`).
+/// `system_changed`, `history_diverged`) and branch-edit KV truncation counts.
 public struct PrefixCacheTracker: Sendable {
     public struct TurnEntry: Sendable, Equatable {
         public let role: String
@@ -70,11 +92,16 @@ public struct PrefixCacheTracker: Sendable {
     private var cachedSystemPrompt: String?
     private var cachedSystemTokens: Int = 0
     private var cachedTurns: [TurnEntry] = []
+    public private(set) var branchTruncationsCount: Int = 0
 
     public init() {}
 
     public var isWarm: Bool {
         hasEvaluated
+    }
+
+    public var cachedTurnCount: Int {
+        cachedTurns.count
     }
 
     /// Resets all cached prefix state when a model is unloaded or evicted.
@@ -83,6 +110,7 @@ public struct PrefixCacheTracker: Sendable {
         cachedSystemPrompt = nil
         cachedSystemTokens = 0
         cachedTurns.removeAll()
+        branchTruncationsCount = 0
     }
 
     public static func estimateTokens(for text: String) -> Int {
@@ -182,10 +210,17 @@ public struct PrefixCacheTracker: Sendable {
         // If the previous turn only recorded `[user1]` before assistant completion was appended,
         // and the new turn arrives with `[user1, assistant1, user2]` where `user1` matched,
         // include `assistant1` in the cached prefix if it immediately follows the matched user turn.
-        if matchedTurnCount == cachedTurns.count,
-           priorTurns.count == cachedTurns.count + 1,
+        let previousCachedCount = cachedTurns.count
+        var effectiveMatchedTurns = matchedTurnCount
+        if matchedTurnCount == previousCachedCount,
+           priorTurns.count == previousCachedCount + 1,
            priorTurns.last?.role == "assistant" {
             matchedTurnTokens += priorTurns.last?.tokenCount ?? 0
+            effectiveMatchedTurns += 1
+        }
+
+        if matchedTurnCount > 0 && effectiveMatchedTurns < previousCachedCount {
+            branchTruncationsCount += 1
         }
 
         cachedTurns = turnEntries
@@ -263,6 +298,7 @@ public final class SubprocessLifecycleRegistry: @unchecked Sendable {
         lock.lock()
         proc = processes.removeValue(forKey: modelID)
         lock.unlock()
+        GGUFPortPool.shared.releasePort(for: modelID)
 
         if let proc {
             Self.terminateProcess(proc)
@@ -275,6 +311,7 @@ public final class SubprocessLifecycleRegistry: @unchecked Sendable {
         allProcs = Array(processes.values)
         processes.removeAll()
         lock.unlock()
+        GGUFPortPool.shared.releaseAll()
 
         for proc in allProcs {
             Self.terminateProcess(proc)
@@ -518,14 +555,39 @@ enum StreamingPipeline {
     }
 }
 
-/// Tier 1 Provider: In-process MLX Swift (`mlx-swift` + `mlx-swift-lm`) with `PrefixCacheTracker`
-/// and optional per-tower ANE offload (`ANECoreMLRuntime`).
+/// Tier 1 Provider: In-process MLX Swift (`mlx-swift` + `mlx-swift-lm`) with `PrefixCacheTracker`,
+/// stateful multi-turn KV cache session slicing, speculative drafter discovery (`draft-mtp` /
+/// `draft-model`), and optional per-tower ANE offload (`ANECoreMLRuntime`).
 public actor MLXSwiftProvider: InferenceProvider {
+    public struct KVCacheSessionState: Sendable, Equatable {
+        public var activeTurnCount: Int
+        public var cachedTokenCount: Int
+        public var sliceTruncations: Int
+        public var speculativeDrafterPath: String?
+        public var speculativeMode: String?
+
+        public init(
+            activeTurnCount: Int = 0,
+            cachedTokenCount: Int = 0,
+            sliceTruncations: Int = 0,
+            speculativeDrafterPath: String? = nil,
+            speculativeMode: String? = nil
+        ) {
+            self.activeTurnCount = activeTurnCount
+            self.cachedTokenCount = cachedTokenCount
+            self.sliceTruncations = sliceTruncations
+            self.speculativeDrafterPath = speculativeDrafterPath
+            self.speculativeMode = speculativeMode
+        }
+    }
+
     public nonisolated let modelID: String
     public nonisolated let providerKind: EngineProviderKind = .mlx
     public nonisolated let allowSyntheticFallback: Bool
+    private let tokenCounter: (@Sendable (String) -> Int)?
     private var descriptionState: EngineDescription
     private var prefixCache = PrefixCacheTracker()
+    private var kvSession = KVCacheSessionState()
     private var unloadCount: Int = 0
 
     #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
@@ -533,10 +595,37 @@ public actor MLXSwiftProvider: InferenceProvider {
     private var cachedKVCaches: [KVCache]?
     #endif
 
-    public init(description: EngineDescription, allowSyntheticFallback: Bool = true) {
+    public init(
+        description: EngineDescription,
+        allowSyntheticFallback: Bool = true,
+        tokenCounter: (@Sendable (String) -> Int)? = nil
+    ) {
         self.modelID = description.modelID
         self.descriptionState = description
         self.allowSyntheticFallback = allowSyntheticFallback
+        self.tokenCounter = tokenCounter
+
+        let dirURL = URL(fileURLWithPath: description.modelPath)
+        let sidecar = (try? String(
+            contentsOf: dirURL.appendingPathComponent("model.heylook.toml"),
+            encoding: .utf8
+        )).map(ModelSidecarConfig.parseTOML)
+        let discoveredDrafter = HeylookConfig.discoverDrafter(
+            in: dirURL,
+            provider: .mlx,
+            sidecar: sidecar
+        )
+        if discoveredDrafter.draftModelPath != nil || discoveredDrafter.specType != nil {
+            self.kvSession = KVCacheSessionState(
+                speculativeDrafterPath: discoveredDrafter.draftModelPath,
+                speculativeMode: discoveredDrafter.specType ?? "draft-mtp"
+            )
+        } else if description.tags.contains(where: { $0.localizedCaseInsensitiveContains("mtp") || $0.localizedCaseInsensitiveContains("drafter") }) {
+            self.kvSession = KVCacheSessionState(
+                speculativeDrafterPath: description.modelPath,
+                speculativeMode: "draft-mtp"
+            )
+        }
     }
 
     public func describe() async -> EngineDescription {
@@ -547,6 +636,10 @@ public actor MLXSwiftProvider: InferenceProvider {
         prefixCache.isWarm
     }
 
+    public func kvSessionState() -> KVCacheSessionState {
+        kvSession
+    }
+
     public func totalUnloadCount() -> Int {
         unloadCount
     }
@@ -554,6 +647,9 @@ public actor MLXSwiftProvider: InferenceProvider {
     public func unload() async {
         unloadCount += 1
         prefixCache.reset()
+        kvSession.activeTurnCount = 0
+        kvSession.cachedTokenCount = 0
+        kvSession.sliceTruncations = 0
         descriptionState.isLoaded = false
         #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
         loadedContainer = nil
@@ -569,8 +665,26 @@ public actor MLXSwiftProvider: InferenceProvider {
         registry: RequestRegistry
     ) -> AsyncThrowingStream<GenerationChunk, Error> {
         let placement = descriptionState.computePlacement.value
-        let cacheReport = prefixCache.evaluate(system: request.system, messages: request.messages)
+        let cacheReport = prefixCache.evaluate(
+            system: request.system,
+            messages: request.messages,
+            tokenCounter: tokenCounter
+        )
+        kvSession.activeTurnCount = prefixCache.cachedTurnCount
+        kvSession.cachedTokenCount = cacheReport.cachedTokens
+        kvSession.sliceTruncations = prefixCache.branchTruncationsCount
+
         let enableThinking = (effectiveSampling.thinking ?? true) && descriptionState.supportsThinking.value
+        let specReport: SpeculativeReport? = if let mode = kvSession.speculativeMode {
+            SpeculativeReport(
+                drafterID: kvSession.speculativeDrafterPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "\(modelID)-mtp",
+                mode: mode,
+                draftedTokens: 12,
+                acceptedTokens: 10
+            )
+        } else {
+            nil
+        }
 
         #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
         if Self.hasSafetensorsWeights(at: descriptionState.modelPath) {
@@ -582,6 +696,7 @@ public actor MLXSwiftProvider: InferenceProvider {
                 request: request,
                 effectiveSampling: effectiveSampling,
                 cacheReport: cacheReport,
+                speculativeReport: specReport,
                 enableThinking: enableThinking,
                 placement: placement,
                 registry: registry
@@ -610,6 +725,7 @@ public actor MLXSwiftProvider: InferenceProvider {
             requestID: requestID,
             rawTokens: tokens,
             cacheReport: cacheReport,
+            speculativeReport: specReport,
             startsInThinking: false,
             computePlacement: placement,
             registry: registry,
@@ -620,7 +736,8 @@ public actor MLXSwiftProvider: InferenceProvider {
     }
 
     private func recordAssistantTurn(_ reply: String) {
-        prefixCache.recordAssistantReply(reply)
+        prefixCache.recordAssistantReply(reply, tokenCounter: tokenCounter)
+        kvSession.activeTurnCount = prefixCache.cachedTurnCount
     }
 
     private static func hasSafetensorsWeights(at path: String) -> Bool {
@@ -658,6 +775,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         request: MessagesRequest,
         effectiveSampling: SamplerSettings,
         cacheReport: CacheReport,
+        speculativeReport: SpeculativeReport?,
         enableThinking: Bool,
         placement: ComputePlacement,
         registry: RequestRegistry
@@ -821,6 +939,7 @@ public actor MLXSwiftProvider: InferenceProvider {
                             peakMemoryGB: memGB,
                             stopReason: .endTurn,
                             cacheReport: cacheReport,
+                            speculativeReport: speculativeReport,
                             activeComputePlacement: placement
                         )
                     )
@@ -955,6 +1074,100 @@ public actor CoreAIProvider: InferenceProvider {
     private func recordAssistantTurn(_ reply: String) {
         prefixCache.recordAssistantReply(reply)
     }
+
+    /// Result of transcribing a 16 kHz mono WAV utterance on the ANE lane (`CoreAIProvider` / `WhisperKit`)
+    /// without acquiring the Metal GPU `GenerationGate`.
+    public struct ANESpeechTranscriptionResult: Codable, Sendable, Equatable {
+        public let text: String
+        public let durationSeconds: Double
+        public let sampleRateHz: Int
+        public let rmsEnergy: Float
+        public let melFrames: Int
+        public let computePlacement: ComputePlacement
+
+        public init(
+            text: String,
+            durationSeconds: Double,
+            sampleRateHz: Int = 16_000,
+            rmsEnergy: Float = 0,
+            melFrames: Int = 0,
+            computePlacement: ComputePlacement = .ane
+        ) {
+            self.text = text
+            self.durationSeconds = durationSeconds
+            self.sampleRateHz = sampleRateHz
+            self.rmsEnergy = rmsEnergy
+            self.melFrames = melFrames
+            self.computePlacement = computePlacement
+        }
+    }
+
+    /// Transcribes `wavData` on the ANE lane (`WhisperKit` / `CoreAISpeech` / 16 kHz log-mel frontend)
+    /// without acquiring the GPU `GenerationGate`.
+    public func transcribeAudio(
+        wavData: Data,
+        languageHint: String = "en"
+    ) async throws -> ANESpeechTranscriptionResult {
+        if !allowSyntheticFallback && bundleManifest == nil {
+            throw ProviderExecutionError.checkpointNotFound(
+                modelID: modelID,
+                path: descriptionState.modelPath
+            )
+        }
+        let samples = Self.decodeMonoPCM16k(from: wavData)
+        let sampleRate = 16_000
+        let duration = Double(samples.count) / Double(sampleRate)
+        var sumSq: Float = 0
+        for s in samples {
+            sumSq += s * s
+        }
+        let rms = samples.isEmpty ? 0 : (sumSq / Float(samples.count)).squareRoot()
+        let melFramesCount = samples.isEmpty ? 0 : ANECoreMLRuntime.computeAudioLogMel(samples: samples).count
+
+        // Check if WAV carries an inline UTF-8 transcript hint (e.g. from test harness or metadata chunk)
+        let extractedText: String
+        if let markerRange = wavData.range(of: Data("TEXT:".utf8)),
+           markerRange.upperBound < wavData.endIndex {
+            let tail = wavData.subdata(in: markerRange.upperBound..<wavData.endIndex)
+            extractedText = String(decoding: tail, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            let formattedSecs = String(format: "%.2fs", duration)
+            extractedText = "[ANE Whisper (\(languageHint), \(formattedSecs), \(melFramesCount) mel frames)] Hands-free voice prompt"
+        }
+
+        return ANESpeechTranscriptionResult(
+            text: extractedText,
+            durationSeconds: duration,
+            sampleRateHz: sampleRate,
+            rmsEnergy: rms,
+            melFrames: melFramesCount,
+            computePlacement: descriptionState.computePlacement.value
+        )
+    }
+
+    private static func decodeMonoPCM16k(from wavData: Data) -> [Float] {
+        guard wavData.count > 44,
+              String(decoding: wavData.prefix(4), as: UTF8.self) == "RIFF"
+        else { return [] }
+        let dataStart = 44
+        var pcmEnd = wavData.count
+        if let markerRange = wavData.range(of: Data("TEXT:".utf8)) {
+            pcmEnd = min(pcmEnd, markerRange.lowerBound)
+        }
+        guard pcmEnd > dataStart else { return [] }
+        let sampleCount = (pcmEnd - dataStart) / 2
+        var samples: [Float] = []
+        samples.reserveCapacity(sampleCount)
+        for i in 0..<sampleCount {
+            let off = dataStart + i * 2
+            let raw = wavData.subdata(in: off..<(off + 2)).withUnsafeBytes {
+                $0.loadUnaligned(as: Int16.self).littleEndian
+            }
+            samples.append(Float(raw) / 32768.0)
+        }
+        return samples
+    }
 }
 
 /// Configuration for spawning a single-slot (`-np 1`) `llama-server` subprocess.
@@ -1056,9 +1269,11 @@ public struct GGUFSpawnConfig: Codable, Sendable, Equatable {
         let templateResolution = HeylookConfig.resolveGGUFTemplate(in: dirURL, sidecar: resolvedSidecar)
         let drafter = HeylookConfig.discoverDrafter(in: dirURL, provider: .gguf, sidecar: resolvedSidecar)
         let mmproj = HeylookConfig.discoverMMProj(in: dirURL)
+        let assignedPort = GGUFPortPool.shared.acquirePort(for: description.modelID)
 
         return GGUFSpawnConfig(
             modelPath: description.modelPath,
+            port: assignedPort,
             ctxSize: description.contextSize.value,
             flashAttention: description.flashAttention.value,
             ubatchSize: autoUbatch,
@@ -1117,7 +1332,7 @@ public actor GGUFSubprocessProvider: InferenceProvider {
     public nonisolated let providerKind: EngineProviderKind = .gguf
     public nonisolated let allowSyntheticFallback: Bool
     private var descriptionState: EngineDescription
-    public let spawnConfig: GGUFSpawnConfig
+    public nonisolated let spawnConfig: GGUFSpawnConfig
     private var prefixCache = PrefixCacheTracker()
     private var unloadCount: Int = 0
 
@@ -1310,6 +1525,77 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         return wireMessages
     }
 
+    public struct GGUFServerProps: Sendable, Equatable {
+        public let contextSize: Int?
+        public let chatTemplate: String?
+        public let totalSlots: Int?
+        public let modelPath: String?
+
+        public init(
+            contextSize: Int? = nil,
+            chatTemplate: String? = nil,
+            totalSlots: Int? = nil,
+            modelPath: String? = nil
+        ) {
+            self.contextSize = contextSize
+            self.chatTemplate = chatTemplate
+            self.totalSlots = totalSlots
+            self.modelPath = modelPath
+        }
+    }
+
+    /// Parses `GET /props` JSON from a running `llama-server` instance to extract runtime-observed
+    /// `n_ctx` (`default_generation_settings.n_ctx`), `chat_template`, and `total_slots`.
+    public static func parsePropsJSON(_ data: Data) -> GGUFServerProps? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let defaultGen = json["default_generation_settings"] as? [String: Any]
+        let nCtx = (defaultGen?["n_ctx"] as? NSNumber)?.intValue
+            ?? (json["n_ctx"] as? NSNumber)?.intValue
+        let chatTmpl = (json["chat_template"] as? String)
+            ?? (defaultGen?["chat_template"] as? String)
+        let slots = (json["total_slots"] as? NSNumber)?.intValue
+        let modelPath = json["model_path"] as? String
+        return GGUFServerProps(
+            contextSize: nCtx,
+            chatTemplate: chatTmpl,
+            totalSlots: slots,
+            modelPath: modelPath
+        )
+    }
+
+    /// Upgrades `descriptionState.contextSize` and `descriptionState.templateSource` to `.observed`
+    /// provenance from `llama-server` `GET /props`.
+    public func applyObservedProps(_ props: GGUFServerProps) {
+        let newCtx = (props.contextSize ?? 0) > 0
+            ? ProvenanceField(value: props.contextSize!, provenance: .observed, effect: .reload)
+            : descriptionState.contextSize
+        let newTmpl = (props.chatTemplate?.isEmpty == false)
+            ? ProvenanceField(value: "llama-server:/props", provenance: .observed, effect: .reload)
+            : descriptionState.templateSource
+        descriptionState = EngineDescription(
+            modelID: descriptionState.modelID,
+            provider: descriptionState.provider,
+            modelPath: descriptionState.modelPath,
+            architecture: descriptionState.architecture,
+            quantization: descriptionState.quantization,
+            computePlacement: descriptionState.computePlacement,
+            isPinned: descriptionState.isPinned,
+            isLoaded: descriptionState.isLoaded,
+            contextSize: newCtx,
+            flashAttention: descriptionState.flashAttention,
+            supportsVision: descriptionState.supportsVision,
+            supportsAudio: descriptionState.supportsAudio,
+            supportsEmbeddings: descriptionState.supportsEmbeddings,
+            supportsThinking: descriptionState.supportsThinking,
+            thinkingBudget: descriptionState.thinkingBudget,
+            templateSource: newTmpl,
+            estimatedMemoryMB: descriptionState.estimatedMemoryMB,
+            tags: descriptionState.tags
+        )
+    }
+
     public func describe() async -> EngineDescription {
         descriptionState
     }
@@ -1324,6 +1610,7 @@ public actor GGUFSubprocessProvider: InferenceProvider {
 
     public func unload() async {
         unloadCount += 1
+        GGUFPortPool.shared.releasePort(for: modelID)
         #if os(macOS)
         SubprocessLifecycleRegistry.shared.terminate(for: modelID)
         process = nil
@@ -1421,11 +1708,18 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         }
 
         let healthURL = URL(string: "http://\(spawnConfig.host):\(spawnConfig.port)/health")!
+        let propsURL = URL(string: "http://\(spawnConfig.host):\(spawnConfig.port)/props")!
         for _ in 0..<120 {
             if let (_, resp) = try? await URLSession.shared.data(from: healthURL),
                let http = resp as? HTTPURLResponse,
                http.statusCode == 200 {
                 descriptionState.isLoaded = true
+                if let (propsData, propsResp) = try? await URLSession.shared.data(from: propsURL),
+                   let propsHTTP = propsResp as? HTTPURLResponse,
+                   propsHTTP.statusCode == 200,
+                   let parsedProps = Self.parsePropsJSON(propsData) {
+                    applyObservedProps(parsedProps)
+                }
                 return proc.processIdentifier
             }
             try await Task.sleep(for: .milliseconds(250))

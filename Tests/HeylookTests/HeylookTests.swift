@@ -1369,4 +1369,270 @@ struct HeylookTests {
         #expect(collected.contains(where: { $0.hasPrefix("event: message_delta") }))
         #expect(collected.last?.hasPrefix("event: message_stop") == true)
     }
+
+    @Test("MLX multi-turn KV cache session slicing, exact tokenCounter, and speculative drafter telemetry")
+    func testMLXMultiTurnKVCacheSlicingExactTokenCounterAndSpeculativeDrafter() async throws {
+        let rootDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase8_mlx_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        // Write model.safetensors.index.json with MTP weights so discoverDrafter auto-detects draft-mtp
+        let indexJSON = """
+        {
+          "weight_map": {
+            "model.layers.0.self_attn.q_proj.weight": "model-00001.safetensors",
+            "mtp.layers.0.head.weight": "model-00001.safetensors"
+          }
+        }
+        """
+        try indexJSON.write(
+            to: rootDir.appendingPathComponent("model.safetensors.index.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let desc = EngineDescription(
+            modelID: "qwen3.5-mtp-mlx",
+            provider: .mlx,
+            modelPath: rootDir.path
+        )
+        let provider = MLXSwiftProvider(
+            description: desc,
+            allowSyntheticFallback: true,
+            tokenCounter: { text in max(2, text.count) }
+        )
+
+        let initialKV = await provider.kvSessionState()
+        #expect(initialKV.speculativeMode == "draft-mtp")
+        #expect(initialKV.speculativeDrafterPath != nil)
+
+        let reg = RequestRegistry()
+        var turn1Final = GenerationChunk()
+        for try await chunk in await provider.generate(
+            requestID: "p8_t1",
+            request: MessagesRequest(
+                model: "qwen3.5-mtp-mlx",
+                messages: [.init(role: "user", content: "First turn message")],
+                system: "System v1"
+            ),
+            effectiveSampling: .builtinDefaults,
+            registry: reg
+        ) {
+            turn1Final = chunk
+        }
+        #expect(turn1Final.cacheReport?.outcome == .miss)
+        #expect(turn1Final.cacheReport?.cause == "cold")
+        #expect(turn1Final.speculativeReport?.mode == "draft-mtp")
+        #expect((turn1Final.speculativeReport?.acceptedTokens ?? 0) > 0)
+
+        var turn2Final = GenerationChunk()
+        for try await chunk in await provider.generate(
+            requestID: "p8_t2",
+            request: MessagesRequest(
+                model: "qwen3.5-mtp-mlx",
+                messages: [
+                    .init(role: "user", content: "First turn message"),
+                    .init(role: "assistant", content: "[qwen3.5-mtp-mlx] Processed: First turn message"),
+                    .init(role: "user", content: "Second turn follow up"),
+                ],
+                system: "System v1"
+            ),
+            effectiveSampling: .builtinDefaults,
+            registry: reg
+        ) {
+            turn2Final = chunk
+        }
+        #expect(turn2Final.cacheReport?.outcome == .reused)
+        let kvAfterTurn2 = await provider.kvSessionState()
+        #expect(kvAfterTurn2.activeTurnCount == 4)
+        #expect(kvAfterTurn2.sliceTruncations == 0)
+
+        // Branch edit on turn 2: reuses turn 1 + assistant 1 prefix and slices trailing KV entries
+        var branchFinal = GenerationChunk()
+        for try await chunk in await provider.generate(
+            requestID: "p8_t2_branch",
+            request: MessagesRequest(
+                model: "qwen3.5-mtp-mlx",
+                messages: [
+                    .init(role: "user", content: "First turn message"),
+                    .init(role: "assistant", content: "[qwen3.5-mtp-mlx] Processed: First turn message"),
+                    .init(role: "user", content: "Edited second turn branch"),
+                ],
+                system: "System v1"
+            ),
+            effectiveSampling: .builtinDefaults,
+            registry: reg
+        ) {
+            branchFinal = chunk
+        }
+        #expect(branchFinal.cacheReport?.outcome == .reused)
+        let kvAfterBranch = await provider.kvSessionState()
+        #expect(kvAfterBranch.sliceTruncations == 1)
+
+        await provider.unload()
+        let kvAfterUnload = await provider.kvSessionState()
+        #expect(kvAfterUnload.activeTurnCount == 0)
+        #expect(kvAfterUnload.cachedTokenCount == 0)
+        #expect(kvAfterUnload.sliceTruncations == 0)
+    }
+
+    @Test("GGUF header KV metadata reader, /props provenance parser, and dynamic loopback port pool")
+    func testGGUFHeaderMetadataReaderPropsParserAndDynamicPortPool() async throws {
+        let rootDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase9_gguf_\(UUID().uuidString)", isDirectory: true)
+        let modelDir = rootDir.appendingPathComponent("Gemma-4-GGUF", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        let ggufBytes = GGUFHeaderReader.buildMinimalGGUF(
+            version: 3,
+            tensorCount: 42,
+            stringMetadata: [
+                "general.architecture": "gemma4",
+                "tokenizer.chat_template": "<start_of_turn>user\n{{ content }}<end_of_turn>",
+            ],
+            uint32Metadata: [
+                "gemma4.context_length": 65536,
+            ]
+        )
+        let ggufURL = modelDir.appendingPathComponent("Gemma-4-26B-Q8_0.gguf")
+        try ggufBytes.write(to: ggufURL)
+
+        let parsedHeader = GGUFHeaderReader.readFileHeader(at: ggufURL)
+        #expect(parsedHeader?.version == 3)
+        #expect(parsedHeader?.tensorCount == 42)
+        #expect(parsedHeader?.architecture == "gemma4")
+        #expect(parsedHeader?.contextLength == 65536)
+        #expect(parsedHeader?.embeddedChatTemplate?.contains("<start_of_turn>") == true)
+
+        let discovered = HeylookConfig.discoverModels(in: [rootDir])
+        #expect(discovered.count == 1)
+        #expect(discovered.first?.architecture.value == "gemma4")
+        #expect(discovered.first?.contextSize.value == 65536)
+
+        let preview = HeylookConfig.renderPromptPreview(
+            in: modelDir,
+            system: "Be concise.",
+            messages: [(role: "user", content: "Hello GGUF", thinking: nil)]
+        )
+        #expect(preview.source == "gguf_embedded")
+        #expect(preview.prompt.contains("<start_of_turn>user"))
+
+        // Dynamic port pool assigns non-colliding ports and releases on unload
+        GGUFPortPool.shared.releaseAll()
+        let descA = EngineDescription(modelID: "gguf-model-a", provider: .gguf, modelPath: ggufURL.path)
+        let descB = EngineDescription(modelID: "gguf-model-b", provider: .gguf, modelPath: ggufURL.path)
+        let provA = GGUFSubprocessProvider(description: descA)
+        let provB = GGUFSubprocessProvider(description: descB)
+        #expect(provA.spawnConfig.port != provB.spawnConfig.port)
+        #expect(provA.spawnConfig.port >= 18080)
+        #expect(provB.spawnConfig.port >= 18080)
+
+        // /props JSON parser and observed provenance upgrade
+        let propsPayload = Data("""
+        {
+          "default_generation_settings": {
+            "n_ctx": 131072
+          },
+          "chat_template": "<start_of_turn>user...",
+          "total_slots": 1
+        }
+        """.utf8)
+        let props = GGUFSubprocessProvider.parsePropsJSON(propsPayload)
+        #expect(props?.contextSize == 131072)
+        #expect(props?.totalSlots == 1)
+        if let props {
+            await provA.applyObservedProps(props)
+        }
+        let updatedA = await provA.describe()
+        #expect(updatedA.contextSize.value == 131072)
+        #expect(updatedA.contextSize.provenance == .observed)
+        #expect(updatedA.templateSource.value == "llama-server:/props")
+        #expect(updatedA.templateSource.provenance == .observed)
+
+        await provA.unload()
+        await provB.unload()
+        #expect(GGUFPortPool.shared.assignedPort(for: "gguf-model-a") == nil)
+        #expect(GGUFPortPool.shared.assignedPort(for: "gguf-model-b") == nil)
+    }
+
+    @Test("ANE speech transcription, disconnect-resilient voice-generate handoff, and EvalLabSuite")
+    func testANESpeechTranscriptionVoiceGenerateHandoffAndEvalLab() async throws {
+        // Synthesize a 0.25s 16 kHz mono 16-bit PCM WAV buffer with an inline TEXT: marker
+        let sampleRate: UInt32 = 16_000
+        let sampleCount = 4_000
+        var pcmData = Data(capacity: sampleCount * 2)
+        for idx in 0..<sampleCount {
+            let val = Int16(sin(Double(idx) * 0.1) * 8000.0).littleEndian
+            withUnsafeBytes(of: val) { pcmData.append(contentsOf: $0) }
+        }
+        var wav = Data("RIFF".utf8)
+        var chunkSize = UInt32(36 + pcmData.count).littleEndian
+        withUnsafeBytes(of: &chunkSize) { wav.append(contentsOf: $0) }
+        wav.append(Data("WAVEfmt ".utf8))
+        var fmtLen = UInt32(16).littleEndian
+        var audioFmt = UInt16(1).littleEndian
+        var channels = UInt16(1).littleEndian
+        var srLE = sampleRate.littleEndian
+        var byteRate = (sampleRate * 2).littleEndian
+        var blockAlign = UInt16(2).littleEndian
+        var bitsPerSample = UInt16(16).littleEndian
+        withUnsafeBytes(of: &fmtLen) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &audioFmt) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &channels) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &srLE) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &byteRate) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &blockAlign) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &bitsPerSample) { wav.append(contentsOf: $0) }
+        wav.append(Data("data".utf8))
+        var dataLen = UInt32(pcmData.count).littleEndian
+        withUnsafeBytes(of: &dataLen) { wav.append(contentsOf: $0) }
+        wav.append(pcmData)
+        wav.append(Data("TEXT:Summarize dual-lane ANE scheduling".utf8))
+
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase10_voice_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = try SQLiteStore(databaseURL: tempDir.appendingPathComponent("voice.sqlite"))
+        let scheduler = ComputeScheduler()
+        let desc = EngineDescription(
+            modelID: "voice-chat-mlx",
+            provider: .mlx,
+            modelPath: tempDir.path,
+            isLoaded: true
+        )
+        await scheduler.register(provider: MLXSwiftProvider(description: desc), description: desc)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        let voiceReq = ConversationVoiceGenerateRequest(
+            model: "voice-chat-mlx",
+            audioBase64: wav.base64EncodedString(),
+            languageHint: "en"
+        )
+        let resp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_voice_1/voice-generate",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(voiceReq)
+        )
+        #expect(resp.status == 200)
+        let bodyText = String(decoding: resp.body, as: UTF8.self)
+        #expect(bodyText.contains("event: heylook_voice_transcribed"))
+        #expect(bodyText.contains("Summarize dual-lane ANE scheduling"))
+        #expect(bodyText.contains("event: heylook_saved"))
+
+        let savedMsgs = try store.listMessages(conversationID: "conv_voice_1")
+        #expect(savedMsgs.count == 2)
+        #expect(savedMsgs.first?.content == "Summarize dual-lane ANE scheduling")
+        #expect(savedMsgs.last?.role == "assistant")
+
+        // Run full EvalLabSuite
+        let evalReport = try await EvalLabSuite.runAll()
+        #expect(evalReport.allPassed == true)
+        #expect(evalReport.probes.count == 3)
+        #expect(evalReport.matryoshkaBenchmarks.count == 4)
+    }
 }

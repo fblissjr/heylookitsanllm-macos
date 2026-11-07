@@ -496,6 +496,34 @@ public final class HeylookWorkbenchViewModel {
         return nil
     }
 
+    /// Transcribes a recorded 16 kHz WAV utterance on the ANE lane (`CoreAIProvider.transcribeAudio`)
+    /// without acquiring the Metal GPU `GenerationGate`, and dispatches the resulting prompt turn.
+    @discardableResult
+    public func sendVoiceTurn(
+        wavData: Data,
+        languageHint: String = "en"
+    ) async -> CoreAIProvider.ANESpeechTranscriptionResult? {
+        let aneProvider = CoreAIProvider(
+            description: EngineDescription(
+                modelID: "ane-speech-whisper",
+                provider: .coreai,
+                modelPath: "models/ane-speech-whisper.aimodel",
+                computePlacement: ProvenanceField(
+                    value: .ane,
+                    provenance: .derived,
+                    effect: .reload,
+                    computePlacement: .ane
+                )
+            )
+        )
+        guard let transcript = try? await aneProvider.transcribeAudio(wavData: wavData, languageHint: languageHint) else {
+            return nil
+        }
+        draftPrompt = transcript.text
+        await sendChatPrompt()
+        return transcript
+    }
+
     public func sendChatPrompt() async {
         let promptText = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!promptText.isEmpty || !draftAttachments.isEmpty), !isGenerating else { return }
