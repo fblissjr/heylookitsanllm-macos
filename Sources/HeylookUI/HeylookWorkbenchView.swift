@@ -1,3 +1,4 @@
+import AVFoundation
 import AVKit
 import Foundation
 import Observation
@@ -74,6 +75,10 @@ public final class HeylookWorkbenchViewModel {
     public var streamingContent: String = ""
     public var showPromptPreview: Bool = false
     public var showLoadPanel: Bool = false
+    public var isRecordingVoice: Bool = false
+    public var lastVoiceTranscription: CoreAIProvider.ANESpeechTranscriptionResult?
+    private var voiceRecorder: AVAudioRecorder?
+    private var voiceRecordingURL: URL?
 
     // Sampler & Thinking Override Controls
     public var presets: [PresetRecord] = []
@@ -519,9 +524,52 @@ public final class HeylookWorkbenchViewModel {
         guard let transcript = try? await aneProvider.transcribeAudio(wavData: wavData, languageHint: languageHint) else {
             return nil
         }
+        lastVoiceTranscription = transcript
         draftPrompt = transcript.text
         await sendChatPrompt()
         return transcript
+    }
+
+    public func toggleVoiceRecording() async {
+        if isRecordingVoice {
+            voiceRecorder?.stop()
+            voiceRecorder = nil
+            isRecordingVoice = false
+            guard let url = voiceRecordingURL else { return }
+            voiceRecordingURL = nil
+            defer { try? FileManager.default.removeItem(at: url) }
+            if let wavData = try? Data(contentsOf: url), wavData.count > 44 {
+                _ = await sendVoiceTurn(wavData: wavData)
+            }
+            return
+        }
+
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heylook-voice-\(UUID().uuidString).wav")
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatLinearPCM),
+            AVSampleRateKey: 16_000.0,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsFloatKey: false
+        ]
+        do {
+            #if os(iOS)
+            let session = AVAudioSession.sharedInstance()
+            try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+            try? session.setActive(true)
+            #endif
+            let recorder = try AVAudioRecorder(url: tempURL, settings: settings)
+            recorder.prepareToRecord()
+            if recorder.record() {
+                voiceRecordingURL = tempURL
+                voiceRecorder = recorder
+                isRecordingVoice = true
+            }
+        } catch {
+            statusBanner = "Microphone capture failed: \(error.localizedDescription)"
+        }
     }
 
     public func sendChatPrompt() async {
@@ -1454,6 +1502,40 @@ struct ChatWorkbenchSurface: View {
                         }
                     }
 
+                    if viewModel.isRecordingVoice {
+                        HStack(spacing: 6) {
+                            Image(systemName: "waveform.badge.mic")
+                                .foregroundStyle(.red)
+                            Text("Recording 16 kHz mono WAV for ANE transcription — click Stop Mic to send")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.red)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.red.opacity(0.1), in: Capsule())
+                    } else if let voiceMeta = viewModel.lastVoiceTranscription {
+                        HStack(spacing: 6) {
+                            Image(systemName: "waveform.circle.fill")
+                                .foregroundStyle(.green)
+                            Text(String(format: "ANE Voice (%@): %.1fs, %d mel frames", voiceMeta.computePlacement.label, voiceMeta.durationSeconds, voiceMeta.melFrames))
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button {
+                                viewModel.lastVoiceTranscription = nil
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.green.opacity(0.1), in: Capsule())
+                    }
+
                     HStack(alignment: .bottom, spacing: 10) {
                         #if os(macOS)
                         Button {
@@ -1465,6 +1547,17 @@ struct ChatWorkbenchSurface: View {
                         .buttonStyle(.bordered)
                         .help("Attach image or audio files")
                         #endif
+
+                        Button {
+                            Task { await viewModel.toggleVoiceRecording() }
+                        } label: {
+                            Image(systemName: viewModel.isRecordingVoice ? "stop.circle.fill" : "mic.fill")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(viewModel.isRecordingVoice ? .red : .primary)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(viewModel.isGenerating)
+                        .help(viewModel.isRecordingVoice ? "Stop recording & transcribe on ANE" : "Record voice turn (16 kHz ANE transcription)")
 
                         TextField("Ask anything or drop images/audio (⌘↩ to send)...", text: $viewModel.draftPrompt, axis: .vertical)
                             .lineLimit(1...6)

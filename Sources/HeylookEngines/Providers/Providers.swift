@@ -654,7 +654,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
         loadedContainer = nil
         cachedKVCaches = nil
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
         #endif
     }
 
@@ -926,7 +926,7 @@ public actor MLXSwiftProvider: InferenceProvider {
                     let tail = reasoningParser.finalize()
                     let tailText = stripSpecials.feed(tail.text) + stripSpecials.finalize()
                     visibleReply.append(tailText)
-                    await self.recordAssistantTurn(visibleReply)
+                    self.recordAssistantTurn(visibleReply)
 
                     continuation.yield(
                         GenerationChunk(

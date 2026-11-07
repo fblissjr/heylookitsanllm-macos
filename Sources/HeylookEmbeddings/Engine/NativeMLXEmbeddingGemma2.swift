@@ -330,7 +330,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         cachedEmbedder = nil
         cachedTokenizer = nil
         await aneRuntime.unload()
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
     }
 
     private static let fallbackDescriptor = NativeMLXEmbeddingGemma2.CheckpointDescriptor(
