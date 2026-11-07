@@ -212,7 +212,7 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         self.explicitModels = explicitModels
     }
 
-    /// Loads `heylook.toml` from `HEYLOOK_CONFIG`, `./heylook.toml`, `../heylookitsanllm/heylook.toml`,
+    /// Loads `heylook.toml` from `HEYLOOK_CONFIG`, `./heylook.toml`,
     /// or `~/.heylook/heylook.toml`, merging `HEYLOOK_MODELS_DIR` if present.
     public static func loadDefault() -> HeylookConfig {
         let env = ProcessInfo.processInfo.environment
@@ -225,8 +225,6 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             candidates.append(URL(fileURLWithPath: (custom as NSString).expandingTildeInPath))
         }
         candidates.append(cwd.appendingPathComponent("heylook.toml"))
-        candidates.append(cwd.deletingLastPathComponent().appendingPathComponent("heylookitsanllm/heylook.toml"))
-        candidates.append(home.appendingPathComponent("workspace/heylookitsanllm/heylook.toml"))
         candidates.append(home.appendingPathComponent(".heylook/heylook.toml"))
 
         var config = HeylookConfig()
@@ -439,6 +437,128 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             return nil
         }
         return SamplerSettings(temperature: temp, topP: topP, topK: topK)
+    }
+
+    /// Derives the per-image vision soft-token budget from `processor_config.json` or `config.json`
+    /// (`vision_config`), falling back to `280` when unspecified.
+    public static func estimateImageTokenBudget(in candidateDir: URL) -> Int {
+        if let procJSON = loadJSONDictionary(at: candidateDir.appendingPathComponent("processor_config.json")) {
+            if let ip = procJSON["image_processor"] as? [String: Any],
+               let maxSoft = (ip["max_soft_tokens"] as? NSNumber)?.intValue,
+               maxSoft > 0 {
+                return maxSoft
+            }
+            if let maxPixels = (procJSON["max_pixels"] as? NSNumber)?.intValue,
+               let patchSize = (procJSON["patch_size"] as? NSNumber)?.intValue,
+               patchSize > 0 {
+                let mergeSize = max(1, (procJSON["merge_size"] as? NSNumber)?.intValue ?? 2)
+                let denom = patchSize * patchSize * mergeSize * mergeSize
+                if denom > 0 {
+                    return max(1, maxPixels / denom)
+                }
+            }
+        }
+        if let configJSON = loadJSONDictionary(at: candidateDir.appendingPathComponent("config.json")),
+           let visionCfg = configJSON["vision_config"] as? [String: Any] {
+            if let defaultLen = (visionCfg["default_output_length"] as? NSNumber)?.intValue,
+               defaultLen > 0 {
+                return defaultLen
+            }
+            if let imageSize = (visionCfg["image_size"] as? NSNumber)?.intValue,
+               let patchSize = (visionCfg["patch_size"] as? NSNumber)?.intValue,
+               patchSize > 0 {
+                let mergeSize = max(
+                    1,
+                    (visionCfg["spatial_merge_size"] as? NSNumber)?.intValue
+                        ?? (visionCfg["pooling_kernel_size"] as? NSNumber)?.intValue
+                        ?? (configJSON["mm_tokens_per_image"] as? NSNumber).map { _ in 1 }
+                        ?? 1
+                )
+                if let mmTokens = (configJSON["mm_tokens_per_image"] as? NSNumber)?.intValue, mmTokens > 0 {
+                    return mmTokens
+                }
+                let grid = imageSize / patchSize
+                return max(1, (grid * grid) / (mergeSize * mergeSize))
+            }
+        }
+        return 280
+    }
+
+    /// Renders a model-derived prompt preview by inspecting the model directory's active template
+    /// (`chat_template.heylook.jinja`, `chat_template.jinja`, `tokenizer_config.json`, or `config.json`).
+    public static func renderPromptPreview(
+        in candidateDir: URL?,
+        system: String?,
+        messages: [(role: String, content: String, thinking: String?)],
+        thinkingEnabled: Bool = false
+    ) -> (prompt: String, source: String) {
+        var source = "default_chatml"
+        var templateText = ""
+        var modelType = ""
+
+        if let candidateDir {
+            let fm = FileManager.default
+            let overrideURL = candidateDir.appendingPathComponent("chat_template.heylook.jinja")
+            let sidecarURL = candidateDir.appendingPathComponent("chat_template.jinja")
+            let tokConfigURL = candidateDir.appendingPathComponent("tokenizer_config.json")
+            let configURL = candidateDir.appendingPathComponent("config.json")
+
+            if fm.fileExists(atPath: overrideURL.path),
+               let t = try? String(contentsOf: overrideURL, encoding: .utf8) {
+                templateText = t
+                source = "chat_template.heylook.jinja"
+            } else if fm.fileExists(atPath: sidecarURL.path),
+                      let t = try? String(contentsOf: sidecarURL, encoding: .utf8) {
+                templateText = t
+                source = "chat_template.jinja"
+            } else if let tokJSON = loadJSONDictionary(at: tokConfigURL),
+                      let t = tokJSON["chat_template"] as? String {
+                templateText = t
+                source = "tokenizer_config.json"
+            }
+            if let cfgJSON = loadJSONDictionary(at: configURL),
+               let mt = cfgJSON["model_type"] as? String {
+                modelType = mt.lowercased()
+            }
+        }
+
+        let usesGemmaTurnMarkers = templateText.contains("<start_of_turn>")
+            || modelType.contains("gemma")
+
+        var lines: [String] = []
+        if usesGemmaTurnMarkers {
+            if let sys = system, !sys.isEmpty {
+                lines.append("<start_of_turn>system\n\(sys)<end_of_turn>")
+            }
+            for msg in messages {
+                let gemmaRole = msg.role == "assistant" ? "model" : msg.role
+                if let thinking = msg.thinking, !thinking.isEmpty {
+                    lines.append("<start_of_turn>\(gemmaRole)\n<thought>\n\(thinking)\n</thought>\n\(msg.content)<end_of_turn>")
+                } else {
+                    lines.append("<start_of_turn>\(gemmaRole)\n\(msg.content)<end_of_turn>")
+                }
+            }
+            lines.append("<start_of_turn>model")
+            if thinkingEnabled {
+                lines.append("<thought>")
+            }
+        } else {
+            if let sys = system, !sys.isEmpty {
+                lines.append("<|im_start|>system\n\(sys)<|im_end|>")
+            }
+            for msg in messages {
+                if let thinking = msg.thinking, !thinking.isEmpty {
+                    lines.append("<|im_start|>\(msg.role)\n<think>\n\(thinking)\n</think>\n\(msg.content)<|im_end|>")
+                } else {
+                    lines.append("<|im_start|>\(msg.role)\n\(msg.content)<|im_end|>")
+                }
+            }
+            lines.append("<|im_start|>assistant")
+            if thinkingEnabled {
+                lines.append("<think>")
+            }
+        }
+        return (lines.joined(separator: "\n"), source)
     }
 
     /// Discovers a `mmproj*.gguf` multimodal vision projector in `candidateDir` or its parent repo directory.

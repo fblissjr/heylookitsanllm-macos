@@ -4,6 +4,7 @@ import CoreImage
 import Foundation
 
 #if canImport(MLXVLM)
+import MLX
 import MLXHuggingFace
 import MLXLMCommon
 import MLXVLM
@@ -17,7 +18,7 @@ public enum NativeMLXEmbeddingGemma2 {
             return URL(fileURLWithPath: envPath)
         }
         return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Storage/llms/google/embeddinggemma-2-MLX-BF16")
+            .appendingPathComponent(".heylook/models/embeddinggemma-2-MLX-BF16")
     }
 
     public struct CheckpointDescriptor: Codable, Sendable, Equatable {
@@ -184,6 +185,10 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
         self.fallbackHash = DeterministicHashEmbeddingEngine(modelID: checkpointURL.lastPathComponent)
     }
 
+    public func unload() async {
+        await aneRuntime.unload()
+    }
+
     public func embedBatch(
         _ inputs: [EmbeddingInput],
         dimensions: Int? = nil
@@ -319,6 +324,13 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         )
         self.cachedEmbedder = loaded
         return loaded
+    }
+
+    public func unload() async {
+        cachedEmbedder = nil
+        cachedTokenizer = nil
+        await aneRuntime.unload()
+        MLX.GPU.clearCache()
     }
 
     private static let fallbackDescriptor = NativeMLXEmbeddingGemma2.CheckpointDescriptor(

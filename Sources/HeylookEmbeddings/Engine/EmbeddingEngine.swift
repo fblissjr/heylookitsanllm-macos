@@ -196,6 +196,13 @@ public protocol EmbeddingEngine: Sendable {
         _ inputs: [EmbeddingInput],
         dimensions: Int?
     ) async throws -> [EmbeddedOutput]
+
+    /// Releases any loaded CoreML / MLX model weights and memory-mapped token tables.
+    func unload() async
+}
+
+public extension EmbeddingEngine {
+    func unload() async {}
 }
 
 /// Matryoshka dimension truncation and hardware-accelerated L2 math (`Accelerate` / `vDSP`).

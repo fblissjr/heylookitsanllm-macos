@@ -649,21 +649,19 @@ public final class HeylookWorkbenchViewModel {
     }
 
     public func renderedPromptPreview() -> String {
-        var lines: [String] = []
-        if !draftSystemPrompt.isEmpty {
-            lines.append("<|im_start|>system\n\(draftSystemPrompt)<|im_end|>")
-        }
-        for msg in currentMessages {
-            lines.append("<|im_start|>\(msg.role)\n\(msg.content)<|im_end|>")
+        var turns: [(role: String, content: String, thinking: String?)] = currentMessages.map {
+            (role: $0.role, content: $0.content, thinking: $0.thinking)
         }
         if !draftPrompt.isEmpty {
-            lines.append("<|im_start|>user\n\(draftPrompt)<|im_end|>")
+            turns.append((role: "user", content: draftPrompt, thinking: nil))
         }
-        lines.append("<|im_start|>assistant")
-        if thinkingEnabled {
-            lines.append("<think>")
-        }
-        return lines.joined(separator: "\n")
+        let dirURL = activeModelDescription.map { URL(fileURLWithPath: $0.modelPath) }
+        return HeylookConfig.renderPromptPreview(
+            in: dirURL,
+            system: draftSystemPrompt.isEmpty ? nil : draftSystemPrompt,
+            messages: turns,
+            thinkingEnabled: thinkingEnabled
+        ).prompt
     }
 
     // MARK: - Notebook Operations
@@ -1120,6 +1118,30 @@ public final class HeylookWorkbenchViewModel {
             await scheduler.unloadModel(model.modelID)
         } else {
             _ = try? await scheduler.activateModel(model.modelID)
+        }
+        await refreshMetrics()
+    }
+
+    public func unloadAllModels() async {
+        await scheduler.unloadAllModels()
+        await activeEmbeddingEngine.unload()
+        await refreshMetrics()
+        statusBanner = "Unloaded all models, cleared Metal/ANE caches, and terminated background subprocesses."
+    }
+
+    public func shutdown() async {
+        indexTask?.cancel()
+        indexTask = nil
+        #if os(macOS)
+        folderWatcher?.stop()
+        #endif
+        stopBonjourDiscovery()
+        if isServerRunning {
+            await server.stop()
+            isServerRunning = false
+        } else {
+            await scheduler.unloadAllModels()
+            await activeEmbeddingEngine.unload()
         }
         await refreshMetrics()
     }
@@ -2838,7 +2860,26 @@ struct ModelsInspectorSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
 
     var body: some View {
-        List(viewModel.registeredModels) { model in
+        VStack(spacing: 0) {
+            HStack {
+                Text("Registered Models (\(viewModel.registeredModels.count))")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    Task { await viewModel.unloadAllModels() }
+                } label: {
+                    Label("Unload All Models", systemImage: "eject.circle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            List(viewModel.registeredModels) { model in
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
                     Circle()
@@ -2907,6 +2948,7 @@ struct ModelsInspectorSurface: View {
                 }
             }
             .padding(.vertical, 6)
+        }
         }
         .sheet(item: $viewModel.editingSidecarModel) { model in
             ModelSidecarEditorSheet(viewModel: viewModel, model: model)

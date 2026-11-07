@@ -32,10 +32,17 @@ struct HeylookApp: App {
                     Task { await viewModel.toggleServer() }
                 }
 
+                Button("Unload All Models") {
+                    Task { await viewModel.unloadAllModels() }
+                }
+
                 Divider()
 
                 Button("Quit Heylook") {
-                    NSApplication.shared.terminate(nil)
+                    Task {
+                        await viewModel.shutdown()
+                        NSApplication.shared.terminate(nil)
+                    }
                 }
             }
             .padding(8)

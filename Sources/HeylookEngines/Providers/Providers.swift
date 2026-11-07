@@ -73,6 +73,18 @@ public struct PrefixCacheTracker: Sendable {
 
     public init() {}
 
+    public var isWarm: Bool {
+        hasEvaluated
+    }
+
+    /// Resets all cached prefix state when a model is unloaded or evicted.
+    public mutating func reset() {
+        hasEvaluated = false
+        cachedSystemPrompt = nil
+        cachedSystemTokens = 0
+        cachedTurns.removeAll()
+    }
+
     public static func estimateTokens(for text: String) -> Int {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return 0 }
@@ -81,18 +93,21 @@ public struct PrefixCacheTracker: Sendable {
     }
 
     /// Evaluates how much of `system` + `messages` reuses the cached KV prefix and updates
-    /// the tracker state for subsequent turns.
+    /// the tracker state for subsequent turns. Accepts an optional `tokenCounter` closure for
+    /// exact tokenizer-backed counts.
     public mutating func evaluate(
         system: String?,
-        messages: [MessagesRequest.MessageTurn]
+        messages: [MessagesRequest.MessageTurn],
+        tokenCounter: ((String) -> Int)? = nil
     ) -> CacheReport {
+        let countFn = tokenCounter ?? Self.estimateTokens(for:)
         let normalizedSystem = (system?.isEmpty == true) ? nil : system
-        let sysTokens = normalizedSystem.map(Self.estimateTokens(for:)) ?? 0
+        let sysTokens = normalizedSystem.map(countFn) ?? 0
         let turnEntries = messages.map { turn in
             TurnEntry(
                 role: turn.role,
                 content: turn.content,
-                tokenCount: max(2, Self.estimateTokens(for: turn.content))
+                tokenCount: max(2, countFn(turn.content))
             )
         }
         let totalPromptTokens = max(4, sysTokens + turnEntries.reduce(0) { $0 + $1.tokenCount })
@@ -198,17 +213,111 @@ public struct PrefixCacheTracker: Sendable {
 
     /// Appends the completed assistant reply to the cached turn prefix so the next turn
     /// matches both the user and assistant turns.
-    public mutating func recordAssistantReply(_ content: String) {
+    public mutating func recordAssistantReply(
+        _ content: String,
+        tokenCounter: ((String) -> Int)? = nil
+    ) {
         guard hasEvaluated, !content.isEmpty else { return }
+        let countFn = tokenCounter ?? Self.estimateTokens(for:)
         cachedTurns.append(
             TurnEntry(
                 role: "assistant",
                 content: content,
-                tokenCount: max(2, Self.estimateTokens(for: content))
+                tokenCount: max(2, countFn(content))
             )
         )
     }
 }
+
+#if os(macOS)
+/// Process-wide lifecycle registry for out-of-process child servers (`llama-server`).
+/// Ensures that unloading a model, LRU eviction, stopping `HeylookHTTPServer`, or process exit
+/// (`atexit`) deterministically terminates (`SIGTERM` -> `SIGKILL`) all spawned child processes
+/// so no orphaned `llama-server` processes or leaked unified memory remain.
+public final class SubprocessLifecycleRegistry: @unchecked Sendable {
+    public static let shared = SubprocessLifecycleRegistry()
+
+    private let lock = NSLock()
+    private var processes: [String: Process] = [:]
+
+    private init() {
+        atexit {
+            SubprocessLifecycleRegistry.shared.terminateAll()
+        }
+    }
+
+    public func register(_ process: Process, for modelID: String) {
+        var oldProcess: Process?
+        lock.lock()
+        oldProcess = processes[modelID]
+        processes[modelID] = process
+        lock.unlock()
+
+        if let oldProcess, oldProcess !== process {
+            Self.terminateProcess(oldProcess)
+        }
+    }
+
+    public func terminate(for modelID: String) {
+        let proc: Process?
+        lock.lock()
+        proc = processes.removeValue(forKey: modelID)
+        lock.unlock()
+
+        if let proc {
+            Self.terminateProcess(proc)
+        }
+    }
+
+    public func terminateAll() {
+        let allProcs: [Process]
+        lock.lock()
+        allProcs = Array(processes.values)
+        processes.removeAll()
+        lock.unlock()
+
+        for proc in allProcs {
+            Self.terminateProcess(proc)
+        }
+    }
+
+    public func isRunning(for modelID: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let proc = processes[modelID] else { return false }
+        return proc.isRunning
+    }
+
+    public func processIdentifier(for modelID: String) -> Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let proc = processes[modelID], proc.isRunning else { return nil }
+        return proc.processIdentifier
+    }
+
+    public var activeSubprocessCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return processes.values.filter(\.isRunning).count
+    }
+
+    private static func terminateProcess(_ proc: Process) {
+        guard proc.isRunning else { return }
+        let pid = proc.processIdentifier
+        proc.terminate()
+        for _ in 0..<10 {
+            if !proc.isRunning {
+                break
+            }
+            usleep(20_000)
+        }
+        if proc.isRunning && pid > 0 {
+            kill(pid, SIGKILL)
+        }
+        proc.waitUntilExit()
+    }
+}
+#endif
 
 /// Inspector for Apple `coreai-models` `.aimodel` bundles (`metadata.json`).
 public struct CoreAIBundleManifest: Codable, Sendable, Equatable {
@@ -414,20 +523,43 @@ enum StreamingPipeline {
 public actor MLXSwiftProvider: InferenceProvider {
     public nonisolated let modelID: String
     public nonisolated let providerKind: EngineProviderKind = .mlx
+    public nonisolated let allowSyntheticFallback: Bool
     private var descriptionState: EngineDescription
     private var prefixCache = PrefixCacheTracker()
+    private var unloadCount: Int = 0
 
     #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
     private var loadedContainer: ModelContainer?
+    private var cachedKVCaches: [KVCache]?
     #endif
 
-    public init(description: EngineDescription) {
+    public init(description: EngineDescription, allowSyntheticFallback: Bool = true) {
         self.modelID = description.modelID
         self.descriptionState = description
+        self.allowSyntheticFallback = allowSyntheticFallback
     }
 
     public func describe() async -> EngineDescription {
         descriptionState
+    }
+
+    public func isPrefixCacheWarm() -> Bool {
+        prefixCache.isWarm
+    }
+
+    public func totalUnloadCount() -> Int {
+        unloadCount
+    }
+
+    public func unload() async {
+        unloadCount += 1
+        prefixCache.reset()
+        descriptionState.isLoaded = false
+        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
+        loadedContainer = nil
+        cachedKVCaches = nil
+        MLX.GPU.clearCache()
+        #endif
     }
 
     public func generate(
@@ -442,6 +574,9 @@ public actor MLXSwiftProvider: InferenceProvider {
 
         #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
         if Self.hasSafetensorsWeights(at: descriptionState.modelPath) {
+            if cacheReport.outcome == .miss {
+                cachedKVCaches = nil
+            }
             return generateWithMLXContainer(
                 requestID: requestID,
                 request: request,
@@ -453,6 +588,16 @@ public actor MLXSwiftProvider: InferenceProvider {
             )
         }
         #endif
+
+        guard allowSyntheticFallback else {
+            let missingError = ProviderExecutionError.checkpointNotFound(
+                modelID: modelID,
+                path: descriptionState.modelPath
+            )
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: missingError)
+            }
+        }
 
         let userText = request.messages.last?.content ?? ""
         var tokens: [String] = []
@@ -695,12 +840,15 @@ public actor MLXSwiftProvider: InferenceProvider {
 public actor CoreAIProvider: InferenceProvider {
     public nonisolated let modelID: String
     public nonisolated let providerKind: EngineProviderKind = .coreai
+    public nonisolated let allowSyntheticFallback: Bool
     private var descriptionState: EngineDescription
     private var prefixCache = PrefixCacheTracker()
     private var bundleManifest: CoreAIBundleManifest?
+    private var unloadCount: Int = 0
 
-    public init(description: EngineDescription) {
+    public init(description: EngineDescription, allowSyntheticFallback: Bool = true) {
         self.modelID = description.modelID
+        self.allowSyntheticFallback = allowSyntheticFallback
         var updatedDesc = description
         let url = URL(fileURLWithPath: description.modelPath)
         if let manifest = try? CoreAIBundleManifest.inspect(at: url) {
@@ -747,12 +895,27 @@ public actor CoreAIProvider: InferenceProvider {
         bundleManifest
     }
 
+    public func unload() async {
+        unloadCount += 1
+        prefixCache.reset()
+        descriptionState.isLoaded = false
+    }
+
     public func generate(
         requestID: String,
         request: MessagesRequest,
         effectiveSampling: SamplerSettings,
         registry: RequestRegistry
     ) -> AsyncThrowingStream<GenerationChunk, Error> {
+        if !allowSyntheticFallback && bundleManifest == nil {
+            let err = ProviderExecutionError.checkpointNotFound(
+                modelID: modelID,
+                path: descriptionState.modelPath
+            )
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: err)
+            }
+        }
         let placement = descriptionState.computePlacement.value
         let cacheReport = prefixCache.evaluate(system: request.system, messages: request.messages)
         let userText = request.messages.last?.content ?? ""
@@ -952,18 +1115,25 @@ public actor GGUFSubprocessProvider: InferenceProvider {
 
     public nonisolated let modelID: String
     public nonisolated let providerKind: EngineProviderKind = .gguf
+    public nonisolated let allowSyntheticFallback: Bool
     private var descriptionState: EngineDescription
     public let spawnConfig: GGUFSpawnConfig
     private var prefixCache = PrefixCacheTracker()
+    private var unloadCount: Int = 0
 
     #if os(macOS)
     private var process: Process?
     #endif
 
-    public init(description: EngineDescription, spawnConfig: GGUFSpawnConfig? = nil) {
+    public init(
+        description: EngineDescription,
+        spawnConfig: GGUFSpawnConfig? = nil,
+        allowSyntheticFallback: Bool = true
+    ) {
         self.modelID = description.modelID
         self.descriptionState = description
         self.spawnConfig = spawnConfig ?? GGUFSpawnConfig.autoSized(for: description)
+        self.allowSyntheticFallback = allowSyntheticFallback
     }
 
     /// Builds the `llama-server` CLI flag array matching `llama_server_provider.py`.
@@ -1144,6 +1314,24 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         descriptionState
     }
 
+    public func isPrefixCacheWarm() -> Bool {
+        prefixCache.isWarm
+    }
+
+    public func totalUnloadCount() -> Int {
+        unloadCount
+    }
+
+    public func unload() async {
+        unloadCount += 1
+        #if os(macOS)
+        SubprocessLifecycleRegistry.shared.terminate(for: modelID)
+        process = nil
+        #endif
+        prefixCache.reset()
+        descriptionState.isLoaded = false
+    }
+
     /// True when both the `llama-server` executable and `.gguf` file exist on disk.
     public nonisolated var canLaunchLiveSubprocess: Bool {
         let fm = FileManager.default
@@ -1173,6 +1361,16 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         }
         #endif
 
+        guard allowSyntheticFallback else {
+            let fm = FileManager.default
+            let err: ProviderExecutionError = !fm.isExecutableFile(atPath: spawnConfig.binaryPath)
+                ? .binaryNotFound(modelID: modelID, binaryPath: spawnConfig.binaryPath)
+                : .checkpointNotFound(modelID: modelID, path: spawnConfig.modelPath)
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: err)
+            }
+        }
+
         let userText = request.messages.last?.content ?? ""
         var tokens: [String] = []
         if enableThinking {
@@ -1198,18 +1396,29 @@ public actor GGUFSubprocessProvider: InferenceProvider {
     }
 
     #if os(macOS)
-    private func ensureSubprocessRunning() async throws {
+    /// Spawns and registers the child subprocess in `SubprocessLifecycleRegistry.shared`.
+    @discardableResult
+    public func launchSubprocess(
+        customArguments: [String]? = nil,
+        checkHealth: Bool = true
+    ) async throws -> Int32 {
         if let proc = process, proc.isRunning {
-            return
+            return proc.processIdentifier
         }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: spawnConfig.binaryPath)
-        proc.arguments = Self.buildLlamaServerArgs(config: spawnConfig)
+        proc.arguments = customArguments ?? Self.buildLlamaServerArgs(config: spawnConfig)
         proc.environment = Self.childEnvironment()
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
         try proc.run()
         self.process = proc
+        SubprocessLifecycleRegistry.shared.register(proc, for: modelID)
+
+        guard checkHealth else {
+            descriptionState.isLoaded = true
+            return proc.processIdentifier
+        }
 
         let healthURL = URL(string: "http://\(spawnConfig.host):\(spawnConfig.port)/health")!
         for _ in 0..<120 {
@@ -1217,10 +1426,15 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                let http = resp as? HTTPURLResponse,
                http.statusCode == 200 {
                 descriptionState.isLoaded = true
-                return
+                return proc.processIdentifier
             }
             try await Task.sleep(for: .milliseconds(250))
         }
+        return proc.processIdentifier
+    }
+
+    private func ensureSubprocessRunning() async throws {
+        _ = try await launchSubprocess(checkHealth: true)
     }
 
     private func generateWithLiveSubprocess(
@@ -1403,6 +1617,17 @@ public actor RemoteHeylookProvider: InferenceProvider {
 
     public func describe() async -> EngineDescription {
         descriptionState
+    }
+
+    public func unload() async {
+        descriptionState.isLoaded = false
+        let unloadURL = baseURL
+            .appendingPathComponent("v1/admin/models")
+            .appendingPathComponent(modelID)
+            .appendingPathComponent("unload")
+        var req = URLRequest(url: unloadURL)
+        req.httpMethod = "POST"
+        _ = try? await session.data(for: req)
     }
 
     /// Parses an Anthropic Messages SSE `(event, data)` frame emitted by `HeylookServer`.

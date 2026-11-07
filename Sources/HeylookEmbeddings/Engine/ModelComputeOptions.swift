@@ -442,6 +442,16 @@ public actor ANECoreMLRuntime {
         self.checkpointDirectory = checkpointDirectory
     }
 
+    /// Evicts all loaded `MLModel` tower instances and unmaps `embed_tokens_fp16.bin`.
+    public func unload() {
+        loadedModels.removeAll()
+        mappedTokenTable = nil
+    }
+
+    public var loadedModelCount: Int {
+        loadedModels.count
+    }
+
     private func model(for component: EmbeddingComponent, unit: TowerComputeUnit) async throws -> MLModel? {
         guard unit != .mlxGPU else { return nil }
         let cacheKey = "\(component.rawValue):\(unit.rawValue)"

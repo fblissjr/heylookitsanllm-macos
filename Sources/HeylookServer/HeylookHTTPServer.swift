@@ -83,7 +83,8 @@ public actor HeylookRouter {
         path: String,
         queryItems: [URLQueryItem] = [],
         headers: [String: String] = [:],
-        body: Data = Data()
+        body: Data = Data(),
+        onSSEFrame: (@Sendable (String) async -> Void)? = nil
     ) async -> HeylookHTTPResponse {
         let hostHeader = headers["Host"] ?? headers["host"]
         guard isAllowedHostHeader(hostHeader) else {
@@ -151,10 +152,27 @@ public actor HeylookRouter {
             case ("POST", "/v1/messages"):
                 let req = try JSONDecoder().decode(MessagesRequest.self, from: body)
                 let reqID = headers["X-Request-ID"] ?? headers["x-request-id"] ?? "req_\(UUID().uuidString)"
-                return try await handleMessages(requestID: reqID, request: req)
+                return try await handleMessages(requestID: reqID, request: req, onSSEFrame: onSSEFrame)
 
             case ("POST", "/v1/embeddings"):
                 return try await handleEmbeddings(body: body)
+
+            case ("POST", "/v1/admin/models/unload-all"):
+                await scheduler.unloadAllModels()
+                await embeddingEngine.unload()
+                let sched = await scheduler.metrics()
+                struct UnloadAllAck: Encodable {
+                    let unloaded: Bool
+                    let loaded_gpu_models: [String]
+                    let loaded_ane_models: [String]
+                }
+                return try .json(
+                    UnloadAllAck(
+                        unloaded: true,
+                        loaded_gpu_models: sched.loadedGPUModels,
+                        loaded_ane_models: sched.loadedANEModels
+                    )
+                )
 
             case ("GET", "/v1/conversations"):
                 let list = try store.listConversations()
@@ -221,30 +239,36 @@ public actor HeylookRouter {
                     return try await handleConversationGenerate(
                         requestID: reqID,
                         conversationID: convID,
-                        generateRequest: genReq
+                        generateRequest: genReq,
+                        onSSEFrame: onSSEFrame
                     )
                 }
                 if segments.count == 4 && segments[3] == "prompt" && method.uppercased() == "POST" {
                     struct PromptResponse: Encodable {
                         let conversation_id: String
                         let prompt: String
+                        let template_source: String
                         let message_count: Int
                     }
                     let conv = try store.getConversation(id: convID)
                     let msgs = try store.listMessages(conversationID: convID)
-                    var lines: [String] = []
-                    if let sys = conv?.systemPrompt, !sys.isEmpty {
-                        lines.append("<|im_start|>system\n\(sys)<|im_end|>")
+                    var modelDirURL: URL?
+                    if let defaultModelID = conv?.defaultModelID,
+                       let desc = await scheduler.modelDescription(for: defaultModelID) {
+                        modelDirURL = URL(fileURLWithPath: desc.modelPath)
+                    } else if let firstModel = await scheduler.listModels().first {
+                        modelDirURL = URL(fileURLWithPath: firstModel.modelPath)
                     }
-                    for m in msgs {
-                        lines.append("<|im_start|>\(m.role)\n\(m.content)<|im_end|>")
-                    }
-                    lines.append("<|im_start|>assistant")
-                    let rendered = lines.joined(separator: "\n")
+                    let rendered = HeylookConfig.renderPromptPreview(
+                        in: modelDirURL,
+                        system: conv?.systemPrompt,
+                        messages: msgs.map { (role: $0.role, content: $0.content, thinking: $0.thinking) }
+                    )
                     return try .json(
                         PromptResponse(
                             conversation_id: convID,
-                            prompt: rendered,
+                            prompt: rendered.prompt,
+                            template_source: rendered.source,
                             message_count: msgs.count
                         )
                     )
@@ -267,7 +291,8 @@ public actor HeylookRouter {
                     let model: String
                     let tokens_per_image: Int
                 }
-                return try .json(ImagePlanResponse(model: modelID, tokens_per_image: 280))
+                let budget = HeylookConfig.estimateImageTokenBudget(in: URL(fileURLWithPath: desc.modelPath))
+                return try .json(ImagePlanResponse(model: modelID, tokens_per_image: budget))
             }
 
             if segments.count >= 4 && segments[0] == "v1" && segments[1] == "admin" && segments[2] == "models" {
@@ -375,6 +400,8 @@ public actor HeylookRouter {
             case .modelNotFound:
                 return .error(status: 404, type: "not_found_error", message: error.localizedDescription)
             }
+        } catch let error as ProviderExecutionError {
+            return .error(status: 500, type: "provider_execution_error", message: error.localizedDescription)
         } catch {
             return .error(status: 400, type: "invalid_request_error", message: error.localizedDescription)
         }
@@ -438,7 +465,8 @@ public actor HeylookRouter {
 
     private func handleMessages(
         requestID: String,
-        request: MessagesRequest
+        request: MessagesRequest,
+        onSSEFrame: (@Sendable (String) async -> Void)? = nil
     ) async throws -> HeylookHTTPResponse {
         let provider = try await scheduler.provider(for: request.model)
         let desc = await provider.describe()
@@ -485,7 +513,9 @@ public actor HeylookRouter {
                 ]
                 if let startData = try? JSONSerialization.data(withJSONObject: startPayload),
                    let startStr = String(data: startData, encoding: .utf8) {
-                    sseLines.append("event: message_start\ndata: \(startStr)\n\n")
+                    let frame = "event: message_start\ndata: \(startStr)\n\n"
+                    sseLines.append(frame)
+                    if let onSSEFrame { await onSSEFrame(frame) }
                 }
             }
 
@@ -509,7 +539,9 @@ public actor HeylookRouter {
                         ]
                         if let d = try? JSONSerialization.data(withJSONObject: deltaObj),
                            let s = String(data: d, encoding: .utf8) {
-                            sseLines.append("event: content_block_delta\ndata: \(s)\n\n")
+                            let frame = "event: content_block_delta\ndata: \(s)\n\n"
+                            sseLines.append(frame)
+                            if let onSSEFrame { await onSSEFrame(frame) }
                         }
                     }
                 }
@@ -526,7 +558,9 @@ public actor HeylookRouter {
                         ]
                         if let d = try? JSONSerialization.data(withJSONObject: deltaObj),
                            let s = String(data: d, encoding: .utf8) {
-                            sseLines.append("event: content_block_delta\ndata: \(s)\n\n")
+                            let frame = "event: content_block_delta\ndata: \(s)\n\n"
+                            sseLines.append(frame)
+                            if let onSSEFrame { await onSSEFrame(frame) }
                         }
                     }
                 }
@@ -565,9 +599,13 @@ public actor HeylookRouter {
                 )
                 if let deltaData = try? JSONEncoder().encode(msgDelta),
                    let deltaStr = String(data: deltaData, encoding: .utf8) {
-                    sseLines.append("event: message_delta\ndata: \(deltaStr)\n\n")
+                    let frame = "event: message_delta\ndata: \(deltaStr)\n\n"
+                    sseLines.append(frame)
+                    if let onSSEFrame { await onSSEFrame(frame) }
                 }
-                sseLines.append("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                let stopFrame = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                sseLines.append(stopFrame)
+                if let onSSEFrame { await onSSEFrame(stopFrame) }
 
                 return HeylookHTTPResponse(
                     status: 200,
@@ -609,7 +647,8 @@ public actor HeylookRouter {
     private func handleConversationGenerate(
         requestID: String,
         conversationID: String,
-        generateRequest: ConversationGenerateRequest
+        generateRequest: ConversationGenerateRequest,
+        onSSEFrame: (@Sendable (String) async -> Void)? = nil
     ) async throws -> HeylookHTTPResponse {
         let provider = try await scheduler.provider(for: generateRequest.model)
         if try store.getConversation(id: conversationID) == nil {
@@ -670,7 +709,9 @@ public actor HeylookRouter {
                             data: JSONEncoder().encode(["type": "thinking_delta", "thinking": chunk.thinking]),
                             encoding: .utf8
                         ) ?? "{}"
-                        sseLines.append("event: content_block_delta\ndata: \(deltaJSON)\n\n")
+                        let frame = "event: content_block_delta\ndata: \(deltaJSON)\n\n"
+                        sseLines.append(frame)
+                        if let onSSEFrame { await onSSEFrame(frame) }
                     }
                     if !chunk.text.isEmpty {
                         fullText.append(chunk.text)
@@ -678,7 +719,9 @@ public actor HeylookRouter {
                             data: JSONEncoder().encode(["type": "text_delta", "text": chunk.text]),
                             encoding: .utf8
                         ) ?? "{}"
-                        sseLines.append("event: content_block_delta\ndata: \(deltaJSON)\n\n")
+                        let frame = "event: content_block_delta\ndata: \(deltaJSON)\n\n"
+                        sseLines.append(frame)
+                        if let onSSEFrame { await onSSEFrame(frame) }
                     }
                     finalChunk = chunk
                 }
@@ -707,7 +750,9 @@ public actor HeylookRouter {
                     stopReason: finalChunk.stopReason ?? .endTurn
                 )
                 let savedJSON = try String(data: JSONEncoder().encode(savedEvent), encoding: .utf8) ?? "{}"
-                sseLines.append("event: heylook_saved\ndata: \(savedJSON)\n\n")
+                let savedFrame = "event: heylook_saved\ndata: \(savedJSON)\n\n"
+                sseLines.append(savedFrame)
+                if let onSSEFrame { await onSSEFrame(savedFrame) }
                 return Data(sseLines.joined().utf8)
             }
         }
@@ -765,10 +810,12 @@ public actor HeylookHTTPServer {
         self.isRunning = true
     }
 
-    public func stop() {
+    public func stop() async {
         listener?.cancel()
         listener = nil
         isRunning = false
+        await router.scheduler.unloadAllModels()
+        await router.embeddingEngine.unload()
     }
 
     /// Assembles multi-frame HTTP requests up to the full `Content-Length` body before dispatching
@@ -816,16 +863,32 @@ public actor HeylookHTTPServer {
 
             let finalBuffer = buffer
             Task {
-                let response = await Self.parseAndDispatch(rawData: finalBuffer, router: router)
-                let serialized = Self.serializeHTTPResponse(response)
-                connection.send(content: serialized, completion: .contentProcessed { _ in
-                    connection.cancel()
-                })
+                let sseStreamBox = SSEConnectionStreamer(connection: connection)
+                let response = await Self.parseAndDispatch(
+                    rawData: finalBuffer,
+                    router: router,
+                    onSSEFrame: { frame in
+                        await sseStreamBox.sendFrame(frame)
+                    }
+                )
+                let didStream = await sseStreamBox.hasStreamed
+                if didStream {
+                    await sseStreamBox.finish()
+                } else {
+                    let serialized = Self.serializeHTTPResponse(response)
+                    connection.send(content: serialized, completion: .contentProcessed { _ in
+                        connection.cancel()
+                    })
+                }
             }
         }
     }
 
-    private nonisolated static func parseAndDispatch(rawData: Data, router: HeylookRouter) async -> HeylookHTTPResponse {
+    private nonisolated static func parseAndDispatch(
+        rawData: Data,
+        router: HeylookRouter,
+        onSSEFrame: (@Sendable (String) async -> Void)? = nil
+    ) async -> HeylookHTTPResponse {
         let separator = Data("\r\n\r\n".utf8)
         let headerData: Data
         let bodyData: Data
@@ -859,7 +922,14 @@ public actor HeylookHTTPServer {
                 headers[parts[0].trimmingCharacters(in: .whitespaces)] = parts[1].trimmingCharacters(in: .whitespaces)
             }
         }
-        return await router.handle(method: method, path: path, queryItems: queryItems, headers: headers, body: bodyData)
+        return await router.handle(
+            method: method,
+            path: path,
+            queryItems: queryItems,
+            headers: headers,
+            body: bodyData,
+            onSSEFrame: onSSEFrame
+        )
     }
 
     private nonisolated static func serializeHTTPResponse(_ response: HeylookHTTPResponse) -> Data {
@@ -873,6 +943,42 @@ public actor HeylookHTTPServer {
         var out = Data(head.utf8)
         out.append(response.body)
         return out
+    }
+}
+
+/// Actor that flushes SSE frames incrementally over an `NWConnection` as tokens are generated.
+private actor SSEConnectionStreamer {
+    private let connection: NWConnection
+    public private(set) var hasStreamed: Bool = false
+
+    init(connection: NWConnection) {
+        self.connection = connection
+    }
+
+    func sendFrame(_ frame: String) async {
+        var payload = Data()
+        if !hasStreamed {
+            hasStreamed = true
+            let sseHeader = [
+                "HTTP/1.1 200 OK",
+                "Content-Type: text/event-stream",
+                "Cache-Control: no-cache",
+                "Connection: keep-alive",
+                "",
+                "",
+            ].joined(separator: "\r\n")
+            payload.append(Data(sseHeader.utf8))
+        }
+        payload.append(Data(frame.utf8))
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            connection.send(content: payload, completion: .contentProcessed { _ in
+                cont.resume()
+            })
+        }
+    }
+
+    func finish() {
+        connection.cancel()
     }
 }
 

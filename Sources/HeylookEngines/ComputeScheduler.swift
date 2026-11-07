@@ -16,6 +16,23 @@ public enum ComputeSchedulerError: LocalizedError, Sendable, Equatable {
     }
 }
 
+public enum ProviderExecutionError: LocalizedError, Sendable, Equatable {
+    case checkpointNotFound(modelID: String, path: String)
+    case binaryNotFound(modelID: String, binaryPath: String)
+    case runtimeUnavailable(modelID: String, detail: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .checkpointNotFound(modelID, path):
+            return "checkpoint_not_found: Model '\(modelID)' weights not found at '\(path)'"
+        case let .binaryNotFound(modelID, binaryPath):
+            return "binary_not_found: Executable for '\(modelID)' not found at '\(binaryPath)'"
+        case let .runtimeUnavailable(modelID, detail):
+            return "runtime_unavailable: Cannot execute '\(modelID)' (\(detail))"
+        }
+    }
+}
+
 /// Unified provider protocol implemented by `MLXSwiftProvider`, `CoreAIProvider`,
 /// `GGUFSubprocessProvider`, and `RemoteHeylookProvider`.
 public protocol InferenceProvider: Sendable {
@@ -30,6 +47,13 @@ public protocol InferenceProvider: Sendable {
         effectiveSampling: SamplerSettings,
         registry: RequestRegistry
     ) async -> AsyncThrowingStream<GenerationChunk, Error>
+
+    /// Releases loaded weights, clears KV/Metal caches, and terminates any child subprocesses.
+    func unload() async
+}
+
+public extension InferenceProvider {
+    func unload() async {}
 }
 
 /// Hardware memory telemetry for Apple Silicon Unified Memory (e.g. 192 GB M2 Ultra Mac Studio).
@@ -131,11 +155,14 @@ public actor ComputeScheduler {
         self.maxQueueDepth = max(1, maxQueueDepth)
     }
 
-    public func register(provider: any InferenceProvider, description: EngineDescription) {
+    public func register(provider: any InferenceProvider, description: EngineDescription) async {
         providers[description.modelID] = provider
         descriptions[description.modelID] = description
         if description.isLoaded {
-            recordResidency(for: description)
+            let evicted = recordResidency(for: description)
+            for evictedID in evicted {
+                await providers[evictedID]?.unload()
+            }
         }
     }
 
@@ -198,22 +225,45 @@ public actor ComputeScheduler {
 
     /// Marks `modelID` as loaded and enforces LRU eviction on unpinned GPU models while leaving
     /// ANE-resident models (`computePlacement.runsOnNeuralEngineLane`) untouched.
-    public func activateModel(_ modelID: String) throws -> EngineDescription {
+    /// Any evicted GPU model's `provider.unload()` is invoked so Metal memory and `llama-server`
+    /// subprocesses are immediately reclaimed.
+    public func activateModel(_ modelID: String) async throws -> EngineDescription {
         guard var desc = descriptions[modelID] else {
             throw ComputeSchedulerError.modelNotFound(modelID)
         }
         desc.isLoaded = true
         descriptions[modelID] = desc
-        recordResidency(for: desc)
+        let evictedIDs = recordResidency(for: desc)
+        for evictedID in evictedIDs {
+            await providers[evictedID]?.unload()
+        }
         return desc
     }
 
-    public func unloadModel(_ modelID: String) {
+    public func unloadModel(_ modelID: String) async {
         guard var desc = descriptions[modelID] else { return }
         desc.isLoaded = false
         descriptions[modelID] = desc
         lruOrderGPU.removeAll { $0 == modelID }
         loadedANE.remove(modelID)
+        await providers[modelID]?.unload()
+    }
+
+    /// Unloads all registered models, freeing Metal GPU memory, clearing KV caches,
+    /// and terminating all `llama-server` subprocesses.
+    public func unloadAllModels() async {
+        let allIDs = Array(descriptions.keys)
+        for id in allIDs {
+            if var desc = descriptions[id] {
+                desc.isLoaded = false
+                descriptions[id] = desc
+            }
+        }
+        lruOrderGPU.removeAll()
+        loadedANE.removeAll()
+        for (_, provider) in providers {
+            await provider.unload()
+        }
     }
 
     /// Acquires a compute lease on either the **ANE Co-Resident Lane** (concurrent, zero GPU contention)
@@ -222,7 +272,7 @@ public actor ComputeScheduler {
         for modelID: String,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
-        let desc = try activateModel(modelID)
+        let desc = try await activateModel(modelID)
         let usesANELane = desc.computePlacement.value.runsOnNeuralEngineLane
 
         if usesANELane {
@@ -277,14 +327,16 @@ public actor ComputeScheduler {
         )
     }
 
-    private func recordResidency(for desc: EngineDescription) {
+    @discardableResult
+    private func recordResidency(for desc: EngineDescription) -> [String] {
         if desc.computePlacement.value.runsOnNeuralEngineLane {
             loadedANE.insert(desc.modelID)
-            return
+            return []
         }
         lruOrderGPU.removeAll { $0 == desc.modelID }
         lruOrderGPU.append(desc.modelID)
 
+        var evictedIDs: [String] = []
         // Evict oldest unpinned GPU models when unpinned + pinned GPU models exceed maxLoadedGPUModels
         while lruOrderGPU.count > maxLoadedGPUModels {
             guard let candidateIdx = lruOrderGPU.firstIndex(where: { id in
@@ -297,6 +349,8 @@ public actor ComputeScheduler {
                 evicted.isLoaded = false
                 descriptions[evictedID] = evicted
             }
+            evictedIDs.append(evictedID)
         }
+        return evictedIDs
     }
 }

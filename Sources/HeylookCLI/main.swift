@@ -424,6 +424,7 @@ struct HeylookCLI {
         } catch {
             print("Chat error: \(error)")
         }
+        await scheduler.unloadAllModels()
     }
 
     static func runServe(port: UInt16) async {
@@ -436,7 +437,12 @@ struct HeylookCLI {
             let server = HeylookHTTPServer(router: router, host: "127.0.0.1", port: port)
             try await server.start()
             print("Heylook Server listening on http://127.0.0.1:\(port) (\(registered.count) models registered)")
-            try await Task.sleep(for: .seconds(3600 * 24))
+            do {
+                try await Task.sleep(for: .seconds(3600 * 24))
+            } catch {
+                // Task cancelled / interrupted
+            }
+            await server.stop()
         } catch {
             print("Server error: \(error)")
         }

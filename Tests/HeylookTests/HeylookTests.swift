@@ -1130,4 +1130,243 @@ struct HeylookTests {
         let promptJSON = try JSONSerialization.jsonObject(with: promptResp.body) as? [String: Any]
         #expect((promptJSON?["message_count"] as? Int) == 1)
     }
+
+    @Test("Provider unload(), LRU eviction subprocess termination, POST /v1/admin/models/unload-all, and strict ProviderExecutionError")
+    func testProviderUnloadSubprocessLifecycleAndStrictErrors() async throws {
+        let scheduler = ComputeScheduler(maxLoadedGPUModels: 1, maxQueueDepth: 2)
+
+        let ggufDesc = EngineDescription(
+            modelID: "qwen3-gguf-live",
+            provider: .gguf,
+            modelPath: "/tmp/nonexistent-qwen3.gguf",
+            architecture: ProvenanceField(value: "qwen3", provenance: .derived),
+            quantization: ProvenanceField(value: "Q8_0", provenance: .derived),
+            computePlacement: ProvenanceField(value: .ggufSubprocess, provenance: .derived),
+            contextSize: ProvenanceField(value: 8192, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: false, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+        let sleepSpawn = GGUFSpawnConfig(
+            binaryPath: "/bin/sleep",
+            modelPath: "/tmp/nonexistent-qwen3.gguf"
+        )
+        let ggufProvider = GGUFSubprocessProvider(description: ggufDesc, spawnConfig: sleepSpawn)
+
+        let mlxDesc = EngineDescription(
+            modelID: "gemma4-mlx-evictor",
+            provider: .mlx,
+            modelPath: "/tmp/nonexistent-gemma4",
+            architecture: ProvenanceField(value: "gemma4", provenance: .derived),
+            quantization: ProvenanceField(value: "4bit", provenance: .derived),
+            computePlacement: ProvenanceField(value: .mlxGPU, provenance: .derived),
+            contextSize: ProvenanceField(value: 8192, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: false, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+        let mlxProvider = MLXSwiftProvider(description: mlxDesc)
+
+        await scheduler.register(provider: ggufProvider, description: ggufDesc)
+        await scheduler.register(provider: mlxProvider, description: mlxDesc)
+
+        // 1. Activate GGUF model, warm its PrefixCacheTracker, and spawn a real child process (/bin/sleep 60)
+        _ = try await scheduler.activateModel("qwen3-gguf-live")
+        let registry = RequestRegistry()
+        let warmStream = await ggufProvider.generate(
+            requestID: "req_warm_gguf",
+            request: MessagesRequest(
+                model: "qwen3-gguf-live",
+                messages: [MessagesRequest.MessageTurn(role: "user", content: "Warm prefix cache")]
+            ),
+            effectiveSampling: .builtinDefaults,
+            registry: registry
+        )
+        for try await _ in warmStream {}
+        #expect(await ggufProvider.isPrefixCacheWarm() == true)
+
+        #if os(macOS)
+        let childPID = try await ggufProvider.launchSubprocess(customArguments: ["60"], checkHealth: false)
+        #expect(childPID > 0)
+        #expect(SubprocessLifecycleRegistry.shared.isRunning(for: "qwen3-gguf-live") == true)
+        #expect(kill(childPID, 0) == 0)
+        #endif
+
+        // 2. Activating second GPU model under maxLoadedGPUModels = 1 evicts qwen3-gguf-live,
+        //    resets its PrefixCacheTracker, and terminates its OS child process!
+        _ = try await scheduler.activateModel("gemma4-mlx-evictor")
+        #expect(await ggufProvider.totalUnloadCount() == 1)
+        #expect(await ggufProvider.isPrefixCacheWarm() == false)
+        #if os(macOS)
+        #expect(SubprocessLifecycleRegistry.shared.isRunning(for: "qwen3-gguf-live") == false)
+        #expect(SubprocessLifecycleRegistry.shared.activeSubprocessCount == 0)
+        #expect(kill(childPID, 0) != 0)
+        #endif
+
+        // 3. POST /v1/admin/models/unload-all unloads all remaining models
+        let dbURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase7_unload_\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: dbURL) }
+        let store = try SQLiteStore(databaseURL: dbURL)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        let unloadAllResp = await router.handle(
+            method: "POST",
+            path: "/v1/admin/models/unload-all",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(unloadAllResp.status == 200)
+        let metricsAfterUnloadAll = await scheduler.metrics()
+        #expect(metricsAfterUnloadAll.loadedGPUModels.isEmpty)
+        #expect(metricsAfterUnloadAll.loadedANEModels.isEmpty)
+        #expect(await mlxProvider.totalUnloadCount() == 1)
+
+        // 4. Strict provider mode (allowSyntheticFallback: false) throws ProviderExecutionError
+        let strictDesc = EngineDescription(
+            modelID: "strict-missing-mlx",
+            provider: .mlx,
+            modelPath: "/tmp/missing_checkpoint_\(UUID().uuidString)",
+            architecture: ProvenanceField(value: "qwen3", provenance: .derived),
+            quantization: ProvenanceField(value: "4bit", provenance: .derived),
+            computePlacement: ProvenanceField(value: .mlxGPU, provenance: .derived),
+            contextSize: ProvenanceField(value: 8192, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: false, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+        let strictProvider = MLXSwiftProvider(description: strictDesc, allowSyntheticFallback: false)
+        await scheduler.register(provider: strictProvider, description: strictDesc)
+
+        let strictReq = MessagesRequest(
+            model: "strict-missing-mlx",
+            messages: [MessagesRequest.MessageTurn(role: "user", content: "Should fail loudly")]
+        )
+        let strictResp = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(strictReq)
+        )
+        #expect(strictResp.status == 500)
+        let errText = String(decoding: strictResp.body, as: UTF8.self)
+        #expect(errText.contains("checkpoint_not_found"))
+    }
+
+    @Test("Incremental SSE frame callback streaming and model-derived /image-plan and /prompt routes")
+    func testIncrementalSSEStreamingAndDerivedImagePlanAndPromptRoutes() async throws {
+        let rootDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase7_derived_\(UUID().uuidString)", isDirectory: true)
+        let gemmaDir = rootDir.appendingPathComponent("Gemma-4-Vision-IT", isDirectory: true)
+        try FileManager.default.createDirectory(at: gemmaDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        // Write config.json with custom vision_config (image_size 896, patch_size 14, spatial_merge_size 2 -> (64*64)/(2*2) = 1024 tokens)
+        let configJSON = """
+        {
+          "model_type": "gemma4",
+          "vision_config": {
+            "image_size": 896,
+            "patch_size": 14,
+            "spatial_merge_size": 2
+          }
+        }
+        """
+        try configJSON.write(to: gemmaDir.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "<start_of_turn>user\n{{ messages }}<end_of_turn>".write(
+            to: gemmaDir.appendingPathComponent("chat_template.jinja"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        #expect(HeylookConfig.estimateImageTokenBudget(in: gemmaDir) == 1024)
+
+        let dbURL = rootDir.appendingPathComponent("phase7.sqlite")
+        let store = try SQLiteStore(databaseURL: dbURL)
+        let scheduler = ComputeScheduler()
+        let gemmaDesc = EngineDescription(
+            modelID: "gemma-4-vision-it",
+            provider: .mlx,
+            modelPath: gemmaDir.path,
+            architecture: ProvenanceField(value: "gemma4", provenance: .derived),
+            quantization: ProvenanceField(value: "4bit", provenance: .derived),
+            computePlacement: ProvenanceField(value: .mlxGPU, provenance: .derived),
+            isLoaded: true,
+            contextSize: ProvenanceField(value: 32768, provenance: .derived),
+            flashAttention: ProvenanceField(value: true, provenance: .derived),
+            supportsVision: ProvenanceField(value: true, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived),
+            templateSource: ProvenanceField(value: "chat_template.jinja", provenance: .derived)
+        )
+        await scheduler.register(provider: MLXSwiftProvider(description: gemmaDesc), description: gemmaDesc)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        // 1. Model-derived /v1/models/{id}/image-plan returns 1024 from vision_config
+        let planResp = await router.handle(
+            method: "POST",
+            path: "/v1/models/gemma-4-vision-it/image-plan",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(planResp.status == 200)
+        let planJSON = try JSONSerialization.jsonObject(with: planResp.body) as? [String: Any]
+        #expect((planJSON?["tokens_per_image"] as? Int) == 1024)
+
+        // 2. Model-derived /v1/conversations/{id}/prompt formats Gemma <start_of_turn> markers
+        let conv = ConversationRecord(
+            id: "conv_gemma",
+            title: "Gemma Prompt Test",
+            systemPrompt: "Answer concisely.",
+            defaultModelID: "gemma-4-vision-it"
+        )
+        try store.upsertConversation(conv)
+        _ = try store.appendMessage(
+            MessageRecord(
+                conversationID: "conv_gemma",
+                position: 0,
+                role: "user",
+                content: "Describe the vision tower."
+            )
+        )
+        let promptResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_gemma/prompt",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(promptResp.status == 200)
+        let promptJSON = try JSONSerialization.jsonObject(with: promptResp.body) as? [String: Any]
+        let renderedPrompt = (promptJSON?["prompt"] as? String) ?? ""
+        #expect(renderedPrompt.contains("<start_of_turn>user"))
+        #expect(renderedPrompt.contains("<end_of_turn>"))
+        #expect((promptJSON?["template_source"] as? String) == "chat_template.jinja")
+
+        // 3. Incremental SSE frame streaming via onSSEFrame
+        actor FrameCollector {
+            var frames: [String] = []
+            func append(_ frame: String) {
+                frames.append(frame)
+            }
+        }
+        let collector = FrameCollector()
+        let streamReq = MessagesRequest(
+            model: "gemma-4-vision-it",
+            messages: [MessagesRequest.MessageTurn(role: "user", content: "Stream incremental SSE")],
+            stream: true,
+            thinking: true
+        )
+        let sseResp = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(streamReq),
+            onSSEFrame: { frame in
+                await collector.append(frame)
+            }
+        )
+        #expect(sseResp.status == 200)
+        let collected = await collector.frames
+        #expect(collected.count >= 4)
+        #expect(collected.first?.hasPrefix("event: message_start") == true)
+        #expect(collected.contains(where: { $0.hasPrefix("event: content_block_delta") }))
+        #expect(collected.contains(where: { $0.hasPrefix("event: message_delta") }))
+        #expect(collected.last?.hasPrefix("event: message_stop") == true)
+    }
 }
