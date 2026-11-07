@@ -376,8 +376,6 @@ public actor HeylookRouter {
                         throw ComputeSchedulerError.modelNotFound(modelID)
                     }
                     let dirURL = URL(fileURLWithPath: existing.modelPath)
-                    let overrideURL = dirURL.appendingPathComponent("chat_template.heylook.jinja")
-                    let vendorURL = dirURL.appendingPathComponent("chat_template.jinja")
                     struct ChatTemplateResponse: Encodable {
                         let model: String
                         let source: String
@@ -386,15 +384,16 @@ public actor HeylookRouter {
                     }
                     switch method.uppercased() {
                     case "GET":
-                        let hasOverride = FileManager.default.fileExists(atPath: overrideURL.path)
-                        let templateText = (try? String(contentsOf: hasOverride ? overrideURL : vendorURL, encoding: .utf8)) ?? ""
-                        let source = hasOverride ? "chat_template.heylook.jinja" : existing.templateSource.value
+                        let state = HeylookConfig.inspectChatTemplate(
+                            in: dirURL,
+                            fallbackSource: existing.templateSource.value
+                        )
                         return try .json(
                             ChatTemplateResponse(
                                 model: modelID,
-                                source: source,
-                                has_override: hasOverride,
-                                template: templateText
+                                source: state.source,
+                                has_override: state.hasOverride,
+                                template: state.template
                             )
                         )
                     case "PUT":
@@ -405,23 +404,23 @@ public actor HeylookRouter {
                         } else {
                             templateText = String(decoding: body, as: UTF8.self)
                         }
-                        try templateText.write(to: overrideURL, atomically: true, encoding: .utf8)
+                        let state = try HeylookConfig.writeChatTemplateOverride(templateText, in: dirURL)
                         return try .json(
                             ChatTemplateResponse(
                                 model: modelID,
-                                source: "chat_template.heylook.jinja",
-                                has_override: true,
-                                template: templateText
+                                source: state.source,
+                                has_override: state.hasOverride,
+                                template: state.template
                             )
                         )
                     case "DELETE":
-                        if FileManager.default.fileExists(atPath: overrideURL.path) {
-                            try? FileManager.default.removeItem(at: overrideURL)
-                        }
-                        let reverted = HeylookConfig.resolveGGUFTemplate(in: dirURL, sidecar: nil)
+                        let reverted = HeylookConfig.deleteChatTemplateOverride(
+                            in: dirURL,
+                            fallbackSource: existing.templateSource.value
+                        )
                         return try .json([
                             "model": modelID,
-                            "source": reverted.source.value
+                            "source": reverted.source
                         ])
                     default:
                         break

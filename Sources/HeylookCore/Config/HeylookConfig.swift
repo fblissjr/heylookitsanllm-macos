@@ -484,8 +484,102 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return 280
     }
 
+    public struct ChatTemplateState: Codable, Sendable, Equatable {
+        public let source: String
+        public let hasOverride: Bool
+        public let template: String
+
+        public init(source: String, hasOverride: Bool, template: String) {
+            self.source = source
+            self.hasOverride = hasOverride
+            self.template = template
+        }
+    }
+
+    /// Inspects the active chat template in `candidateDir` across the 4-rung ladder:
+    /// `chat_template.heylook.jinja` (operator override) -> `chat_template.jinja` (vendor ship) ->
+    /// `tokenizer_config.json` -> `.gguf` header `tokenizer.chat_template` (`gguf_embedded`).
+    public static func inspectChatTemplate(
+        in candidateDir: URL,
+        fallbackSource: String = "default_chatml"
+    ) -> ChatTemplateState {
+        let fm = FileManager.default
+        let overrideURL = candidateDir.appendingPathComponent("chat_template.heylook.jinja")
+        let sidecarURL = candidateDir.appendingPathComponent("chat_template.jinja")
+        let tokConfigURL = candidateDir.appendingPathComponent("tokenizer_config.json")
+
+        if fm.fileExists(atPath: overrideURL.path),
+           let t = try? String(contentsOf: overrideURL, encoding: .utf8) {
+            return ChatTemplateState(
+                source: "chat_template.heylook.jinja",
+                hasOverride: true,
+                template: t
+            )
+        }
+        if fm.fileExists(atPath: sidecarURL.path),
+           let t = try? String(contentsOf: sidecarURL, encoding: .utf8) {
+            return ChatTemplateState(
+                source: "chat_template.jinja",
+                hasOverride: false,
+                template: t
+            )
+        }
+        if let tokJSON = loadJSONDictionary(at: tokConfigURL),
+           let t = tokJSON["chat_template"] as? String {
+            return ChatTemplateState(
+                source: "tokenizer_config.json",
+                hasOverride: false,
+                template: t
+            )
+        }
+        if let ggufURL = firstGGUFFile(in: candidateDir),
+           let ggufHeader = GGUFHeaderReader.readFileHeader(at: ggufURL),
+           let embedded = ggufHeader.embeddedChatTemplate,
+           !embedded.isEmpty {
+            return ChatTemplateState(
+                source: "gguf_embedded",
+                hasOverride: false,
+                template: embedded
+            )
+        }
+        return ChatTemplateState(
+            source: fallbackSource,
+            hasOverride: false,
+            template: ""
+        )
+    }
+
+    /// Writes `chat_template.heylook.jinja` inside `candidateDir` without mutating vendor files.
+    @discardableResult
+    public static func writeChatTemplateOverride(
+        _ template: String,
+        in candidateDir: URL
+    ) throws -> ChatTemplateState {
+        try FileManager.default.createDirectory(at: candidateDir, withIntermediateDirectories: true)
+        let overrideURL = candidateDir.appendingPathComponent("chat_template.heylook.jinja")
+        try template.write(to: overrideURL, atomically: true, encoding: .utf8)
+        return ChatTemplateState(
+            source: "chat_template.heylook.jinja",
+            hasOverride: true,
+            template: template
+        )
+    }
+
+    /// Removes `chat_template.heylook.jinja` from `candidateDir` and returns the reverted template state.
+    @discardableResult
+    public static func deleteChatTemplateOverride(
+        in candidateDir: URL,
+        fallbackSource: String = "gguf_embedded"
+    ) -> ChatTemplateState {
+        let overrideURL = candidateDir.appendingPathComponent("chat_template.heylook.jinja")
+        if FileManager.default.fileExists(atPath: overrideURL.path) {
+            try? FileManager.default.removeItem(at: overrideURL)
+        }
+        return inspectChatTemplate(in: candidateDir, fallbackSource: fallbackSource)
+    }
+
     /// Renders a model-derived prompt preview by inspecting the model directory's active template
-    /// (`chat_template.heylook.jinja`, `chat_template.jinja`, `tokenizer_config.json`, or `config.json`).
+    /// (`chat_template.heylook.jinja`, `chat_template.jinja`, `tokenizer_config.json`, or `gguf_embedded`).
     public static func renderPromptPreview(
         in candidateDir: URL?,
         system: String?,
@@ -497,38 +591,17 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         var modelType = ""
 
         if let candidateDir {
-            let fm = FileManager.default
-            let overrideURL = candidateDir.appendingPathComponent("chat_template.heylook.jinja")
-            let sidecarURL = candidateDir.appendingPathComponent("chat_template.jinja")
-            let tokConfigURL = candidateDir.appendingPathComponent("tokenizer_config.json")
+            let state = inspectChatTemplate(in: candidateDir, fallbackSource: "default_chatml")
+            templateText = state.template
+            source = state.source
             let configURL = candidateDir.appendingPathComponent("config.json")
-
-            if fm.fileExists(atPath: overrideURL.path),
-               let t = try? String(contentsOf: overrideURL, encoding: .utf8) {
-                templateText = t
-                source = "chat_template.heylook.jinja"
-            } else if fm.fileExists(atPath: sidecarURL.path),
-                      let t = try? String(contentsOf: sidecarURL, encoding: .utf8) {
-                templateText = t
-                source = "chat_template.jinja"
-            } else if let tokJSON = loadJSONDictionary(at: tokConfigURL),
-                      let t = tokJSON["chat_template"] as? String {
-                templateText = t
-                source = "tokenizer_config.json"
-            }
             if let cfgJSON = loadJSONDictionary(at: configURL),
                let mt = cfgJSON["model_type"] as? String {
                 modelType = mt.lowercased()
-            }
-            if templateText.isEmpty, let ggufURL = firstGGUFFile(in: candidateDir),
-               let ggufHeader = GGUFHeaderReader.readFileHeader(at: ggufURL) {
-                if let embedded = ggufHeader.embeddedChatTemplate, !embedded.isEmpty {
-                    templateText = embedded
-                    source = "gguf_embedded"
-                }
-                if modelType.isEmpty, let arch = ggufHeader.architecture {
-                    modelType = arch.lowercased()
-                }
+            } else if let ggufURL = firstGGUFFile(in: candidateDir),
+                      let ggufHeader = GGUFHeaderReader.readFileHeader(at: ggufURL),
+                      let arch = ggufHeader.architecture {
+                modelType = arch.lowercased()
             }
         }
 

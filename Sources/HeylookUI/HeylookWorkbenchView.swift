@@ -1280,6 +1280,40 @@ public final class HeylookWorkbenchViewModel {
         await refreshMetrics()
         statusBanner = "Saved model.heylook.toml sidecar for \(model.modelID)."
     }
+
+    public func loadChatTemplateState(for model: EngineDescription) -> HeylookConfig.ChatTemplateState {
+        let dirURL = URL(fileURLWithPath: model.modelPath)
+        return HeylookConfig.inspectChatTemplate(
+            in: dirURL,
+            fallbackSource: model.templateSource.value
+        )
+    }
+
+    @discardableResult
+    public func saveChatTemplateOverride(_ template: String, for model: EngineDescription) async -> HeylookConfig.ChatTemplateState {
+        let dirURL = URL(fileURLWithPath: model.modelPath)
+        let state = (try? HeylookConfig.writeChatTemplateOverride(template, in: dirURL))
+            ?? HeylookConfig.ChatTemplateState(source: "chat_template.heylook.jinja", hasOverride: true, template: template)
+        let sidecar = loadSidecarConfig(for: model)
+        _ = try? await scheduler.applySidecarUpdate(sidecar, for: model.modelID)
+        await refreshMetrics()
+        statusBanner = "Saved chat_template.heylook.jinja override for \(model.modelID)."
+        return state
+    }
+
+    @discardableResult
+    public func revertChatTemplateOverride(for model: EngineDescription) async -> HeylookConfig.ChatTemplateState {
+        let dirURL = URL(fileURLWithPath: model.modelPath)
+        let reverted = HeylookConfig.deleteChatTemplateOverride(
+            in: dirURL,
+            fallbackSource: model.templateSource.value
+        )
+        let sidecar = loadSidecarConfig(for: model)
+        _ = try? await scheduler.applySidecarUpdate(sidecar, for: model.modelID)
+        await refreshMetrics()
+        statusBanner = "Reverted chat_template.heylook.jinja override for \(model.modelID) (active: \(reverted.source))."
+        return reverted
+    }
 }
 
 // MARK: - Root Multiplatform Workbench View
@@ -3156,18 +3190,30 @@ private struct ModelSidecarEditorSheet: View {
     @State private var thinkingBudget: Int = 4096
     @State private var tagsText: String = ""
     @State private var unsetText: String = ""
+    @State private var templateSourceLabel: String = "default_chatml"
+    @State private var hasTemplateOverride: Bool = false
+    @State private var chatTemplateText: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Edit model.heylook.toml Sidecar")
+                    Text("Edit model.heylook.toml Sidecar & Chat Template")
                         .font(.headline)
                     Text(model.modelID)
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Text(templateSourceLabel)
+                    .font(.caption2.monospaced().weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        (hasTemplateOverride ? Color.purple : Color.secondary).opacity(0.15),
+                        in: Capsule()
+                    )
+                    .foregroundStyle(hasTemplateOverride ? .purple : .secondary)
             }
 
             Divider()
@@ -3201,6 +3247,47 @@ private struct ModelSidecarEditorSheet: View {
             TextField("Unset Keys (comma-separated, e.g. draft_model_path, spec_type)", text: $unsetText)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption.monospaced())
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("4-Rung Chat Template Override (chat_template.heylook.jinja)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if hasTemplateOverride {
+                        Button("Revert Override", role: .destructive) {
+                            Task {
+                                let reverted = await viewModel.revertChatTemplateOverride(for: model)
+                                templateSourceLabel = reverted.source
+                                hasTemplateOverride = reverted.hasOverride
+                                chatTemplateText = reverted.template
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                    Button("Save Template Override") {
+                        Task {
+                            let saved = await viewModel.saveChatTemplateOverride(chatTemplateText, for: model)
+                            templateSourceLabel = saved.source
+                            hasTemplateOverride = saved.hasOverride
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(chatTemplateText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+
+                TextEditor(text: $chatTemplateText)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(minHeight: 110, maxHeight: 150)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(Color.secondary.opacity(0.22), lineWidth: 1)
+                    )
+            }
 
             HStack {
                 Button("Cancel") { dismiss() }
@@ -3242,7 +3329,7 @@ private struct ModelSidecarEditorSheet: View {
             }
         }
         .padding(20)
-        .frame(minWidth: 500)
+        .frame(minWidth: 560)
         .onAppear {
             let loaded = viewModel.loadSidecarConfig(for: model)
             pinned = loaded.pinned ?? model.isPinned
@@ -3255,6 +3342,10 @@ private struct ModelSidecarEditorSheet: View {
             thinkingBudget = loaded.sampling.thinkingBudget ?? (model.thinkingBudget.value ?? 4096)
             tagsText = (loaded.tags.isEmpty ? model.tags : loaded.tags).joined(separator: ", ")
             unsetText = loaded.unsetKeys.joined(separator: ", ")
+            let tmplState = viewModel.loadChatTemplateState(for: model)
+            templateSourceLabel = tmplState.source
+            hasTemplateOverride = tmplState.hasOverride
+            chatTemplateText = tmplState.template
         }
     }
 }
