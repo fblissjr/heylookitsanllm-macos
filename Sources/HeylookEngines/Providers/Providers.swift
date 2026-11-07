@@ -59,6 +59,12 @@ public final class GGUFPortPool: @unchecked Sendable {
         return assignedPorts[modelID]
     }
 
+    public func activeAllocations() -> [String: Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return assignedPorts
+    }
+
     public func releasePort(for modelID: String) {
         lock.lock()
         assignedPorts.removeValue(forKey: modelID)

@@ -811,6 +811,7 @@ public actor HeylookRouter {
                         modelID: generateRequest.model,
                         stopReason: finalChunk.stopReason ?? .endTurn,
                         cacheReport: finalChunk.cacheReport,
+                        speculativeReport: finalChunk.speculativeReport,
                         generationTPS: finalChunk.generationTPS,
                         computePlacement: finalChunk.activeComputePlacement
                     )

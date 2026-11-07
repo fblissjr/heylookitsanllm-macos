@@ -134,6 +134,10 @@ public final class HeylookWorkbenchViewModel {
     public var compareCosineScore: Float?
     public var aneInspectionReports: [ANETowerInspector.ComponentComputeReport] = []
     public var labMetrics: [EmbeddingLabRunner.DimensionMetrics] = []
+    public var evalLabSuiteReport: EvalLabSuite.SuiteReport?
+    public var isRunningEvalLab: Bool = false
+    public var activeGGUFPorts: [String: Int] = [:]
+    public var activeSubprocessCount: Int = 0
 
     public var hasActiveQuery: Bool {
         !embeddingQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || queryAttachmentURL != nil
@@ -374,6 +378,10 @@ public final class HeylookWorkbenchViewModel {
         schedulerMetrics = await scheduler.metrics()
         registeredModels = await scheduler.listModels()
         aneInspectionReports = ANETowerInspector.statusSnapshot(options: modelComputeOptions)
+        activeGGUFPorts = GGUFPortPool.shared.activeAllocations()
+        #if os(macOS)
+        activeSubprocessCount = SubprocessLifecycleRegistry.shared.activeSubprocessCount
+        #endif
     }
 
     // MARK: - Chat Operations
@@ -681,6 +689,7 @@ public final class HeylookWorkbenchViewModel {
                 modelID: modelID,
                 stopReason: finalChunk.stopReason ?? .endTurn,
                 cacheReport: finalChunk.cacheReport,
+                speculativeReport: finalChunk.speculativeReport,
                 generationTPS: finalChunk.generationTPS,
                 computePlacement: finalChunk.activeComputePlacement
             )
@@ -1082,6 +1091,20 @@ public final class HeylookWorkbenchViewModel {
             .init(query: "heylook_saved SQLite WAL mobile lock screen", expectedArtifactID: "doc-sse")
         ]
         labMetrics = (try? await EmbeddingLabRunner.evaluate(coordinator: indexCoordinator, cases: cases)) ?? []
+    }
+
+    @discardableResult
+    public func runFullEvalLabSuite() async -> EvalLabSuite.SuiteReport? {
+        isRunningEvalLab = true
+        defer { isRunningEvalLab = false }
+        guard let report = try? await EvalLabSuite.runAll() else {
+            return nil
+        }
+        evalLabSuiteReport = report
+        if !report.matryoshkaBenchmarks.isEmpty {
+            labMetrics = report.matryoshkaBenchmarks
+        }
+        return report
     }
 
     // MARK: - Server Lifecycle & Bonjour Remote Discovery
@@ -1652,6 +1675,13 @@ struct MessageBubbleView: View {
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(Color.blue.opacity(0.12), in: Capsule())
+                }
+                if let spec = message.speculativeReport {
+                    Text(spec.summaryBadge)
+                        .font(.caption2.monospaced())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.purple.opacity(0.14), in: Capsule())
                 }
                 Spacer()
                 if let tps = message.generationTPS, tps > 0 {
@@ -2337,12 +2367,46 @@ private struct EmbeddingsSearchAndResultsView: View {
                         Label("Pairwise Embedding Cosine & Retrieval Lab (Recall@1 / MRR)", systemImage: "chart.bar.xaxis")
                             .font(.caption.weight(.semibold))
                         Spacer()
+                        Button {
+                            Task { await viewModel.runFullEvalLabSuite() }
+                        } label: {
+                            Label(
+                                viewModel.isRunningEvalLab ? "Running Probes..." : "Run Eval Suite (chain + VLM + MRL)",
+                                systemImage: "checkmark.shield"
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                        .disabled(viewModel.isRunningEvalLab)
+
                         ForEach(viewModel.labMetrics, id: \.dimensions) { metric in
                             Text(String(format: "%dd R@1: %.0f%% (MRR %.2f)", metric.dimensions, metric.recallAt1 * 100, metric.mrr))
                                 .font(.caption2.monospaced())
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
                                 .background(Color.secondary.opacity(0.12), in: Capsule())
+                        }
+                    }
+
+                    if let suite = viewModel.evalLabSuiteReport {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(suite.probes, id: \.name) { probe in
+                                    HStack(spacing: 4) {
+                                        Image(systemName: probe.passed ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                                            .foregroundStyle(probe.passed ? .green : .red)
+                                            .font(.caption2)
+                                        Text("\(probe.name): \(probe.detail)")
+                                            .font(.caption2.monospaced())
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(
+                                        (probe.passed ? Color.green : Color.red).opacity(0.12),
+                                        in: Capsule()
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -3233,6 +3297,45 @@ struct PerfServerSurface: View {
                             }
                             .buttonStyle(.bordered)
                         }
+                    }
+                    .padding(8)
+                }
+
+                GroupBox("Lifecycle Reclamation, Subprocess Registry & GGUF Port Pool") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 24) {
+                            VStack(alignment: .leading) {
+                                Text("Active llama-server Subprocesses")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text("\(viewModel.activeSubprocessCount)")
+                                    .font(.title3.monospaced().weight(.semibold))
+                                    .foregroundStyle(viewModel.activeSubprocessCount > 0 ? .orange : .green)
+                            }
+                            VStack(alignment: .leading) {
+                                Text("Allocated GGUF Loopback Ports")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(
+                                    viewModel.activeGGUFPorts.isEmpty
+                                        ? "None (18080+ free)"
+                                        : viewModel.activeGGUFPorts
+                                            .sorted { $0.value < $1.value }
+                                            .map { "\($0.key)::\($0.value)" }
+                                            .joined(separator: ", ")
+                                )
+                                .font(.caption.monospaced().weight(.medium))
+                                .lineLimit(1)
+                            }
+                            Spacer()
+                            Button("Unload All & Reclaim Memory", role: .destructive) {
+                                Task { await viewModel.unloadAllModels() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        Text("Calls `provider.unload()`, `MLX.Memory.clearCache()`, `ANECoreMLRuntime.unload()`, and `SubprocessLifecycleRegistry.shared.terminateAll()` (`SIGTERM` -> `SIGKILL`).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     .padding(8)
                 }

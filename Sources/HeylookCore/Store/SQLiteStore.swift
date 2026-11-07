@@ -52,6 +52,7 @@ public struct MessageRecord: Codable, Identifiable, Sendable, Equatable, Hashabl
     public var modelID: String?
     public var stopReason: StopReason?
     public var cacheReport: CacheReport?
+    public var speculativeReport: SpeculativeReport?
     public var generationTPS: Double?
     public var computePlacement: ComputePlacement?
     public let createdUnixMs: Int64
@@ -66,6 +67,7 @@ public struct MessageRecord: Codable, Identifiable, Sendable, Equatable, Hashabl
         modelID: String? = nil,
         stopReason: StopReason? = nil,
         cacheReport: CacheReport? = nil,
+        speculativeReport: SpeculativeReport? = nil,
         generationTPS: Double? = nil,
         computePlacement: ComputePlacement? = nil,
         createdUnixMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
@@ -79,6 +81,7 @@ public struct MessageRecord: Codable, Identifiable, Sendable, Equatable, Hashabl
         self.modelID = modelID
         self.stopReason = stopReason
         self.cacheReport = cacheReport
+        self.speculativeReport = speculativeReport
         self.generationTPS = generationTPS
         self.computePlacement = computePlacement
         self.createdUnixMs = createdUnixMs
@@ -176,6 +179,7 @@ public final class SQLiteStore: @unchecked Sendable {
             model_id TEXT,
             stop_reason TEXT,
             cache_json TEXT,
+            speculative_json TEXT,
             gen_tps REAL,
             compute_placement TEXT,
             created_ms INTEGER NOT NULL
@@ -283,14 +287,15 @@ public final class SQLiteStore: @unchecked Sendable {
         let sql = """
         INSERT INTO messages (
             id, conversation_id, position, role, content, thinking, model_id,
-            stop_reason, cache_json, gen_tps, compute_placement, created_ms
+            stop_reason, cache_json, speculative_json, gen_tps, compute_placement, created_ms
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             content = excluded.content,
             thinking = excluded.thinking,
             stop_reason = excluded.stop_reason,
             cache_json = excluded.cache_json,
+            speculative_json = excluded.speculative_json,
             gen_tps = excluded.gen_tps,
             compute_placement = excluded.compute_placement;
         """
@@ -312,13 +317,20 @@ public final class SQLiteStore: @unchecked Sendable {
         } else {
             sqlite3_bind_null(stmt, 9)
         }
-        if let tps = message.generationTPS {
-            sqlite3_bind_double(stmt, 10, tps)
+        if let spec = message.speculativeReport,
+           let data = try? JSONEncoder().encode(spec),
+           let json = String(data: data, encoding: .utf8) {
+            sqlite3_bind_text(stmt, 10, json, -1, SQLITE_TRANSIENT_CORE)
         } else {
             sqlite3_bind_null(stmt, 10)
         }
-        bindOptionalText(stmt, index: 11, value: message.computePlacement?.rawValue)
-        sqlite3_bind_int64(stmt, 12, message.createdUnixMs)
+        if let tps = message.generationTPS {
+            sqlite3_bind_double(stmt, 11, tps)
+        } else {
+            sqlite3_bind_null(stmt, 11)
+        }
+        bindOptionalText(stmt, index: 12, value: message.computePlacement?.rawValue)
+        sqlite3_bind_int64(stmt, 13, message.createdUnixMs)
         guard sqlite3_step(stmt) == SQLITE_DONE else { throw lastError() }
 
         let touchConv = "UPDATE conversations SET updated_ms = ? WHERE id = ?;"
@@ -337,7 +349,7 @@ public final class SQLiteStore: @unchecked Sendable {
         defer { lock.unlock() }
         let sql = """
         SELECT id, conversation_id, position, role, content, thinking, model_id,
-               stop_reason, cache_json, gen_tps, compute_placement, created_ms
+               stop_reason, cache_json, speculative_json, gen_tps, compute_placement, created_ms
         FROM messages
         WHERE conversation_id = ?
         ORDER BY position ASC, created_ms ASC;
@@ -359,9 +371,11 @@ public final class SQLiteStore: @unchecked Sendable {
             let stopReason = optionalColumnText(stmt, 7).flatMap(StopReason.init(rawValue:))
             let cacheReport = optionalColumnText(stmt, 8)
                 .flatMap { try? decoder.decode(CacheReport.self, from: Data($0.utf8)) }
-            let genTPS: Double? = sqlite3_column_type(stmt, 9) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 9)
-            let placement = optionalColumnText(stmt, 10).flatMap(ComputePlacement.init(rawValue:))
-            let createdMs = sqlite3_column_int64(stmt, 11)
+            let speculativeReport = optionalColumnText(stmt, 9)
+                .flatMap { try? decoder.decode(SpeculativeReport.self, from: Data($0.utf8)) }
+            let genTPS: Double? = sqlite3_column_type(stmt, 10) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 10)
+            let placement = optionalColumnText(stmt, 11).flatMap(ComputePlacement.init(rawValue:))
+            let createdMs = sqlite3_column_int64(stmt, 12)
             out.append(
                 MessageRecord(
                     id: id,
@@ -373,6 +387,7 @@ public final class SQLiteStore: @unchecked Sendable {
                     modelID: modelID,
                     stopReason: stopReason,
                     cacheReport: cacheReport,
+                    speculativeReport: speculativeReport,
                     generationTPS: genTPS,
                     computePlacement: placement,
                     createdUnixMs: createdMs

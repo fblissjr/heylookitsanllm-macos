@@ -138,6 +138,11 @@ public struct SpeculativeReport: Codable, Sendable, Equatable, Hashable {
         guard draftedTokens > 0 else { return 0 }
         return Double(acceptedTokens) / Double(draftedTokens)
     }
+
+    public var summaryBadge: String {
+        let pct = Int((acceptanceShare * 100.0).rounded())
+        return "\(mode) \(acceptedTokens)/\(draftedTokens) (\(pct)%)"
+    }
 }
 
 /// Canonical Anthropic Messages stop reasons plus `cancelled`.
