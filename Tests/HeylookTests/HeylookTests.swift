@@ -1635,4 +1635,94 @@ struct HeylookTests {
         #expect(evalReport.probes.count == 3)
         #expect(evalReport.matryoshkaBenchmarks.count == 4)
     }
+
+    @Test("Explicit [[models]] discovery, canonical 5-layer SamplerCascade on HTTP routes, and unified store paths")
+    func testExplicitModelsDiscoveryCanonicalSamplerCascadeAndUnifiedStoragePaths() async throws {
+        let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_audit_\(UUID().uuidString)", isDirectory: true)
+        let scanDir = tempRoot.appendingPathComponent("scanned", isDirectory: true)
+        let scannedModelDir = scanDir.appendingPathComponent("Scanned-MLX-Model", isDirectory: true)
+        let explicitModelDir = tempRoot.appendingPathComponent("Explicit-External-Model", isDirectory: true)
+        try FileManager.default.createDirectory(at: scannedModelDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: explicitModelDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        try Data("stub".utf8).write(to: scannedModelDir.appendingPathComponent("model.safetensors"))
+        try """
+        {"model_type": "qwen3_5", "max_position_embeddings": 16384}
+        """.write(to: scannedModelDir.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+
+        // Write vendor generation_config.json + model.heylook.toml in explicitModelDir
+        try """
+        {"temperature": 0.55, "top_p": 0.91, "top_k": 25}
+        """.write(to: explicitModelDir.appendingPathComponent("generation_config.json"), atomically: true, encoding: .utf8)
+        try """
+        thinking = false
+        max_tokens = 512
+        """.write(to: explicitModelDir.appendingPathComponent("model.heylook.toml"), atomically: true, encoding: .utf8)
+
+        let tomlText = """
+        default_model = "custom-explicit-mlx"
+        scan_folders = ["\(scanDir.path)"]
+
+        [[models]]
+        id = "custom-explicit-mlx"
+        model_path = "\(explicitModelDir.path)"
+        provider = "mlx"
+        ctx_size = 65536
+        pinned = true
+        thinking_capable = true
+        """
+        let cfg = HeylookConfig.parseTOML(tomlText)
+        let discovered = cfg.discoverConfiguredModels()
+        #expect(discovered.count == 2)
+        let explicitDesc = try #require(discovered.first(where: { $0.modelID == "custom-explicit-mlx" }))
+        #expect(explicitDesc.contextSize.value == 65536)
+        #expect(explicitDesc.contextSize.provenance == .configured)
+        #expect(explicitDesc.isPinned == true)
+
+        // Verify 5-layer SamplerCascade resolution via HeylookConfig.resolveEffectiveSampling
+        let resolved = HeylookConfig.resolveEffectiveSampling(
+            modelPath: explicitDesc.modelPath,
+            preset: SamplerSettings(topK: 50),
+            request: SamplerSettings(temperature: 0.2)
+        )
+        #expect(resolved.effective.temperature == 0.2)
+        #expect(resolved.provenanceByField[.temperature] == .configured)
+        #expect(resolved.effective.topP == 0.91)
+        #expect(resolved.provenanceByField[.topP] == .derived)
+        #expect(resolved.effective.topK == 50)
+        #expect(resolved.provenanceByField[.topK] == .configured)
+        #expect(resolved.effective.maxTokens == 512)
+        #expect(resolved.provenanceByField[.maxTokens] == .configured)
+        #expect(resolved.effective.thinking == false)
+
+        // Verify HeylookRouter honors model.heylook.toml `thinking = false` when request omits `thinking`
+        let store = try SQLiteStore(databaseURL: tempRoot.appendingPathComponent("audit.sqlite"))
+        let scheduler = ComputeScheduler()
+        await scheduler.register(provider: MLXSwiftProvider(description: explicitDesc), description: explicitDesc)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        let msgReq = MessagesRequest(
+            model: "custom-explicit-mlx",
+            messages: [MessagesRequest.MessageTurn(role: "user", content: "Check sidecar thinking override")]
+        )
+        let resp = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(msgReq)
+        )
+        #expect(resp.status == 200)
+        let decoded = try JSONDecoder().decode(MessagesResponse.self, from: resp.body)
+        // Because `thinking = false` in model.heylook.toml and request.thinking == nil, no thinking block is emitted!
+        let hasThinkingBlock = decoded.content.contains { block in
+            block.type == "thinking" || (block.thinking?.isEmpty == false)
+        }
+        #expect(hasThinkingBlock == false)
+
+        // Verify unified defaultStoreURL and defaultVectorStoreURL share defaultAppSupportDirectory
+        #expect(HeylookConfig.defaultStoreURL.deletingLastPathComponent() == HeylookConfig.defaultAppSupportDirectory)
+        #expect(HeylookConfig.defaultVectorStoreURL.deletingLastPathComponent() == HeylookConfig.defaultAppSupportDirectory)
+    }
 }

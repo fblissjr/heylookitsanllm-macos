@@ -598,8 +598,23 @@ public actor MLXSwiftProvider: InferenceProvider {
 
     #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
     private var loadedContainer: ModelContainer?
+    private var loadedTokenizer: (any Tokenizer)?
     private var cachedKVCaches: [KVCache]?
     #endif
+
+    private var effectiveTokenCounter: (@Sendable (String) -> Int)? {
+        if let tokenCounter {
+            return tokenCounter
+        }
+        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
+        if let tok = loadedTokenizer {
+            return { text in
+                max(1, tok.encode(text: text).count)
+            }
+        }
+        #endif
+        return nil
+    }
 
     public init(
         description: EngineDescription,
@@ -659,6 +674,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         descriptionState.isLoaded = false
         #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
         loadedContainer = nil
+        loadedTokenizer = nil
         cachedKVCaches = nil
         MLX.Memory.clearCache()
         #endif
@@ -674,7 +690,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         let cacheReport = prefixCache.evaluate(
             system: request.system,
             messages: request.messages,
-            tokenCounter: tokenCounter
+            tokenCounter: effectiveTokenCounter
         )
         kvSession.activeTurnCount = prefixCache.cachedTurnCount
         kvSession.cachedTokenCount = cacheReport.cachedTokens
@@ -742,7 +758,7 @@ public actor MLXSwiftProvider: InferenceProvider {
     }
 
     private func recordAssistantTurn(_ reply: String) {
-        prefixCache.recordAssistantReply(reply, tokenCounter: tokenCounter)
+        prefixCache.recordAssistantReply(reply, tokenCounter: effectiveTokenCounter)
         kvSession.activeTurnCount = prefixCache.cachedTurnCount
     }
 
@@ -772,6 +788,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         container = try await LLMModelFactory.shared.loadContainer(from: dirURL, using: loader)
         #endif
         loadedContainer = container
+        loadedTokenizer = await container.tokenizer
         descriptionState.isLoaded = true
         return container
     }
@@ -828,6 +845,17 @@ public actor MLXSwiftProvider: InferenceProvider {
                         repetitionPenalty: effectiveSampling.repetitionPenalty.map(Float.init),
                         repetitionContextSize: effectiveSampling.repetitionContextSize ?? 64
                     )
+
+                    if let existingCaches = self.cachedKVCaches, cacheReport.outcome == .reused {
+                        for cache in existingCaches where cache.isTrimmable && cache.offset > cacheReport.cachedTokens {
+                            _ = cache.trim(cache.offset - cacheReport.cachedTokens)
+                        }
+                    } else {
+                        self.cachedKVCaches = await container.perform { context in
+                            context.model.newCache(parameters: genParams)
+                        }
+                    }
+                    self.kvSession.cachedTokenCount = max(cacheReport.cachedTokens, lmInput.text.tokens.size)
 
                     let archLower = descriptionState.architecture.value.lowercased()
                     let startsInThinking = enableThinking && (

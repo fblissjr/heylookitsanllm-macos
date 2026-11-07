@@ -212,8 +212,73 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         self.explicitModels = explicitModels
     }
 
+    /// Canonical application support directory (`~/Library/Application Support/Heylook`),
+    /// shared between `HeylookApp`, `HeylookUI`, `HeylookServer`, and `heylook-cli`.
+    public static var defaultAppSupportDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = base.appendingPathComponent("Heylook", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// Canonical SQLite WAL store path for conversations, messages, notebooks, and presets.
+    /// Honors `HEYLOOK_STORE_DB_PATH` or `HEYLOOK_DB_PATH` (when ending in `heylook.sqlite`).
+    public static var defaultStoreURL: URL {
+        let env = ProcessInfo.processInfo.environment
+        if let custom = env["HEYLOOK_STORE_DB_PATH"], !custom.isEmpty {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
+        }
+        if let custom = env["HEYLOOK_DB_PATH"], !custom.isEmpty, custom.hasSuffix("heylook.sqlite") {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
+        }
+        return defaultAppSupportDirectory.appendingPathComponent("heylook.sqlite")
+    }
+
+    /// Canonical SQLite WAL vector store path for `HeylookEmbeddings` (`VectorStore`).
+    /// Honors `HEYLOOK_VECTOR_DB_PATH` or `HEYLOOK_DB_PATH`.
+    public static var defaultVectorStoreURL: URL {
+        let env = ProcessInfo.processInfo.environment
+        if let custom = env["HEYLOOK_VECTOR_DB_PATH"], !custom.isEmpty {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
+        }
+        if let custom = env["HEYLOOK_DB_PATH"], !custom.isEmpty {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
+        }
+        return defaultAppSupportDirectory.appendingPathComponent("heylook_vectors.sqlite")
+    }
+
+    /// Resolves the 5-layer `SamplerCascade` (`builtin` -> `vendor generation_config.json` ->
+    /// `model.heylook.toml` -> `preset` -> `request`) from a model directory path.
+    public static func resolveEffectiveSampling(
+        modelPath: String?,
+        preset: SamplerSettings? = nil,
+        request: SamplerSettings? = nil
+    ) -> SamplerCascade.ResolvedSampling {
+        var vendorSettings: SamplerSettings?
+        var modelSidecarSettings: SamplerSettings?
+        if let modelPath, !modelPath.isEmpty {
+            let rawURL = URL(fileURLWithPath: (modelPath as NSString).expandingTildeInPath)
+            let dirURL = rawURL.pathExtension.lowercased() == "gguf"
+                ? rawURL.deletingLastPathComponent()
+                : rawURL
+            vendorSettings = loadVendorSampling(in: dirURL)
+            let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")
+            if let text = try? String(contentsOf: sidecarURL, encoding: .utf8) {
+                modelSidecarSettings = ModelSidecarConfig.parseTOML(text).sampling
+            }
+        }
+        return SamplerCascade.resolve(
+            vendor: vendorSettings,
+            modelSidecar: modelSidecarSettings,
+            preset: preset,
+            request: request
+        )
+    }
+
     /// Loads `heylook.toml` from `HEYLOOK_CONFIG`, `./heylook.toml`,
-    /// or `~/.heylook/heylook.toml`, merging `HEYLOOK_MODELS_DIR` if present.
+    /// `~/Library/Application Support/Heylook/heylook.toml`, or `~/.heylook/heylook.toml`,
+    /// merging `HEYLOOK_MODELS_DIR` if present.
     public static func loadDefault() -> HeylookConfig {
         let env = ProcessInfo.processInfo.environment
         let fm = FileManager.default
@@ -225,6 +290,7 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             candidates.append(URL(fileURLWithPath: (custom as NSString).expandingTildeInPath))
         }
         candidates.append(cwd.appendingPathComponent("heylook.toml"))
+        candidates.append(defaultAppSupportDirectory.appendingPathComponent("heylook.toml"))
         candidates.append(home.appendingPathComponent(".heylook/heylook.toml"))
 
         var config = HeylookConfig()
@@ -681,10 +747,21 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return dirName != stem && stem.contains(dirName)
     }
 
+    /// Discovers all models configured in this `HeylookConfig`, combining `scanFolders`
+    /// and explicit `[[models]]` entries (`explicitModels` take precedence on matching `modelID` or `modelPath`).
+    public func discoverConfiguredModels() -> [EngineDescription] {
+        let folderURLs = scanFolders.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+        return Self.discoverModels(in: folderURLs, explicitModels: explicitModels)
+    }
+
     /// Scans `scanFolders` for `.safetensors` (MLX), `.aimodel` / `.mlmodelc` (CoreAI / ANE),
-    /// and `.gguf` (llama-server) model directories, merging any `model.heylook.toml` sidecar.
-    public static func discoverModels(in folders: [URL]) -> [EngineDescription] {
-        var discovered: [EngineDescription] = []
+    /// and `.gguf` (llama-server) model directories, merging any `model.heylook.toml` sidecar
+    /// as well as explicit `[[models]]` entries from `heylook.toml`.
+    public static func discoverModels(
+        in folders: [URL],
+        explicitModels: [ExplicitModelEntry] = []
+    ) -> [EngineDescription] {
+        var byID: [String: EngineDescription] = [:]
         let fm = FileManager.default
         let drafterSubfolderNames: Set<String> = ["mtp", "dspark", "dflash", "eagle3", "coreml", "ane"]
 
@@ -762,132 +839,184 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                     continue
                 }
 
-                let isVariant = (detectedProvider == .gguf && primaryGGUFURL != nil)
-                    ? isGGUFVariantDirectory(candidateDir, primaryGGUFFile: primaryGGUFURL!)
-                    : false
-                let repoRootDir = isVariant ? candidateDir.deletingLastPathComponent() : candidateDir
-
-                let sidecarURL = fm.fileExists(atPath: candidateDir.appendingPathComponent("model.heylook.toml").path)
-                    ? candidateDir.appendingPathComponent("model.heylook.toml")
-                    : repoRootDir.appendingPathComponent("model.heylook.toml")
-                let sidecar: ModelSidecarConfig? = (try? String(contentsOf: sidecarURL, encoding: .utf8))
-                    .map { ModelSidecarConfig.parseTOML($0) }
-
-                let defaultID: String
-                if isVariant, let primaryGGUFURL {
-                    defaultID = ggufModelStem(from: primaryGGUFURL.lastPathComponent)
-                } else {
-                    defaultID = candidateDir.lastPathComponent
-                }
-                let modelID = sidecar?.id ?? defaultID
-                let provider = sidecar?.provider ?? detectedProvider
-                let placementValue = sidecar?.computePlacement ?? defaultPlacement
-                let placementProv: ProvenanceSource = sidecar?.computePlacement != nil ? .configured : .derived
-
-                let ggufHeader = primaryGGUFURL.flatMap { GGUFHeaderReader.readFileHeader(at: $0) }
-                let archString = (configJSON?["model_type"] as? String)
-                    ?? (configJSON?["architectures"] as? [String])?.first
-                    ?? ggufHeader?.architecture
-                    ?? provider.rawValue
-                let isEmbedding = modelID.localizedCaseInsensitiveContains("embed")
-                    || archString.localizedCaseInsensitiveContains("embedding")
-                let mmprojPath = provider == .gguf ? discoverMMProj(in: candidateDir) : nil
-                let hasVision = sidecar?.supportsVision
-                    ?? (configJSON?["vision_config"] != nil
-                        || mmprojPath != nil
-                        || modelID.localizedCaseInsensitiveContains("vl")
-                        || modelID.localizedCaseInsensitiveContains("vision")
-                        || isEmbedding)
-                let hasAudio = configJSON?["audio_config"] != nil || isEmbedding
-                let ctxValue = sidecar?.ctxSize
-                    ?? (configJSON?["max_position_embeddings"] as? Int)
-                    ?? ggufHeader?.contextLength
-                    ?? 8192
-
-                let templateField: ProvenanceField<String>
-                if provider == .gguf {
-                    let ownTemplate = resolveGGUFTemplate(in: candidateDir, sidecar: sidecar)
-                    if ownTemplate.source.value == "gguf_embedded" && isVariant {
-                        templateField = resolveGGUFTemplate(in: repoRootDir, sidecar: sidecar).source
-                    } else {
-                        templateField = ownTemplate.source
-                    }
-                } else {
-                    templateField = ProvenanceField(value: "tokenizer_config.json", provenance: .derived, effect: .reload)
-                }
-
-                var tags = sidecar?.tags ?? []
-                let drafter = discoverDrafter(in: candidateDir, provider: provider, sidecar: sidecar)
-                if drafter.draftModelPath != nil || drafter.specType != nil {
-                    if !tags.contains("mtp") {
-                        tags.append("mtp")
-                    }
-                }
-                if hasVision && !tags.contains("vision") {
-                    tags.append("vision")
-                }
-
-                discovered.append(
-                    EngineDescription(
-                        modelID: modelID,
-                        provider: provider,
-                        modelPath: dirPath,
-                        architecture: ProvenanceField(value: archString, provenance: .derived, effect: .reload),
-                        quantization: ProvenanceField(
-                            value: inferQuantization(from: modelID, configJSON: configJSON),
-                            provenance: .derived,
-                            effect: .reload
-                        ),
-                        computePlacement: ProvenanceField(
-                            value: placementValue,
-                            provenance: placementProv,
-                            effect: .reload,
-                            computePlacement: placementValue
-                        ),
-                        isPinned: sidecar?.pinned ?? false,
-                        isLoaded: false,
-                        contextSize: ProvenanceField(
-                            value: ctxValue,
-                            provenance: sidecar?.ctxSize != nil ? .configured : .derived,
-                            effect: .reload
-                        ),
-                        flashAttention: ProvenanceField(
-                            value: sidecar?.flashAttn ?? true,
-                            provenance: sidecar?.flashAttn != nil ? .configured : .derived,
-                            effect: .reload
-                        ),
-                        supportsVision: ProvenanceField(
-                            value: hasVision,
-                            provenance: sidecar?.supportsVision != nil ? .configured : .derived,
-                            effect: .reload
-                        ),
-                        supportsAudio: ProvenanceField(
-                            value: hasAudio,
-                            provenance: .derived,
-                            effect: .reload
-                        ),
-                        supportsEmbeddings: ProvenanceField(
-                            value: isEmbedding,
-                            provenance: .derived,
-                            effect: .reload
-                        ),
-                        supportsThinking: ProvenanceField(
-                            value: sidecar?.supportsThinking ?? (!isEmbedding),
-                            provenance: sidecar?.supportsThinking != nil ? .configured : .derived,
-                            effect: .perRequest
-                        ),
-                        thinkingBudget: ProvenanceField(
-                            value: sidecar?.sampling.thinkingBudget,
-                            provenance: sidecar?.sampling.thinkingBudget != nil ? .configured : .notApplicable,
-                            effect: .perRequest
-                        ),
-                        templateSource: templateField,
-                        tags: tags
-                    )
+                let desc = buildEngineDescription(
+                    for: candidateDir,
+                    detectedProvider: detectedProvider,
+                    defaultPlacement: defaultPlacement,
+                    primaryGGUFURL: primaryGGUFURL,
+                    configJSON: configJSON,
+                    explicitID: nil,
+                    explicitSidecar: nil
                 )
+                byID[desc.modelID] = desc
             }
         }
-        return discovered.sorted { $0.modelID.localizedStandardCompare($1.modelID) == .orderedAscending }
+
+        for entry in explicitModels {
+            let expandedURL = URL(fileURLWithPath: (entry.path as NSString).expandingTildeInPath).standardizedFileURL
+            let ext = expandedURL.pathExtension.lowercased()
+            let candidateDir = ext == "gguf" ? expandedURL.deletingLastPathComponent() : expandedURL
+            let primaryGGUF = ext == "gguf" ? expandedURL : firstGGUFFile(in: candidateDir)
+            let defaultPlacement: ComputePlacement
+            switch entry.provider {
+            case .mlx: defaultPlacement = .mlxGPU
+            case .coreai: defaultPlacement = .ane
+            case .gguf: defaultPlacement = .ggufSubprocess
+            case .remote: defaultPlacement = .remote
+            }
+            let configJSON = loadJSONDictionary(at: candidateDir.appendingPathComponent("config.json"))
+            let desc = buildEngineDescription(
+                for: candidateDir,
+                detectedProvider: entry.provider,
+                defaultPlacement: defaultPlacement,
+                primaryGGUFURL: primaryGGUF,
+                configJSON: configJSON,
+                explicitID: entry.id,
+                explicitSidecar: entry.sidecar
+            )
+            // Remove any earlier folder-scanned entry that points at the same directory path
+            if let existingSamePath = byID.first(where: { $0.value.modelPath == desc.modelPath })?.key {
+                byID.removeValue(forKey: existingSamePath)
+            }
+            byID[desc.modelID] = desc
+        }
+
+        return byID.values.sorted { $0.modelID.localizedStandardCompare($1.modelID) == .orderedAscending }
+    }
+
+    private static func buildEngineDescription(
+        for candidateDir: URL,
+        detectedProvider: EngineProviderKind,
+        defaultPlacement: ComputePlacement,
+        primaryGGUFURL: URL?,
+        configJSON: [String: Any]?,
+        explicitID: String?,
+        explicitSidecar: ModelSidecarConfig?
+    ) -> EngineDescription {
+        let fm = FileManager.default
+        let dirPath = candidateDir.standardizedFileURL.path
+        let isVariant = (detectedProvider == .gguf && primaryGGUFURL != nil)
+            ? isGGUFVariantDirectory(candidateDir, primaryGGUFFile: primaryGGUFURL!)
+            : false
+        let repoRootDir = isVariant ? candidateDir.deletingLastPathComponent() : candidateDir
+
+        let sidecarURL = fm.fileExists(atPath: candidateDir.appendingPathComponent("model.heylook.toml").path)
+            ? candidateDir.appendingPathComponent("model.heylook.toml")
+            : repoRootDir.appendingPathComponent("model.heylook.toml")
+        let fileSidecar: ModelSidecarConfig? = (try? String(contentsOf: sidecarURL, encoding: .utf8))
+            .map { ModelSidecarConfig.parseTOML($0) }
+        let sidecar = explicitSidecar ?? fileSidecar
+
+        let defaultID: String
+        if isVariant, let primaryGGUFURL {
+            defaultID = ggufModelStem(from: primaryGGUFURL.lastPathComponent)
+        } else {
+            defaultID = candidateDir.lastPathComponent
+        }
+        let modelID = explicitID ?? sidecar?.id ?? defaultID
+        let provider = sidecar?.provider ?? detectedProvider
+        let placementValue = sidecar?.computePlacement ?? defaultPlacement
+        let placementProv: ProvenanceSource = sidecar?.computePlacement != nil ? .configured : .derived
+
+        let ggufHeader = primaryGGUFURL.flatMap { GGUFHeaderReader.readFileHeader(at: $0) }
+        let archString = (configJSON?["model_type"] as? String)
+            ?? (configJSON?["architectures"] as? [String])?.first
+            ?? ggufHeader?.architecture
+            ?? provider.rawValue
+        let isEmbedding = modelID.localizedCaseInsensitiveContains("embed")
+            || archString.localizedCaseInsensitiveContains("embedding")
+        let mmprojPath = provider == .gguf ? discoverMMProj(in: candidateDir) : nil
+        let hasVision = sidecar?.supportsVision
+            ?? (configJSON?["vision_config"] != nil
+                || mmprojPath != nil
+                || modelID.localizedCaseInsensitiveContains("vl")
+                || modelID.localizedCaseInsensitiveContains("vision")
+                || isEmbedding)
+        let hasAudio = configJSON?["audio_config"] != nil || isEmbedding
+        let ctxValue = sidecar?.ctxSize
+            ?? (configJSON?["max_position_embeddings"] as? Int)
+            ?? ggufHeader?.contextLength
+            ?? 8192
+
+        let templateField: ProvenanceField<String>
+        if provider == .gguf {
+            let ownTemplate = resolveGGUFTemplate(in: candidateDir, sidecar: sidecar)
+            if ownTemplate.source.value == "gguf_embedded" && isVariant {
+                templateField = resolveGGUFTemplate(in: repoRootDir, sidecar: sidecar).source
+            } else {
+                templateField = ownTemplate.source
+            }
+        } else {
+            templateField = ProvenanceField(value: "tokenizer_config.json", provenance: .derived, effect: .reload)
+        }
+
+        var tags = sidecar?.tags ?? []
+        let drafter = discoverDrafter(in: candidateDir, provider: provider, sidecar: sidecar)
+        if drafter.draftModelPath != nil || drafter.specType != nil {
+            if !tags.contains("mtp") {
+                tags.append("mtp")
+            }
+        }
+        if hasVision && !tags.contains("vision") {
+            tags.append("vision")
+        }
+
+        return EngineDescription(
+            modelID: modelID,
+            provider: provider,
+            modelPath: dirPath,
+            architecture: ProvenanceField(value: archString, provenance: .derived, effect: .reload),
+            quantization: ProvenanceField(
+                value: inferQuantization(from: modelID, configJSON: configJSON),
+                provenance: .derived,
+                effect: .reload
+            ),
+            computePlacement: ProvenanceField(
+                value: placementValue,
+                provenance: placementProv,
+                effect: .reload,
+                computePlacement: placementValue
+            ),
+            isPinned: sidecar?.pinned ?? false,
+            isLoaded: false,
+            contextSize: ProvenanceField(
+                value: ctxValue,
+                provenance: sidecar?.ctxSize != nil ? .configured : .derived,
+                effect: .reload
+            ),
+            flashAttention: ProvenanceField(
+                value: sidecar?.flashAttn ?? true,
+                provenance: sidecar?.flashAttn != nil ? .configured : .derived,
+                effect: .reload
+            ),
+            supportsVision: ProvenanceField(
+                value: hasVision,
+                provenance: sidecar?.supportsVision != nil ? .configured : .derived,
+                effect: .reload
+            ),
+            supportsAudio: ProvenanceField(
+                value: hasAudio,
+                provenance: .derived,
+                effect: .reload
+            ),
+            supportsEmbeddings: ProvenanceField(
+                value: isEmbedding,
+                provenance: .derived,
+                effect: .reload
+            ),
+            supportsThinking: ProvenanceField(
+                value: sidecar?.supportsThinking ?? (!isEmbedding),
+                provenance: sidecar?.supportsThinking != nil ? .configured : .derived,
+                effect: .perRequest
+            ),
+            thinkingBudget: ProvenanceField(
+                value: sidecar?.sampling.thinkingBudget,
+                provenance: sidecar?.sampling.thinkingBudget != nil ? .configured : .notApplicable,
+                effect: .perRequest
+            ),
+            templateSource: templateField,
+            tags: tags
+        )
     }
 
     private static func loadJSONDictionary(at url: URL) -> [String: Any]? {

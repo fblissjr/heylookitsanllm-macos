@@ -560,7 +560,10 @@ public actor HeylookRouter {
             )
         }
 
-        let resolvedSampling = SamplerCascade.resolve(request: request.samplerOverlay)
+        let resolvedSampling = HeylookConfig.resolveEffectiveSampling(
+            modelPath: desc.modelPath,
+            request: request.samplerOverlay
+        )
         await registry.register(requestID: requestID, modelID: request.model)
 
         return try await scheduler.withComputeLease(for: request.model) { [registry] in
@@ -724,6 +727,7 @@ public actor HeylookRouter {
         onSSEFrame: (@Sendable (String) async -> Void)? = nil
     ) async throws -> HeylookHTTPResponse {
         let provider = try await scheduler.provider(for: generateRequest.model)
+        let desc = await provider.describe()
         if try store.getConversation(id: conversationID) == nil {
             try store.upsertConversation(
                 ConversationRecord(
@@ -755,7 +759,10 @@ public actor HeylookRouter {
             system: conv?.systemPrompt,
             stream: true
         )
-        let resolvedSampling = SamplerCascade.resolve(request: generateRequest.sampling)
+        let resolvedSampling = HeylookConfig.resolveEffectiveSampling(
+            modelPath: desc.modelPath,
+            request: generateRequest.sampling
+        )
         await registry.register(requestID: requestID, conversationID: conversationID, modelID: generateRequest.model)
 
         // Unstructured server-owned task ensures persistence even if caller task cancels

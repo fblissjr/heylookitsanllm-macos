@@ -211,16 +211,9 @@ public final class HeylookWorkbenchViewModel {
     #endif
 
     public init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let heylookDir = appSupport.appendingPathComponent("Heylook", isDirectory: true)
-        try? FileManager.default.createDirectory(at: heylookDir, withIntermediateDirectories: true)
-
-        let dbURL = heylookDir.appendingPathComponent("heylook.sqlite")
-        let vecDbURL = heylookDir.appendingPathComponent("heylook_vectors.sqlite")
-        let tomlURL = heylookDir.appendingPathComponent("heylook.toml")
-
-        let cfg = (try? String(contentsOf: tomlURL, encoding: .utf8)).map(HeylookConfig.parseTOML) ?? HeylookConfig.loadDefault()
+        let dbURL = HeylookConfig.defaultStoreURL
+        let vecDbURL = HeylookConfig.defaultVectorStoreURL
+        let cfg = HeylookConfig.loadDefault()
         self.config = cfg
         self.store = (try? SQLiteStore(databaseURL: dbURL))
             ?? (try! SQLiteStore(databaseURL: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("heylook_fallback.sqlite")))
@@ -252,8 +245,7 @@ public final class HeylookWorkbenchViewModel {
     }
 
     public func bootstrap() async {
-        let folderURLs = config.scanFolders.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-        var discovered = HeylookConfig.discoverModels(in: folderURLs)
+        var discovered = config.discoverConfiguredModels()
         if discovered.isEmpty {
             discovered = Self.defaultDemoModels()
         }
@@ -457,16 +449,6 @@ public final class HeylookWorkbenchViewModel {
 
     public var currentResolvedSamplers: SamplerCascade.ResolvedSampling {
         let activePreset = presets.first(where: { $0.name == selectedPresetName })?.settings
-        var vendorSettings: SamplerSettings?
-        var modelSidecarSettings: SamplerSettings?
-        if let desc = activeModelDescription {
-            let modelDirURL = URL(fileURLWithPath: desc.modelPath)
-            vendorSettings = HeylookConfig.loadVendorSampling(in: modelDirURL)
-            let sidecarURL = modelDirURL.appendingPathComponent("model.heylook.toml")
-            if let text = try? String(contentsOf: sidecarURL, encoding: .utf8) {
-                modelSidecarSettings = ModelSidecarConfig.parseTOML(text).sampling
-            }
-        }
         let requestOverlay = SamplerSettings(
             temperature: userOverriddenSamplerKeys.contains("temperature") ? temperatureOverride : nil,
             topP: userOverriddenSamplerKeys.contains("top_p") ? topPOverride : nil,
@@ -476,9 +458,8 @@ public final class HeylookWorkbenchViewModel {
             thinking: userOverriddenSamplerKeys.contains("thinking") ? thinkingEnabled : nil,
             thinkingBudget: userOverriddenSamplerKeys.contains("thinking_budget") ? thinkingBudgetOverride : nil
         )
-        return SamplerCascade.resolve(
-            vendor: vendorSettings,
-            modelSidecar: modelSidecarSettings,
+        return HeylookConfig.resolveEffectiveSampling(
+            modelPath: activeModelDescription?.modelPath,
             preset: activePreset,
             request: requestOverlay
         )
@@ -775,6 +756,7 @@ public final class HeylookWorkbenchViewModel {
         let reqID = "nb_\(UUID().uuidString.prefix(8))"
         do {
             let provider = try await scheduler.provider(for: modelID)
+            let desc = await provider.describe()
             let req = MessagesRequest(
                 model: modelID,
                 messages: [MessagesRequest.MessageTurn(role: "user", content: "Continue writing seamlessly from:\n\n\(notebookBody)")],
@@ -782,7 +764,10 @@ public final class HeylookWorkbenchViewModel {
                 temperature: temperatureOverride,
                 thinking: false
             )
-            let resolved = SamplerCascade.resolve(request: req.samplerOverlay)
+            let resolved = HeylookConfig.resolveEffectiveSampling(
+                modelPath: desc.modelPath,
+                request: req.samplerOverlay
+            )
             notebookBody += "\n\n"
             try await scheduler.withComputeLease(for: modelID) { [registry] in
                 let stream = await provider.generate(
@@ -1020,7 +1005,15 @@ public final class HeylookWorkbenchViewModel {
             )
         ]
 
-        for (id, kind, title, snippet) in samples {
+        let batchInputs = samples.map { _, _, title, snippet in
+            EmbeddingInput(parts: [.text(snippet)], task: .document, title: title)
+        }
+        let batchOutputs = try? await activeEmbeddingEngine.embedBatch(
+            batchInputs,
+            dimensions: Matryoshka.gemma2NativeDimensions
+        )
+
+        for (idx, (id, kind, title, snippet)) in samples.enumerated() {
             let artifact = Artifact(
                 id: id,
                 collectionID: "default",
@@ -1030,7 +1023,9 @@ public final class HeylookWorkbenchViewModel {
                 fingerprint: ContentFingerprint(byteCount: Int64(snippet.utf8.count), modifiedUnixMs: 1_700_000_000_000),
                 modelID: activeEmbeddingEngine.modelID
             )
-            let vec = hashEmbeddingEngine.embed(text: snippet)
+            let vec = (batchOutputs != nil && idx < batchOutputs!.count)
+                ? batchOutputs![idx].vector
+                : hashEmbeddingEngine.embed(text: snippet)
             let chunk = EmbeddedChunk(
                 id: "\(id)#whole",
                 artifactID: id,
@@ -1078,9 +1073,23 @@ public final class HeylookWorkbenchViewModel {
     }
 
     public func runPairwiseCompare() {
-        let left = hashEmbeddingEngine.embed(text: compareLeftText, dimensions: selectedDimension)
-        let right = hashEmbeddingEngine.embed(text: compareRightText, dimensions: selectedDimension)
-        compareCosineScore = Matryoshka.cosine(left, right, dimensions: selectedDimension)
+        let dim = selectedDimension
+        let leftText = compareLeftText
+        let rightText = compareRightText
+        let engine = activeEmbeddingEngine
+        let fallback = hashEmbeddingEngine
+        Task { @MainActor in
+            if let outputs = try? await engine.embedBatch(
+                [.text(leftText, task: .sts), .text(rightText, task: .sts)],
+                dimensions: dim
+            ), outputs.count == 2 {
+                self.compareCosineScore = Matryoshka.cosine(outputs[0].vector, outputs[1].vector, dimensions: dim)
+            } else {
+                let left = fallback.embed(text: leftText, dimensions: dim)
+                let right = fallback.embed(text: rightText, dimensions: dim)
+                self.compareCosineScore = Matryoshka.cosine(left, right, dimensions: dim)
+            }
+        }
     }
 
     public func runEmbeddingLabEvaluation() async {

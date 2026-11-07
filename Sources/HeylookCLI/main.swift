@@ -40,13 +40,7 @@ struct HeylookCLI {
     }
 
     static func defaultVectorStoreURL() -> URL {
-        if let envPath = ProcessInfo.processInfo.environment["HEYLOOK_DB_PATH"], !envPath.isEmpty {
-            return URL(fileURLWithPath: envPath)
-        }
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport
-            .appendingPathComponent("heylook", isDirectory: true)
-            .appendingPathComponent("vectors.sqlite")
+        HeylookConfig.defaultVectorStoreURL
     }
 
     static func resolveVectorStoreURL(from args: [String] = []) -> URL {
@@ -100,8 +94,7 @@ struct HeylookCLI {
 
     static func runModels() {
         let cfg = HeylookConfig.loadDefault()
-        let folderURLs = cfg.scanFolders.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-        let found = HeylookConfig.discoverModels(in: folderURLs)
+        let found = cfg.discoverConfiguredModels()
         print("Discovered \(found.count) models across \(cfg.scanFolders.count) configured folders (\(cfg.explicitModels.count) explicit entries in heylook.toml).")
         for m in found {
             let mtpBadge = m.tags.contains("mtp") ? " [MTP]" : ""
@@ -277,8 +270,7 @@ struct HeylookCLI {
 
     static func registerConfiguredModels(into scheduler: ComputeScheduler) async -> [EngineDescription] {
         let cfg = HeylookConfig.loadDefault()
-        let folderURLs = cfg.scanFolders.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-        let found = HeylookConfig.discoverModels(in: folderURLs)
+        let found = cfg.discoverConfiguredModels()
         for desc in found {
             let provider: any InferenceProvider
             switch desc.provider {
@@ -385,8 +377,10 @@ struct HeylookCLI {
             stream: true,
             thinking: thinking
         )
-        let vendorSamplers = HeylookConfig.loadVendorSampling(in: URL(fileURLWithPath: selectedDesc.modelPath))
-        let resolved = SamplerCascade.resolve(vendor: vendorSamplers, request: req.samplerOverlay)
+        let resolved = HeylookConfig.resolveEffectiveSampling(
+            modelPath: selectedDesc.modelPath,
+            request: req.samplerOverlay
+        )
         do {
             let provider = try await scheduler.provider(for: selectedDesc.modelID)
             let lastChunk = try await scheduler.withComputeLease(for: selectedDesc.modelID) { () throws -> GenerationChunk? in
@@ -431,14 +425,25 @@ struct HeylookCLI {
 
     static func runServe(port: UInt16) async {
         do {
-            let dbURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("heylook_serve.sqlite")
+            let cfg = HeylookConfig.loadDefault()
+            let dbURL = HeylookConfig.defaultStoreURL
             let store = try SQLiteStore(databaseURL: dbURL)
-            let scheduler = ComputeScheduler()
+            let scheduler = ComputeScheduler(
+                maxLoadedGPUModels: cfg.maxLoadedModels,
+                maxQueueDepth: cfg.maxQueueDepth
+            )
             let registered = await registerConfiguredModels(into: scheduler)
-            let router = HeylookRouter(store: store, scheduler: scheduler)
-            let server = HeylookHTTPServer(router: router, host: "127.0.0.1", port: port)
+            let embeddingEngine = makeEmbeddingEngine(computeOptions: .hybridANETowers)
+            let router = HeylookRouter(
+                store: store,
+                scheduler: scheduler,
+                embeddingEngine: embeddingEngine,
+                bindHost: cfg.serverHost,
+                allowedHosts: cfg.allowedHosts
+            )
+            let server = HeylookHTTPServer(router: router, host: cfg.serverHost, port: port)
             try await server.start()
-            print("Heylook Server listening on http://127.0.0.1:\(port) (\(registered.count) models registered)")
+            print("Heylook Server listening on http://\(cfg.serverHost):\(port) (\(registered.count) models registered, store: \(dbURL.path))")
             do {
                 try await Task.sleep(for: .seconds(3600 * 24))
             } catch {
