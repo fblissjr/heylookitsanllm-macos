@@ -279,13 +279,31 @@ public struct DeterministicHashEmbeddingEngine: EmbeddingEngine, Sendable {
         let targetDim = dimensions ?? nativeDimensions
         return inputs.map { input in
             var combined = input.title ?? ""
+            var windows: [EmbeddedOutput.WindowVector] = []
             for part in input.parts {
-                if case .text(let s) = part {
+                switch part {
+                case let .text(s):
                     combined += " " + s
+                case let .media(kind, mimeType, data, mediaURL, windowSampling):
+                    let byteLen = data?.count ?? part.estimatedBytes
+                    let tag = mediaURL?.lastPathComponent ?? "\(kind.rawValue)_\(mimeType)_\(byteLen)"
+                    combined += " media_\(tag)_\(windowSampling.rawValue)"
+                    if kind == .video && windowSampling != .off {
+                        let winVec = embed(text: "\(combined)_win_0_16_\(windowSampling.rawValue)", dimensions: targetDim)
+                        let frames: [Double] = windowSampling == .fps ? [0.5, 4.5, 8.5, 12.5] : [0.5, 3.25, 9.75, 14.5]
+                        windows.append(
+                            EmbeddedOutput.WindowVector(
+                                start: 0.0,
+                                end: 16.0,
+                                frameTimes: frames,
+                                vector: winVec
+                            )
+                        )
+                    }
                 }
             }
             let vec = embed(text: combined, dimensions: targetDim)
-            return EmbeddedOutput(vector: vec)
+            return EmbeddedOutput(vector: vec, windows: windows)
         }
     }
 }
@@ -308,37 +326,103 @@ public enum EmbeddingEngineError: LocalizedError, Sendable {
     }
 }
 
-/// Capabilities reported by `heylook`'s `GET /v1/models` endpoint for an embedding model.
+/// Canonical `/v1/embeddings` request limits shared between server validators, `/v1/capabilities`,
+/// `/v1/models`, and `HeylookMLXEngine` client-side batch planning (`heylookitsanllm` `v2.0.239` parity).
+public struct EmbeddingRequestLimits: Codable, Sendable, Equatable {
+    public static let maxItems: Int = 16
+    public static let maxBlocksPerItem: Int = 32
+    public static let maxTextChars: Int = 131_072
+    public static let maxImageOrAudioBytes: Int = 32 * 1024 * 1024
+    public static let maxVideoBytes: Int = 256 * 1024 * 1024
+    public static let maxRequestMediaBytes: Int = 256 * 1024 * 1024
+    public static let mediaBytesByKind: [String: Int] = [
+        "image": maxImageOrAudioBytes,
+        "audio": maxImageOrAudioBytes,
+        "video": maxVideoBytes,
+    ]
+
+    public let items: Int
+    public let blocksPerItem: Int
+    public let textChars: Int
+    public let mediaBytes: [String: Int]
+    public let requestMediaBytes: Int
+
+    public init(
+        items: Int = Self.maxItems,
+        blocksPerItem: Int = Self.maxBlocksPerItem,
+        textChars: Int = Self.maxTextChars,
+        mediaBytes: [String: Int] = Self.mediaBytesByKind,
+        requestMediaBytes: Int = Self.maxRequestMediaBytes
+    ) {
+        self.items = items
+        self.blocksPerItem = blocksPerItem
+        self.textChars = textChars
+        self.mediaBytes = mediaBytes
+        self.requestMediaBytes = requestMediaBytes
+    }
+
+    public static let `default` = EmbeddingRequestLimits()
+
+    enum CodingKeys: String, CodingKey {
+        case items
+        case blocksPerItem = "blocks_per_item"
+        case textChars = "text_chars"
+        case mediaBytes = "media_bytes"
+        case requestMediaBytes = "request_media_bytes"
+    }
+}
+
+/// Capabilities reported by `heylook`'s `GET /v1/models` and `GET /v1/capabilities` endpoints for an embedding model.
 public struct HeylookServerCapabilities: Codable, Sendable, Equatable {
     public let modelID: String
-    public let maxItems: Int
-    public let maxRequestMediaBytes: Int
+    public let limits: EmbeddingRequestLimits
     public let defaultWindowSeconds: Double
     public let videoSamplingModes: [String]
     public let prompts: [String: String]
 
+    public var maxItems: Int { limits.items }
+    public var maxRequestMediaBytes: Int { limits.requestMediaBytes }
+
     public init(
         modelID: String,
-        maxItems: Int = 16,
-        maxRequestMediaBytes: Int = 256 * 1024 * 1024,
+        limits: EmbeddingRequestLimits = .default,
         defaultWindowSeconds: Double = 32.0,
         videoSamplingModes: [String] = ["fps", "content"],
         prompts: [String: String] = [:]
     ) {
         self.modelID = modelID
-        self.maxItems = maxItems
-        self.maxRequestMediaBytes = maxRequestMediaBytes
+        self.limits = limits
         self.defaultWindowSeconds = defaultWindowSeconds
         self.videoSamplingModes = videoSamplingModes
         self.prompts = prompts
+    }
+
+    public init(
+        modelID: String,
+        maxItems: Int,
+        maxRequestMediaBytes: Int = EmbeddingRequestLimits.maxRequestMediaBytes,
+        defaultWindowSeconds: Double = 32.0,
+        videoSamplingModes: [String] = ["fps", "content"],
+        prompts: [String: String] = [:]
+    ) {
+        self.init(
+            modelID: modelID,
+            limits: EmbeddingRequestLimits(
+                items: maxItems,
+                requestMediaBytes: maxRequestMediaBytes
+            ),
+            defaultWindowSeconds: defaultWindowSeconds,
+            videoSamplingModes: videoSamplingModes,
+            prompts: prompts
+        )
     }
 }
 
 /// HTTP `EmbeddingEngine` talking to `heylook`'s `/v1/embeddings` endpoint with bounded
 /// client-side sub-batching (`<= 16` items, `<= 192 MiB` raw media bytes) and `DELETE /v1/requests/{id}` cancellation.
 public actor HeylookMLXEngine: EmbeddingEngine {
-    public static let defaultMaxItemsPerRequest: Int = 16
-    public static let defaultMaxRequestMediaBytes: Int = 256 * 1024 * 1024
+    public static let defaultMaxItemsPerRequest: Int = EmbeddingRequestLimits.maxItems
+    public static let defaultMaxRequestMediaBytes: Int = EmbeddingRequestLimits.maxRequestMediaBytes
 
     public nonisolated let baseURL: URL
     public nonisolated let modelID: String
@@ -408,17 +492,31 @@ public actor HeylookMLXEngine: EmbeddingEngine {
         else {
             return HeylookServerCapabilities(modelID: modelID)
         }
-        let matching = rows.first { ($0["id"] as? String) == modelID && $0["embedding"] != nil }
-            ?? rows.first { $0["embedding"] != nil }
+        func extractEmbeddingDict(_ row: [String: Any]) -> [String: Any]? {
+            if let direct = row["embedding"] as? [String: Any] { return direct }
+            if let engine = row["engine"] as? [String: Any],
+               let nested = engine["embedding"] as? [String: Any] {
+                return nested
+            }
+            return nil
+        }
+        let matching = rows.first {
+            let id = ($0["id"] as? String) ?? ($0["modelID"] as? String)
+            return id == modelID && extractEmbeddingDict($0) != nil
+        } ?? rows.first { extractEmbeddingDict($0) != nil }
+
         guard let matching,
-              let emb = matching["embedding"] as? [String: Any]
+              let emb = extractEmbeddingDict(matching)
         else {
             return HeylookServerCapabilities(modelID: modelID)
         }
-        let resolvedID = (matching["id"] as? String) ?? modelID
-        let limits = emb["limits"] as? [String: Any] ?? [:]
-        let maxItems = (limits["items"] as? Int) ?? Self.defaultMaxItemsPerRequest
-        let maxMediaBytes = (limits["request_media_bytes"] as? Int) ?? Self.defaultMaxRequestMediaBytes
+        let resolvedID = (matching["id"] as? String) ?? (matching["modelID"] as? String) ?? modelID
+        let limitsDict = emb["limits"] as? [String: Any] ?? [:]
+        let maxItems = (limitsDict["items"] as? Int) ?? Self.defaultMaxItemsPerRequest
+        let blocksPerItem = (limitsDict["blocks_per_item"] as? Int) ?? EmbeddingRequestLimits.maxBlocksPerItem
+        let textChars = (limitsDict["text_chars"] as? Int) ?? EmbeddingRequestLimits.maxTextChars
+        let mediaBytes = (limitsDict["media_bytes"] as? [String: Int]) ?? EmbeddingRequestLimits.mediaBytesByKind
+        let maxMediaBytes = (limitsDict["request_media_bytes"] as? Int) ?? Self.defaultMaxRequestMediaBytes
         let videoWin = emb["video_windows"] as? [String: Any] ?? [:]
         let winSec = (videoWin["default_seconds"] as? Double)
             ?? Double((videoWin["default_seconds"] as? Int) ?? 32)
@@ -427,8 +525,13 @@ public actor HeylookMLXEngine: EmbeddingEngine {
 
         let caps = HeylookServerCapabilities(
             modelID: resolvedID,
-            maxItems: maxItems,
-            maxRequestMediaBytes: maxMediaBytes,
+            limits: EmbeddingRequestLimits(
+                items: maxItems,
+                blocksPerItem: blocksPerItem,
+                textChars: textChars,
+                mediaBytes: mediaBytes,
+                requestMediaBytes: maxMediaBytes
+            ),
             defaultWindowSeconds: winSec,
             videoSamplingModes: samplingModes,
             prompts: prompts

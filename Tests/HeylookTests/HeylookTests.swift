@@ -668,7 +668,10 @@ struct HeylookTests {
         let capResp = await router.handle(method: "GET", path: "/v1/capabilities", headers: ["Host": "127.0.0.1:8000"])
         #expect(capResp.status == 200)
         let capJSON = try JSONSerialization.jsonObject(with: capResp.body) as? [String: Any]
-        #expect((capJSON?["max_request_media_bytes"] as? Int) == 24 * 1024 * 1024)
+        #expect((capJSON?["max_request_media_bytes"] as? Int) == EmbeddingRequestLimits.maxRequestMediaBytes)
+        let embLimits = capJSON?["embedding_limits"] as? [String: Any]
+        #expect((embLimits?["items"] as? Int) == EmbeddingRequestLimits.maxItems)
+        #expect((embLimits?["blocks_per_item"] as? Int) == EmbeddingRequestLimits.maxBlocksPerItem)
 
         // 2. POST /v1/embeddings with Matryoshka 256d truncation
         let embPayload = try JSONSerialization.data(withJSONObject: [
@@ -2110,5 +2113,130 @@ struct HeylookTests {
         #expect((highEffortJSON?["thinking_depth"] as? String) == "high")
         let renderedHighEffortPrompt = (highEffortJSON?["prompt"] as? String) ?? ""
         #expect(renderedHighEffortPrompt.contains("# reasoning_effort = high"))
+    }
+
+    // MARK: - 27. Structured /v1/embeddings Wire, EmbeddingRequestLimits & MLXModelConverter Preflight
+
+    @Test("Structured /v1/embeddings wire with video windows, EmbeddingRequestLimits 422 validation, and MLXModelConverter preflight")
+    func testStructuredEmbeddingsWireAndMLXModelConverterPreflight() async throws {
+        let dbURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_emb_wire_\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: dbURL) }
+        let store = try SQLiteStore(databaseURL: dbURL)
+        let scheduler = ComputeScheduler()
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        // 1. Structured HeylookMLXEngine wire payload with prompt_name and windowed video block
+        let fakeVideoB64 = Data("fake_mp4_payload_bytes".utf8).base64EncodedString()
+        let structuredBody = try JSONSerialization.data(withJSONObject: [
+            "model": "embeddinggemma-2-MLX-BF16",
+            "dimensions": 512,
+            "input": [
+                [
+                    "content": [
+                        ["type": "text", "text": "title: architecture.md | text: Dual-lane GPU and ANE scheduler"]
+                    ]
+                ],
+                [
+                    "content": [
+                        [
+                            "type": "video",
+                            "source": [
+                                "type": "base64",
+                                "media_type": "video/mp4",
+                                "data": fakeVideoB64,
+                            ],
+                            "windows": ["sampling": "fps"],
+                        ]
+                    ],
+                    "prompt_name": "query",
+                ],
+            ],
+        ])
+        let embResp = await router.handle(
+            method: "POST",
+            path: "/v1/embeddings",
+            headers: ["Host": "127.0.0.1:8000", "Content-Type": "application/json"],
+            body: structuredBody
+        )
+        #expect(embResp.status == 200)
+        let embJSON = try JSONSerialization.jsonObject(with: embResp.body) as? [String: Any]
+        #expect((embJSON?["dimensions"] as? Int) == 512)
+        let rows = embJSON?["data"] as? [[String: Any]]
+        #expect(rows?.count == 2)
+        let videoRow = rows?[1]
+        #expect((videoRow?["prompt_name"] as? String) == "query")
+        let windows = videoRow?["windows"] as? [[String: Any]]
+        #expect(windows?.count == 1)
+        let firstWindow = windows?.first
+        #expect((firstWindow?["start"] as? Double) == 0.0)
+        #expect((firstWindow?["end"] as? Double) == 16.0)
+        let winEmbedding = firstWindow?["embedding"] as? [Double]
+        #expect(winEmbedding?.count == 512)
+
+        // 2. EmbeddingRequestLimits HTTP 422 validation (windowed video cannot mix with extra blocks)
+        let invalidWindowBody = try JSONSerialization.data(withJSONObject: [
+            "model": "embeddinggemma-2-MLX-BF16",
+            "input": [
+                [
+                    "content": [
+                        ["type": "text", "text": "extra block"],
+                        [
+                            "type": "video",
+                            "source": ["type": "base64", "media_type": "video/mp4", "data": fakeVideoB64],
+                            "windows": ["sampling": "fps"],
+                        ],
+                    ]
+                ]
+            ],
+        ])
+        let invalidWindowResp = await router.handle(
+            method: "POST",
+            path: "/v1/embeddings",
+            headers: ["Host": "127.0.0.1:8000", "Content-Type": "application/json"],
+            body: invalidWindowBody
+        )
+        #expect(invalidWindowResp.status == 422)
+
+        // 3. MLXModelConverter.planConversion preflight validation
+        let tmpRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_mlx_convert_\(UUID().uuidString)")
+        let srcDir = tmpRoot.appendingPathComponent("Qwen3.5-BF16")
+        let dstDir = tmpRoot.appendingPathComponent("Qwen3.5-MLX-4bit")
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        try FileManager.default.createDirectory(at: srcDir, withIntermediateDirectories: true)
+
+        try """
+        {
+          "model_type": "qwen3_5",
+          "vision_config": { "hidden_size": 1152 }
+        }
+        """.write(to: srcDir.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try Data("safetensors_header".utf8).write(to: srcDir.appendingPathComponent("model-00001-of-00001.safetensors"))
+        try """
+        {% if enable_thinking %}<think>{% endif %}
+        """.write(to: srcDir.appendingPathComponent("chat_template.jinja"), atomically: true, encoding: .utf8)
+
+        let plan = try MLXModelConverter.planConversion(
+            from: srcDir,
+            to: dstDir,
+            spec: MLXConversionSpec(bits: 4, groupSize: 64, mode: .affine, calibration: .standard)
+        )
+        #expect(plan.modelType == "qwen3_5")
+        #expect(plan.isVisionModel == true)
+        #expect(plan.resolvedBits == 4)
+        #expect(plan.resolvedGroupSize == 64)
+        #expect(plan.safetensorsFiles == ["model-00001-of-00001.safetensors"])
+        #expect(plan.sidecarFiles.contains("config.json"))
+        #expect(plan.sidecarFiles.contains("chat_template.jinja"))
+
+        // Verify q4_zero calibration rejects groupSize=64
+        #expect(throws: MLXModelConversionError.self) {
+            _ = try MLXModelConverter.planConversion(
+                from: srcDir,
+                to: dstDir,
+                spec: MLXConversionSpec(bits: 4, groupSize: 64, mode: .affine, calibration: .q4Zero)
+            )
+        }
     }
 }

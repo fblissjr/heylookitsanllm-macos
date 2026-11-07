@@ -138,6 +138,7 @@ public actor HeylookRouter {
                     let totalPhysicalRAMGB: Double
                     let metalWorkingSetGB: Double
                     let maxRequestMediaBytes: Int
+                    let embeddingLimits: EmbeddingRequestLimits
                     let endpoints: [String]
 
                     enum CodingKeys: String, CodingKey {
@@ -145,6 +146,7 @@ public actor HeylookRouter {
                         case totalPhysicalRAMGB = "total_physical_ram_gb"
                         case metalWorkingSetGB = "metal_working_set_gb"
                         case maxRequestMediaBytes = "max_request_media_bytes"
+                        case embeddingLimits = "embedding_limits"
                         case endpoints
                     }
                 }
@@ -154,7 +156,8 @@ public actor HeylookRouter {
                         deviceName: snap.deviceName,
                         totalPhysicalRAMGB: snap.totalPhysicalRAMGB,
                         metalWorkingSetGB: snap.metalRecommendedMaxWorkingSetGB,
-                        maxRequestMediaBytes: 24 * 1024 * 1024,
+                        maxRequestMediaBytes: EmbeddingRequestLimits.maxRequestMediaBytes,
+                        embeddingLimits: .default,
                         endpoints: [
                             "/v1/messages",
                             "/v1/embeddings",
@@ -524,10 +527,107 @@ public actor HeylookRouter {
         let task = EmbeddingTask(rawValue: taskRaw) ?? .document
 
         var inputs: [EmbeddingInput] = []
+        var promptNames: [String?] = []
+
         if let singleText = json["input"] as? String {
+            if singleText.count > EmbeddingRequestLimits.maxTextChars {
+                return .error(status: 422, type: "invalid_request_error", message: "Text block exceeds \(EmbeddingRequestLimits.maxTextChars) characters")
+            }
             inputs = [.text(singleText, task: task)]
+            promptNames = [task.promptName]
         } else if let textList = json["input"] as? [String] {
+            if textList.count > EmbeddingRequestLimits.maxItems {
+                return .error(status: 422, type: "invalid_request_error", message: "Embedding input count (\(textList.count)) exceeds limit of \(EmbeddingRequestLimits.maxItems)")
+            }
+            for txt in textList where txt.count > EmbeddingRequestLimits.maxTextChars {
+                return .error(status: 422, type: "invalid_request_error", message: "Text block exceeds \(EmbeddingRequestLimits.maxTextChars) characters")
+            }
             inputs = textList.map { .text($0, task: task) }
+            promptNames = Array(repeating: task.promptName, count: textList.count)
+        } else if let itemObjects = json["input"] as? [[String: Any]] {
+            if itemObjects.isEmpty || itemObjects.count > EmbeddingRequestLimits.maxItems {
+                return .error(
+                    status: 422,
+                    type: "invalid_request_error",
+                    message: "Embedding input count (\(itemObjects.count)) must be between 1 and \(EmbeddingRequestLimits.maxItems)"
+                )
+            }
+            var totalRequestMediaBytes = 0
+            for itemObj in itemObjects {
+                let promptName = itemObj["prompt_name"] as? String
+                let resolvedTask: EmbeddingTask
+                if let promptName {
+                    resolvedTask = EmbeddingTask.allCases.first { $0.promptName == promptName || $0.rawValue == promptName } ?? task
+                } else {
+                    resolvedTask = task
+                }
+                guard let contentBlocks = itemObj["content"] as? [[String: Any]], !contentBlocks.isEmpty else {
+                    return .error(status: 400, type: "invalid_request_error", message: "Each embedding item must contain a non-empty 'content' array")
+                }
+                if contentBlocks.count > EmbeddingRequestLimits.maxBlocksPerItem {
+                    return .error(
+                        status: 422,
+                        type: "invalid_request_error",
+                        message: "Embedding item content block count (\(contentBlocks.count)) exceeds limit of \(EmbeddingRequestLimits.maxBlocksPerItem)"
+                    )
+                }
+                let hasWindows = contentBlocks.contains { $0["windows"] != nil && !($0["windows"] is NSNull) }
+                if hasWindows && contentBlocks.count != 1 {
+                    return .error(
+                        status: 422,
+                        type: "invalid_request_error",
+                        message: "An item with video windows must contain only that video block"
+                    )
+                }
+                var parts: [EmbeddingPart] = []
+                for block in contentBlocks {
+                    let bType = (block["type"] as? String) ?? "text"
+                    if bType == "text" {
+                        let txt = (block["text"] as? String) ?? ""
+                        if txt.count > EmbeddingRequestLimits.maxTextChars {
+                            return .error(status: 422, type: "invalid_request_error", message: "Text block exceeds \(EmbeddingRequestLimits.maxTextChars) characters")
+                        }
+                        parts.append(.text(txt))
+                    } else if bType == "image" || bType == "audio" || bType == "video" {
+                        guard let source = block["source"] as? [String: Any],
+                              let b64 = source["data"] as? String,
+                              let data = Data(base64Encoded: b64) else {
+                            return .error(status: 400, type: "invalid_request_error", message: "Invalid base64 media source in /v1/embeddings")
+                        }
+                        let mimeType = (source["media_type"] as? String)
+                            ?? (bType == "video" ? "video/mp4" : (bType == "audio" ? "audio/wav" : "image/jpeg"))
+                        if !mimeType.lowercased().hasPrefix("\(bType)/") {
+                            return .error(status: 422, type: "invalid_request_error", message: "media_type '\(mimeType)' must match block type '\(bType)'")
+                        }
+                        let kindCap = EmbeddingRequestLimits.mediaBytesByKind[bType] ?? EmbeddingRequestLimits.maxImageOrAudioBytes
+                        if data.count > kindCap {
+                            return .error(status: 422, type: "invalid_request_error", message: "\(bType) payload (\(data.count) bytes) exceeds limit of \(kindCap) bytes")
+                        }
+                        totalRequestMediaBytes += data.count
+                        if totalRequestMediaBytes > EmbeddingRequestLimits.maxRequestMediaBytes {
+                            return .error(
+                                status: 422,
+                                type: "invalid_request_error",
+                                message: "Total request media (\(totalRequestMediaBytes) bytes) exceeds \(EmbeddingRequestLimits.maxRequestMediaBytes) bytes"
+                            )
+                        }
+                        var windowSampling: VideoWindowSampling = .off
+                        if let winDict = block["windows"] as? [String: Any] {
+                            guard bType == "video" else {
+                                return .error(status: 422, type: "invalid_request_error", message: "windows applies to video blocks only")
+                            }
+                            let samplingStr = (winDict["sampling"] as? String) ?? "fps"
+                            windowSampling = VideoWindowSampling(rawValue: samplingStr) ?? .fps
+                        }
+                        let kind: ArtifactKind = bType == "video" ? .video : (bType == "audio" ? .audio : .image)
+                        parts.append(.media(kind: kind, mimeType: mimeType, data: data, windowSampling: windowSampling))
+                    } else {
+                        return .error(status: 400, type: "invalid_request_error", message: "Unsupported embedding block type '\(bType)'")
+                    }
+                }
+                inputs.append(EmbeddingInput(parts: parts, task: resolvedTask))
+                promptNames.append(promptName)
+            }
         } else if let partArrays = json["input"] as? [[[String: Any]]] {
             for partArray in partArrays {
                 var parts: [EmbeddingPart] = []
@@ -547,27 +647,41 @@ public actor HeylookRouter {
                     }
                 }
                 inputs.append(EmbeddingInput(parts: parts.isEmpty ? [.text("")] : parts, task: task))
+                promptNames.append(task.promptName)
             }
         } else {
             return .error(status: 400, type: "invalid_request_error", message: "Missing or unsupported 'input' field in /v1/embeddings")
         }
 
         let outputs = try await embeddingEngine.embedBatch(inputs, dimensions: requestedDim)
+        struct WindowRow: Encodable {
+            let start: Double
+            let end: Double
+            let frame_times: [Double]
+            let embedding: [Float]
+        }
         struct EmbeddingItem: Encodable {
             let object = "embedding"
             let index: Int
             let embedding: [Float]
+            let prompt_name: String?
+            let windows: [WindowRow]?
         }
         struct EmbeddingsResponseEnvelope: Encodable {
             let object = "list"
             let model: String
+            let dimensions: Int
             let data: [EmbeddingItem]
         }
 
         let items = outputs.enumerated().map { idx, out in
-            EmbeddingItem(index: idx, embedding: out.vector)
+            let winRows: [WindowRow]? = out.windows.isEmpty ? nil : out.windows.map {
+                WindowRow(start: $0.start, end: $0.end, frame_times: $0.frameTimes, embedding: $0.vector)
+            }
+            let pName = idx < promptNames.count ? promptNames[idx] : nil
+            return EmbeddingItem(index: idx, embedding: out.vector, prompt_name: pName, windows: winRows)
         }
-        return try .json(EmbeddingsResponseEnvelope(model: modelName, data: items))
+        return try .json(EmbeddingsResponseEnvelope(model: modelName, dimensions: requestedDim, data: items))
     }
 
     private func handleMessages(

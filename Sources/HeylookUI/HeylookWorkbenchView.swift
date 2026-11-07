@@ -51,6 +51,8 @@ public final class HeylookWorkbenchViewModel {
     public var registeredModels: [EngineDescription] = []
     public var selectedModelID: String = ""
     public var editingSidecarModel: EngineDescription?
+    public var showMLXConverterSheet: Bool = false
+    public var convertingSourceModel: EngineDescription?
     public var memorySnapshot: HardwareMemoryMonitor.MemorySnapshot = HardwareMemoryMonitor.snapshot()
     public var schedulerMetrics: ComputeScheduler.SchedulerMetrics = ComputeScheduler.SchedulerMetrics(
         gpuGateBusy: false,
@@ -1198,7 +1200,7 @@ public final class HeylookWorkbenchViewModel {
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let list = json["data"] as? [[String: Any]] {
             for item in list {
-                if let id = item["id"] as? String {
+                if let id = (item["id"] as? String) ?? (item["modelID"] as? String) {
                     let remoteDesc = EngineDescription(
                         modelID: id,
                         provider: .remote,
@@ -1266,6 +1268,29 @@ public final class HeylookWorkbenchViewModel {
         await activeEmbeddingEngine.unload()
         await refreshMetrics()
         statusBanner = "Unloaded all models, cleared Metal/ANE caches, and terminated background subprocesses."
+    }
+
+    public func rescanConfiguredModels() async {
+        let discovered = config.discoverConfiguredModels()
+        for desc in discovered {
+            if await scheduler.modelDescription(for: desc.modelID) == nil {
+                let provider: any InferenceProvider
+                switch desc.provider {
+                case .mlx:
+                    provider = MLXSwiftProvider(description: desc)
+                case .coreai:
+                    provider = CoreAIProvider(description: desc)
+                case .gguf:
+                    provider = GGUFSubprocessProvider(description: desc)
+                case .remote:
+                    provider = MLXSwiftProvider(description: desc)
+                }
+                await scheduler.register(provider: provider, description: desc)
+            }
+        }
+        registeredModels = await scheduler.listModels()
+        await refreshMetrics()
+        statusBanner = "Rescanned model directories (\(registeredModels.count) models registered)."
     }
 
     public func shutdown() async {
@@ -3185,11 +3210,28 @@ struct ModelsInspectorSurface: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("Registered Models (\(viewModel.registeredModels.count))")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
+                Button {
+                    viewModel.convertingSourceModel = nil
+                    viewModel.showMLXConverterSheet = true
+                } label: {
+                    Label("Quantize / Convert MLX…", systemImage: "cube.transparent")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    Task { await viewModel.rescanConfiguredModels() }
+                } label: {
+                    Label("Re-scan", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
                 Button {
                     Task { await viewModel.unloadAllModels() }
                 } label: {
@@ -3240,6 +3282,17 @@ struct ModelsInspectorSurface: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
 
+                    if model.provider == .mlx {
+                        Button {
+                            viewModel.convertingSourceModel = model
+                            viewModel.showMLXConverterSheet = true
+                        } label: {
+                            Label("Quantize…", systemImage: "cube.transparent")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+
                     Button {
                         viewModel.editingSidecarModel = model
                     } label: {
@@ -3277,7 +3330,275 @@ struct ModelsInspectorSurface: View {
         .sheet(item: $viewModel.editingSidecarModel) { model in
             ModelSidecarEditorSheet(viewModel: viewModel, model: model)
         }
+        .sheet(isPresented: $viewModel.showMLXConverterSheet) {
+            MLXModelConverterSheet(
+                viewModel: viewModel,
+                initialModel: viewModel.convertingSourceModel
+            )
+        }
     }
+}
+
+private struct MLXModelConverterSheet: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    let initialModel: EngineDescription?
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var sourcePath: String = ""
+    @State private var outputPath: String = ""
+    @State private var mode: MLXQuantizationMode = .affine
+    @State private var bits: Int = 4
+    @State private var groupSize: Int = 64
+    @State private var calibration: MLXQuantizationCalibration = .standard
+    @State private var overwriteExisting: Bool = false
+    @State private var isConverting: Bool = false
+    @State private var progressMessage: String = ""
+    @State private var conversionError: String?
+
+    private var activeSpec: MLXConversionSpec {
+        MLXConversionSpec(
+            bits: bits,
+            groupSize: groupSize,
+            mode: mode,
+            calibration: calibration,
+            overwriteExistingOutput: overwriteExisting
+        )
+    }
+
+    private var preflightResult: Result<MLXConversionPlan, Error>? {
+        let src = sourcePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dst = outputPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !src.isEmpty, !dst.isEmpty else { return nil }
+        return Result {
+            try MLXModelConverter.planConversion(
+                from: URL(fileURLWithPath: src),
+                to: URL(fileURLWithPath: dst),
+                spec: activeSpec
+            )
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Pure-Swift MLX Checkpoint Quantizer (MLXLMCommon.convert)")
+                        .font(.headline)
+                    Text("Quantize unquantized BF16/FP16 .safetensors checkpoints in-process without Python")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    TextField("Source .safetensors directory", text: $sourcePath)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption.monospaced())
+                        .onChange(of: sourcePath) {
+                            autoUpdateOutputPathIfEmptyOrDefault()
+                        }
+                    #if os(macOS)
+                    Button("Browse…") {
+                        pickFolder(isOutput: false)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    #endif
+                }
+
+                HStack {
+                    TextField("Output quantized directory", text: $outputPath)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption.monospaced())
+                    #if os(macOS)
+                    Button("Browse…") {
+                        pickFolder(isOutput: true)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    #endif
+                }
+            }
+
+            Divider()
+
+            HStack(spacing: 14) {
+                Picker("Mode", selection: $mode) {
+                    ForEach(MLXQuantizationMode.allCases, id: \.self) { qMode in
+                        Text(qMode.rawValue).tag(qMode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .onChange(of: mode) {
+                    bits = mode.defaultBits
+                    groupSize = mode.defaultGroupSize
+                }
+
+                Picker("Bits", selection: $bits) {
+                    Text("4-bit").tag(4)
+                    Text("8-bit").tag(8)
+                }
+                .pickerStyle(.segmented)
+                .disabled(calibration == .q4Zero)
+
+                Picker("Group Size", selection: $groupSize) {
+                    Text("32").tag(32)
+                    Text("64").tag(64)
+                    Text("128").tag(128)
+                }
+                .pickerStyle(.segmented)
+                .disabled(calibration == .q4Zero)
+            }
+
+            HStack(spacing: 14) {
+                Picker("Calibration", selection: $calibration) {
+                    Text("standard").tag(MLXQuantizationCalibration.standard)
+                    Text("q4_zero (4-bit gs=32 affine)").tag(MLXQuantizationCalibration.q4Zero)
+                }
+                .pickerStyle(.menu)
+                .onChange(of: calibration) {
+                    if calibration == .q4Zero {
+                        mode = .affine
+                        bits = 4
+                        groupSize = 32
+                    }
+                }
+
+                Toggle("Overwrite existing output directory", isOn: $overwriteExisting)
+                    .font(.caption)
+            }
+
+            if let preflightResult {
+                switch preflightResult {
+                case .success(let plan):
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Image(systemName: "checkmark.seal.fill")
+                                .foregroundStyle(.green)
+                            Text("Preflight Ready: \(plan.modelType) (\(plan.isVisionModel ? "VLM" : "LLM")) • \(plan.resolvedBits)-bit \(plan.mode.rawValue) (group_size=\(plan.resolvedGroupSize), \(plan.calibration.rawValue))")
+                                .font(.caption.weight(.semibold))
+                        }
+                        Text("Shards: \(plan.safetensorsFiles.count) .safetensors • Sidecars: \(plan.sidecarFiles.count) files • Reasoning: \(plan.reasoningFormat)")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.green.opacity(0.1)))
+
+                case .failure(let err):
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text(err.localizedDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.1)))
+                }
+            }
+
+            if !progressMessage.isEmpty {
+                HStack(spacing: 8) {
+                    if isConverting {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(progressMessage)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let conversionError {
+                Text(conversionError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            HStack {
+                Button("Close") { dismiss() }
+                    .buttonStyle(.bordered)
+                    .disabled(isConverting)
+                Spacer()
+                Button("Quantize Checkpoint") {
+                    runConversion()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isConverting || (try? preflightResult?.get()) == nil)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 580)
+        .onAppear {
+            if let initialModel {
+                sourcePath = initialModel.modelPath
+                outputPath = "\(initialModel.modelPath)-MLX-\(bits)bit"
+            }
+        }
+    }
+
+    private func autoUpdateOutputPathIfEmptyOrDefault() {
+        let trimmed = sourcePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if outputPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            outputPath = "\(trimmed)-MLX-\(activeSpec.resolvedBits)bit"
+        }
+    }
+
+    private func runConversion() {
+        isConverting = true
+        conversionError = nil
+        progressMessage = "Starting MLX quantization…"
+        let srcURL = URL(fileURLWithPath: sourcePath.trimmingCharacters(in: .whitespacesAndNewlines))
+        let dstURL = URL(fileURLWithPath: outputPath.trimmingCharacters(in: .whitespacesAndNewlines))
+        let spec = activeSpec
+
+        Task {
+            do {
+                let (_, weights) = try await MLXModelConverter.convert(
+                    from: srcURL,
+                    to: dstURL,
+                    spec: spec,
+                    progressHandler: { msg in
+                        Task { @MainActor in
+                            self.progressMessage = msg
+                        }
+                    }
+                )
+                await viewModel.rescanConfiguredModels()
+                isConverting = false
+                progressMessage = "Completed: wrote \(weights.count) quantized .safetensors shard(s) to \(dstURL.lastPathComponent)."
+            } catch {
+                isConverting = false
+                conversionError = error.localizedDescription
+            }
+        }
+    }
+
+    #if os(macOS)
+    private func pickFolder(isOutput: Bool) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = isOutput
+        panel.allowsMultipleSelection = false
+        panel.prompt = isOutput ? "Select Output Folder" : "Select Source Checkpoint"
+        if panel.runModal() == .OK, let url = panel.url {
+            if isOutput {
+                outputPath = url.path
+            } else {
+                sourcePath = url.path
+                autoUpdateOutputPathIfEmptyOrDefault()
+            }
+        }
+    }
+    #endif
 }
 
 private struct ModelSidecarEditorSheet: View {
