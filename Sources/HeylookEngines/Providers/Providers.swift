@@ -362,37 +362,46 @@ public final class SubprocessLifecycleRegistry: @unchecked Sendable {
 }
 #endif
 
-/// Inspector for Apple `coreai-models` `.aimodel` bundles (`metadata.json`).
+/// Inspector for Apple `coreai-models` `.aimodel` bundles (`metadata.json`, supporting both Schema 0.1 and Schema 0.2 nested layouts).
 public struct CoreAIBundleManifest: Codable, Sendable, Equatable {
     public let name: String
     public let kind: String
+    public let schemaVersion: String
     public let vocabSize: Int
     public let maxContextLength: Int
     public let prefillChunkSize: Int
     public let componentNames: [String]
+    public let visionBackbone: String?
+    public let drafterKind: String?
 
     public var hasVisionComponent: Bool {
-        kind.lowercased() == "vlm" || componentNames.contains("vision")
+        kind.lowercased() == "vlm" || visionBackbone != nil || componentNames.contains("vision")
     }
 
     public var hasDrafterComponent: Bool {
-        componentNames.contains("drafter")
+        drafterKind != nil || componentNames.contains("drafter")
     }
 
     public init(
         name: String,
         kind: String = "llm",
+        schemaVersion: String = "0.2",
         vocabSize: Int = 151936,
         maxContextLength: Int = 8192,
         prefillChunkSize: Int = 64,
-        componentNames: [String] = ["main"]
+        componentNames: [String] = ["main"],
+        visionBackbone: String? = nil,
+        drafterKind: String? = nil
     ) {
         self.name = name
         self.kind = kind
+        self.schemaVersion = schemaVersion
         self.vocabSize = vocabSize
         self.maxContextLength = maxContextLength
         self.prefillChunkSize = prefillChunkSize
         self.componentNames = componentNames
+        self.visionBackbone = visionBackbone
+        self.drafterKind = drafterKind
     }
 
     public static func inspect(at bundleURL: URL) throws -> CoreAIBundleManifest {
@@ -404,37 +413,69 @@ public struct CoreAIBundleManifest: Codable, Sendable, Equatable {
             throw CocoaError(.fileReadCorruptFile)
         }
 
-        let name = (json["name"] as? String) ?? bundleURL.deletingPathExtension().lastPathComponent
-        let kind = (json["kind"] as? String) ?? "llm"
+        let schemaVersion = (json["schema_version"] as? String)
+            ?? (json["schemaVersion"] as? String)
+            ?? "0.1"
+        let langDict = json["language"] as? [String: Any]
+        let visionDict = json["vision"] as? [String: Any]
+        let specDict = json["speculative"] as? [String: Any]
+        let assetsDict = json["assets"] as? [String: Any]
+
+        let name = (json["name"] as? String)
+            ?? (json["tokenizer"] as? String)?.components(separatedBy: "/").last
+            ?? bundleURL.deletingPathExtension().lastPathComponent
+        let rawKind = (json["kind"] as? String)
+            ?? (json["model_type"] as? String)
+            ?? (visionDict != nil ? "vlm" : "llm")
         let vocabSize = (json["vocabSize"] as? Int)
             ?? (json["vocab_size"] as? Int)
+            ?? (langDict?["vocab_size"] as? Int)
+            ?? ((langDict?["overrides"] as? [String: Any])?["vocab_size"] as? Int)
             ?? 151936
         let maxContextLength = (json["maxContextLength"] as? Int)
             ?? (json["max_context_length"] as? Int)
+            ?? (langDict?["max_context_length"] as? Int)
             ?? 8192
         let prefillChunkSize = (json["prefillChunkSize"] as? Int)
             ?? (json["prefill_chunk_size"] as? Int)
+            ?? (langDict?["prefill_chunk_size"] as? Int)
             ?? 64
+        let visionBackbone = (visionDict?["backbone"] as? String)
+        let drafterKind = (specDict?["drafter_kind"] as? String)
 
-        var comps: [String] = []
+        var compsSet = Set<String>()
         if let compDict = json["components"] as? [String: Any] {
-            comps = compDict.keys.sorted()
+            compsSet.formUnion(compDict.keys)
         } else if let compArray = json["components"] as? [[String: Any]] {
-            comps = compArray.compactMap { $0["name"] as? String }.sorted()
+            compsSet.formUnion(compArray.compactMap { $0["name"] as? String })
         } else if let compStrings = json["components"] as? [String] {
-            comps = compStrings.sorted()
+            compsSet.formUnion(compStrings)
         }
-        if comps.isEmpty {
-            comps = ["main"]
+        if let assetsDict {
+            for (k, _) in assetsDict where k != "tokenizer_dir" {
+                compsSet.insert(k)
+            }
+        }
+        if visionDict != nil {
+            compsSet.insert("vision")
+        }
+        if specDict != nil {
+            compsSet.insert("drafter")
+        }
+        if compsSet.isEmpty {
+            compsSet.insert("main")
         }
 
         return CoreAIBundleManifest(
             name: name,
-            kind: kind,
+            kind: rawKind,
+            schemaVersion: schemaVersion,
             vocabSize: vocabSize,
             maxContextLength: maxContextLength,
             prefillChunkSize: prefillChunkSize,
-            componentNames: comps
+            componentNames: compsSet.sorted(),
+            visionBackbone: visionBackbone,
+            drafterKind: drafterKind
         )
     }
 }
@@ -456,14 +497,28 @@ enum StreamingPipeline {
         cacheReport: CacheReport,
         speculativeReport: SpeculativeReport? = nil,
         startsInThinking: Bool,
+        reasoningFormat: ReasoningFormat? = nil,
+        thinkingEnabled: Bool = true,
+        strippableSpecialTokens: [String]? = nil,
         computePlacement: ComputePlacement,
         registry: RequestRegistry,
         onComplete: (@Sendable (String) async -> Void)? = nil
     ) -> AsyncThrowingStream<GenerationChunk, Error> {
         AsyncThrowingStream { continuation in
             Task {
-                var reasoningParser = ReasoningParser(startsInThinking: startsInThinking)
-                var stripSpecials = StripSpecials()
+                var reasoningParser: ReasoningParser
+                if let reasoningFormat {
+                    reasoningParser = ReasoningParser(
+                        format: reasoningFormat,
+                        thinkingEnabled: thinkingEnabled,
+                        startsInThinkingOverride: startsInThinking ? true : nil
+                    )
+                } else {
+                    reasoningParser = ReasoningParser(startsInThinking: startsInThinking)
+                }
+                var stripSpecials = StripSpecials(
+                    tokens: strippableSpecialTokens ?? StripSpecials.defaultSpecialTokens
+                )
                 var generatedCount = 0
                 var accumulatedVisibleText = ""
                 let promptTokenCount = cacheReport.promptTokens
@@ -591,6 +646,7 @@ public actor MLXSwiftProvider: InferenceProvider {
     public nonisolated let providerKind: EngineProviderKind = .mlx
     public nonisolated let allowSyntheticFallback: Bool
     private let tokenCounter: (@Sendable (String) -> Int)?
+    private let templateInfo: ModelTemplateInfo
     private var descriptionState: EngineDescription
     private var prefixCache = PrefixCacheTracker()
     private var kvSession = KVCacheSessionState()
@@ -627,6 +683,10 @@ public actor MLXSwiftProvider: InferenceProvider {
         self.tokenCounter = tokenCounter
 
         let dirURL = URL(fileURLWithPath: description.modelPath)
+        self.templateInfo = ModelTemplateInfo.inspect(
+            modelDirectory: dirURL,
+            modelID: description.modelID
+        )
         let sidecar = (try? String(
             contentsOf: dirURL.appendingPathComponent("model.heylook.toml"),
             encoding: .utf8
@@ -749,6 +809,9 @@ public actor MLXSwiftProvider: InferenceProvider {
             cacheReport: cacheReport,
             speculativeReport: specReport,
             startsInThinking: false,
+            reasoningFormat: templateInfo.reasoningFormat,
+            thinkingEnabled: enableThinking,
+            strippableSpecialTokens: Array(templateInfo.strippableSpecialTokens),
             computePlacement: placement,
             registry: registry,
             onComplete: { [weak self] reply in
@@ -771,21 +834,66 @@ public actor MLXSwiftProvider: InferenceProvider {
     }
 
     #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
+    private static func mlxReasoningConfig(from info: ModelTemplateInfo) -> ReasoningConfig? {
+        switch info.reasoningFormat {
+        case .gemmaChannel:
+            return .gemma4
+        case .tagPair(let open, let close, _):
+            let strategy: ReasoningPromptStrategy = if let switchVar = info.thinkingControls.switchVariable {
+                .templateFlag(key: switchVar, defaultOn: info.thinkingControls.defaultEnabled)
+            } else if info.thinkingControls.canDisableThinking {
+                .templateFlag(key: "enable_thinking", defaultOn: info.thinkingControls.defaultEnabled)
+            } else {
+                .alwaysOn
+            }
+            return ReasoningConfig(
+                startDelimiter: open,
+                endDelimiter: close,
+                promptStrategy: strategy,
+                isSpecialToken: info.specialTokens.contains(open)
+            )
+        default:
+            return nil
+        }
+    }
+
     private func ensureContainerLoaded() async throws -> ModelContainer {
         if let loadedContainer {
             return loadedContainer
         }
         let dirURL = URL(fileURLWithPath: descriptionState.modelPath)
         let loader: any TokenizerLoader = #huggingFaceTokenizerLoader()
+        let modelConfig = ModelConfiguration(
+            directory: dirURL,
+            extraEOSTokens: self.templateInfo.strippableSpecialTokens,
+            eosTokenIds: Set(self.templateInfo.eosTokenIDs),
+            reasoningConfig: Self.mlxReasoningConfig(from: self.templateInfo)
+        )
+        let resolvedConfig = modelConfig.resolved(
+            modelDirectory: dirURL,
+            tokenizerDirectory: dirURL
+        )
         let container: ModelContainer
         #if canImport(MLXVLM)
         if descriptionState.supportsVision.value {
-            container = try await VLMModelFactory.shared.loadContainer(from: dirURL, using: loader)
+            let ctx = try await VLMModelFactory.shared._load(
+                configuration: resolvedConfig,
+                tokenizerLoader: loader
+            )
+            container = VLMModelFactory.shared._wrap(ctx)
         } else {
-            container = try await LLMModelFactory.shared.loadContainer(from: dirURL, using: loader)
+            let ctx = try await LLMModelFactory.shared._load(
+                configuration: resolvedConfig,
+                tokenizerLoader: loader
+            )
+            container = LLMModelFactory.shared._wrap(ctx)
         }
         #else
-        container = try await LLMModelFactory.shared.loadContainer(from: dirURL, using: loader)
+        let ctx = try await LLMModelFactory.shared._load(
+            configuration: resolvedConfig,
+            tokenizerLoader: loader
+        )
+        container = LLMModelFactory.shared._wrap(ctx)
         #endif
         loadedContainer = container
         loadedTokenizer = await container.tokenizer
@@ -832,7 +940,13 @@ public actor MLXSwiftProvider: InferenceProvider {
                     }
 
                     var additionalContext: [String: any Sendable] = [:]
-                    additionalContext["enable_thinking"] = enableThinking
+                    let switchKey = self.templateInfo.thinkingControls.switchVariable ?? "enable_thinking"
+                    additionalContext[switchKey] = enableThinking
+                    if let depthVar = self.templateInfo.thinkingControls.depthVariable,
+                       let depthVal = effectiveSampling.thinkingDepth ?? request.thinkingDepth,
+                       !depthVal.isEmpty {
+                        additionalContext[depthVar] = depthVal
+                    }
                     let userInput = UserInput(
                         chat: chatMessages,
                         additionalContext: additionalContext
@@ -857,12 +971,13 @@ public actor MLXSwiftProvider: InferenceProvider {
                     }
                     self.kvSession.cachedTokenCount = max(cacheReport.cachedTokens, lmInput.text.tokens.size)
 
-                    let archLower = descriptionState.architecture.value.lowercased()
-                    let startsInThinking = enableThinking && (
-                        archLower.contains("qwen3") || archLower.contains("deepseek")
+                    var reasoningParser = ReasoningParser(
+                        format: self.templateInfo.reasoningFormat,
+                        thinkingEnabled: enableThinking
                     )
-                    var reasoningParser = ReasoningParser(startsInThinking: startsInThinking)
-                    var stripSpecials = StripSpecials()
+                    var stripSpecials = StripSpecials(
+                        tokens: Array(self.templateInfo.strippableSpecialTokens)
+                    )
                     var generatedCount = 0
                     var promptTokens = cacheReport.promptTokens
                     var promptTPS = 0.0
@@ -994,6 +1109,7 @@ public actor CoreAIProvider: InferenceProvider {
     public nonisolated let modelID: String
     public nonisolated let providerKind: EngineProviderKind = .coreai
     public nonisolated let allowSyntheticFallback: Bool
+    private let templateInfo: ModelTemplateInfo
     private var descriptionState: EngineDescription
     private var prefixCache = PrefixCacheTracker()
     private var bundleManifest: CoreAIBundleManifest?
@@ -1004,6 +1120,11 @@ public actor CoreAIProvider: InferenceProvider {
         self.allowSyntheticFallback = allowSyntheticFallback
         var updatedDesc = description
         let url = URL(fileURLWithPath: description.modelPath)
+        let inspectedTemplate = ModelTemplateInfo.inspect(
+            modelDirectory: url,
+            modelID: description.modelID
+        )
+        self.templateInfo = inspectedTemplate
         if let manifest = try? CoreAIBundleManifest.inspect(at: url) {
             self.bundleManifest = manifest
             if updatedDesc.contextSize.provenance == .derived {
@@ -1031,6 +1152,12 @@ public actor CoreAIProvider: InferenceProvider {
                     supportsEmbeddings: updatedDesc.supportsEmbeddings,
                     supportsThinking: updatedDesc.supportsThinking,
                     thinkingBudget: updatedDesc.thinkingBudget,
+                    reasoningFormat: ProvenanceField(
+                        value: inspectedTemplate.reasoningFormat.wireIdentifier,
+                        provenance: .derived,
+                        effect: .reload
+                    ),
+                    thinkingControls: inspectedTemplate.thinkingControls,
                     templateSource: updatedDesc.templateSource,
                     estimatedMemoryMB: updatedDesc.estimatedMemoryMB,
                     tags: updatedDesc.tags
@@ -1079,7 +1206,7 @@ public actor CoreAIProvider: InferenceProvider {
         let specReport: SpeculativeReport? = hasDrafter
             ? SpeculativeReport(
                 drafterID: "\(modelID)-drafter",
-                mode: "speculative",
+                mode: bundleManifest?.drafterKind ?? "speculative",
                 draftedTokens: 16,
                 acceptedTokens: 13
             )
@@ -1097,6 +1224,9 @@ public actor CoreAIProvider: InferenceProvider {
             cacheReport: cacheReport,
             speculativeReport: specReport,
             startsInThinking: false,
+            reasoningFormat: templateInfo.reasoningFormat,
+            thinkingEnabled: enableThinking,
+            strippableSpecialTokens: Array(templateInfo.strippableSpecialTokens),
             computePlacement: placement,
             registry: registry,
             onComplete: { [weak self] reply in
@@ -1305,6 +1435,36 @@ public struct GGUFSpawnConfig: Codable, Sendable, Equatable {
         let mmproj = HeylookConfig.discoverMMProj(in: dirURL)
         let assignedPort = GGUFPortPool.shared.acquirePort(for: description.modelID)
 
+        // Check primary GGUF header for hybrid-recurrent SSM state (`--cache-ram 8192`) and built-in MTP
+        var ggufHeader: GGUFHeaderReader.HeaderSummary?
+        if dirURL.pathExtension.lowercased() == "gguf" {
+            ggufHeader = GGUFHeaderReader.readFileHeader(at: dirURL)
+        } else if let items = try? FileManager.default.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: nil),
+                  let firstGGUF = items.first(where: { $0.pathExtension.lowercased() == "gguf" && !$0.lastPathComponent.lowercased().contains("mmproj") }) {
+            ggufHeader = GGUFHeaderReader.readFileHeader(at: firstGGUF)
+        }
+
+        let effectiveCacheRAM: Int?
+        if let autoCacheRAMMiB {
+            effectiveCacheRAM = autoCacheRAMMiB
+        } else if ggufHeader?.isHybridRecurrent == true {
+            effectiveCacheRAM = 8192
+        } else {
+            effectiveCacheRAM = nil
+        }
+
+        let unset = Set(resolvedSidecar?.unsetKeys ?? [])
+        let effectiveSpecType: String?
+        if let spec = drafter.specType {
+            effectiveSpecType = spec
+        } else if drafter.draftModelPath == nil,
+                  ggufHeader?.hasBuiltInMTP == true,
+                  !unset.contains("spec_type") {
+            effectiveSpecType = "draft-mtp"
+        } else {
+            effectiveSpecType = nil
+        }
+
         return GGUFSpawnConfig(
             modelPath: description.modelPath,
             port: assignedPort,
@@ -1314,8 +1474,8 @@ public struct GGUFSpawnConfig: Codable, Sendable, Equatable {
             mmprojPath: mmproj,
             chatTemplateFile: templateResolution.resolvedFilePath,
             draftModelPath: drafter.draftModelPath,
-            specType: drafter.specType,
-            cacheRAMMiB: autoCacheRAMMiB
+            specType: effectiveSpecType,
+            cacheRAMMiB: effectiveCacheRAM
         )
     }
 }

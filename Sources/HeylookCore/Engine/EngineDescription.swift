@@ -212,6 +212,8 @@ public struct EngineDescription: Codable, Identifiable, Sendable, Equatable {
     public let supportsEmbeddings: ProvenanceField<Bool>
     public let supportsThinking: ProvenanceField<Bool>
     public let thinkingBudget: ProvenanceField<Int?>
+    public let reasoningFormat: ProvenanceField<String>
+    public let thinkingControls: ThinkingControls?
     public let templateSource: ProvenanceField<String>
     public let estimatedMemoryMB: Int
     public let tags: [String]
@@ -232,6 +234,8 @@ public struct EngineDescription: Codable, Identifiable, Sendable, Equatable {
         supportsEmbeddings: ProvenanceField<Bool> = ProvenanceField(value: false, provenance: .derived, effect: .reload),
         supportsThinking: ProvenanceField<Bool> = ProvenanceField(value: true, provenance: .derived, effect: .perRequest),
         thinkingBudget: ProvenanceField<Int?> = ProvenanceField(value: nil, provenance: .notApplicable, effect: .perRequest),
+        reasoningFormat: ProvenanceField<String> = ProvenanceField(value: "tag_pair", provenance: .derived, effect: .reload),
+        thinkingControls: ThinkingControls? = nil,
         templateSource: ProvenanceField<String> = ProvenanceField(value: "tokenizer_config.json", provenance: .derived, effect: .reload),
         estimatedMemoryMB: Int = 0,
         tags: [String] = []
@@ -251,6 +255,8 @@ public struct EngineDescription: Codable, Identifiable, Sendable, Equatable {
         self.supportsEmbeddings = supportsEmbeddings
         self.supportsThinking = supportsThinking
         self.thinkingBudget = thinkingBudget
+        self.reasoningFormat = reasoningFormat
+        self.thinkingControls = thinkingControls
         self.templateSource = templateSource
         self.estimatedMemoryMB = estimatedMemoryMB
         self.tags = tags

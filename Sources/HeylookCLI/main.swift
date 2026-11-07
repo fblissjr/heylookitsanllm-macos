@@ -98,7 +98,15 @@ struct HeylookCLI {
         print("Discovered \(found.count) models across \(cfg.scanFolders.count) configured folders (\(cfg.explicitModels.count) explicit entries in heylook.toml).")
         for m in found {
             let mtpBadge = m.tags.contains("mtp") ? " [MTP]" : ""
-            print("- [\(m.provider.rawValue)] \(m.modelID)\(mtpBadge) ctx=\(m.contextSize.value) template=\(m.templateSource.value) (\(m.modelPath))")
+            let visionBadge = m.supportsVision.value ? " [vision]" : ""
+            let audioBadge = m.supportsAudio.value ? " [audio]" : ""
+            let depthBadge: String
+            if let depthVar = m.thinkingControls?.depthVariable {
+                depthBadge = " depth=\(depthVar)(\(m.thinkingControls?.depthValues.joined(separator: "|") ?? ""))"
+            } else {
+                depthBadge = ""
+            }
+            print("- [\(m.provider.rawValue)] \(m.modelID)\(mtpBadge)\(visionBadge)\(audioBadge) ctx=\(m.contextSize.value) reasoning=\(m.reasoningFormat.value)\(depthBadge) template=\(m.templateSource.value) (\(m.modelPath))")
         }
     }
 

@@ -110,7 +110,9 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
             maxTokens: kv["max_tokens"]?.intValue,
             seed: kv["seed"]?.intValue,
             thinking: kv["thinking"]?.boolValue ?? kv["enable_thinking"]?.boolValue,
-            thinkingDepth: kv["thinking_depth"]?.stringValue,
+            thinkingDepth: kv["thinking_depth"]?.stringValue
+                ?? kv["reasoning_effort"]?.stringValue
+                ?? kv["reasoning_strength"]?.stringValue,
             thinkingBudget: kv["thinking_budget"]?.intValue
         )
         return config
@@ -490,19 +492,24 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return (nil, nil)
     }
 
-    /// Loads vendor sampling defaults (`temperature`, `top_p`, `top_k`) from `generation_config.json`
-    /// in a model directory (`engine-contract.md` §Sampling).
+    /// Loads vendor sampling defaults (`temperature`, `top_p`, `top_k`, `min_p`) from `generation_config.json`
+    /// or `.gguf` header `general.sampling.*` metadata in a model directory.
     public static func loadVendorSampling(in candidateDir: URL) -> SamplerSettings? {
-        guard let json = loadJSONDictionary(at: candidateDir.appendingPathComponent("generation_config.json")) else {
-            return nil
+        if let json = loadJSONDictionary(at: candidateDir.appendingPathComponent("generation_config.json")) {
+            let temp = (json["temperature"] as? NSNumber)?.doubleValue
+            let topP = (json["top_p"] as? NSNumber)?.doubleValue
+            let topK = (json["top_k"] as? NSNumber)?.intValue
+            let minP = (json["min_p"] as? NSNumber)?.doubleValue
+            if temp != nil || topP != nil || topK != nil || minP != nil {
+                return SamplerSettings(temperature: temp, topP: topP, topK: topK, minP: minP)
+            }
         }
-        let temp = (json["temperature"] as? NSNumber)?.doubleValue
-        let topP = (json["top_p"] as? NSNumber)?.doubleValue
-        let topK = (json["top_k"] as? NSNumber)?.intValue
-        guard temp != nil || topP != nil || topK != nil else {
-            return nil
+        if let ggufURL = firstGGUFFile(in: candidateDir),
+           let header = GGUFHeaderReader.readFileHeader(at: ggufURL),
+           let ggufSampling = header.vendorSampling {
+            return ggufSampling
         }
-        return SamplerSettings(temperature: temp, topP: topP, topK: topK)
+        return nil
     }
 
     /// Derives the per-image vision soft-token budget from `processor_config.json` or `config.json`
@@ -650,16 +657,19 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         in candidateDir: URL?,
         system: String?,
         messages: [(role: String, content: String, thinking: String?)],
-        thinkingEnabled: Bool = false
+        thinkingEnabled: Bool = false,
+        thinkingDepth: String? = nil
     ) -> (prompt: String, source: String) {
         var source = "default_chatml"
         var templateText = ""
         var modelType = ""
+        var templateInfo: ModelTemplateInfo?
 
         if let candidateDir {
             let state = inspectChatTemplate(in: candidateDir, fallbackSource: "default_chatml")
             templateText = state.template
             source = state.source
+            templateInfo = ModelTemplateInfo.inspect(modelDirectory: candidateDir)
             let configURL = candidateDir.appendingPathComponent("config.json")
             if let cfgJSON = loadJSONDictionary(at: configURL),
                let mt = cfgJSON["model_type"] as? String {
@@ -672,24 +682,34 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         }
 
         let usesGemmaTurnMarkers = templateText.contains("<start_of_turn>")
+            || templateText.contains("<|turn>")
             || modelType.contains("gemma")
 
         var lines: [String] = []
+        if let depth = thinkingDepth, !depth.isEmpty,
+           let depthVar = templateInfo?.thinkingControls.depthVariable {
+            lines.append("# \(depthVar) = \(depth)")
+        }
         if usesGemmaTurnMarkers {
+            let isGemma4Channel = (templateInfo?.reasoningFormat == .gemmaChannel(openPrefix: "<|channel>", closeTag: "<channel|>"))
             if let sys = system, !sys.isEmpty {
                 lines.append("<start_of_turn>system\n\(sys)<end_of_turn>")
             }
             for msg in messages {
                 let gemmaRole = msg.role == "assistant" ? "model" : msg.role
                 if let thinking = msg.thinking, !thinking.isEmpty {
-                    lines.append("<start_of_turn>\(gemmaRole)\n<thought>\n\(thinking)\n</thought>\n\(msg.content)<end_of_turn>")
+                    if isGemma4Channel {
+                        lines.append("<start_of_turn>\(gemmaRole)\n<|channel>thought\n\(thinking)<channel|>\(msg.content)<end_of_turn>")
+                    } else {
+                        lines.append("<start_of_turn>\(gemmaRole)\n<thought>\n\(thinking)\n</thought>\n\(msg.content)<end_of_turn>")
+                    }
                 } else {
                     lines.append("<start_of_turn>\(gemmaRole)\n\(msg.content)<end_of_turn>")
                 }
             }
             lines.append("<start_of_turn>model")
             if thinkingEnabled {
-                lines.append("<thought>")
+                lines.append(isGemma4Channel ? "<|channel>thought" : "<thought>")
             }
         } else {
             if let sys = system, !sys.isEmpty {
@@ -926,15 +946,33 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         let isEmbedding = modelID.localizedCaseInsensitiveContains("embed")
             || archString.localizedCaseInsensitiveContains("embedding")
         let mmprojPath = provider == .gguf ? discoverMMProj(in: candidateDir) : nil
-        let hasVision = sidecar?.supportsVision
-            ?? (configJSON?["vision_config"] != nil
-                || mmprojPath != nil
-                || modelID.localizedCaseInsensitiveContains("vl")
-                || modelID.localizedCaseInsensitiveContains("vision")
-                || isEmbedding)
-        let hasAudio = configJSON?["audio_config"] != nil || isEmbedding
+        let mmprojHeader = mmprojPath.flatMap { GGUFHeaderReader.readFileHeader(at: URL(fileURLWithPath: $0)) }
+        let rawHasVision = configJSON?["vision_config"] != nil
+            || mmprojHeader?.hasVisionEncoder == true
+            || mmprojPath != nil
+            || modelID.localizedCaseInsensitiveContains("vl")
+            || modelID.localizedCaseInsensitiveContains("vision")
+            || isEmbedding
+        let hasVision: Bool
+        if let explicitVision = sidecar?.supportsVision {
+            hasVision = explicitVision
+        } else if provider == .mlx,
+                  let modelType = configJSON?["model_type"] as? String,
+                  configJSON?["vision_config"] != nil,
+                  !isEmbedding,
+                  ModelTemplateInfo.mlxSwiftLLMModelTypes.contains(modelType.lowercased()),
+                  !ModelTemplateInfo.supportsMLXSwiftVision(modelType: modelType) {
+            // Checkpoint has vision_config but MLX Swift only registers its model_type in LLMTypeRegistry
+            hasVision = false
+        } else {
+            hasVision = rawHasVision
+        }
+        let hasAudio = configJSON?["audio_config"] != nil
+            || mmprojHeader?.hasAudioEncoder == true
+            || isEmbedding
         let ctxValue = sidecar?.ctxSize
             ?? (configJSON?["max_position_embeddings"] as? Int)
+            ?? ((configJSON?["text_config"] as? [String: Any])?["max_position_embeddings"] as? Int)
             ?? ggufHeader?.contextLength
             ?? 8192
 
@@ -950,15 +988,31 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             templateField = ProvenanceField(value: "tokenizer_config.json", provenance: .derived, effect: .reload)
         }
 
+        let templateInfo = ModelTemplateInfo.inspect(
+            modelDirectory: candidateDir,
+            modelID: modelID
+        )
+        let derivedSupportsThinking: Bool
+        if isEmbedding {
+            derivedSupportsThinking = false
+        } else if templateInfo.templateSource != "default_chatml" {
+            derivedSupportsThinking = templateInfo.thinkingControls.supportsThinking
+        } else {
+            derivedSupportsThinking = true
+        }
+
         var tags = sidecar?.tags ?? []
         let drafter = discoverDrafter(in: candidateDir, provider: provider, sidecar: sidecar)
-        if drafter.draftModelPath != nil || drafter.specType != nil {
+        if drafter.draftModelPath != nil || drafter.specType != nil || ggufHeader?.hasBuiltInMTP == true {
             if !tags.contains("mtp") {
                 tags.append("mtp")
             }
         }
         if hasVision && !tags.contains("vision") {
             tags.append("vision")
+        }
+        if hasAudio && !isEmbedding && !tags.contains("audio") {
+            tags.append("audio")
         }
 
         return EngineDescription(
@@ -1005,7 +1059,7 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 effect: .reload
             ),
             supportsThinking: ProvenanceField(
-                value: sidecar?.supportsThinking ?? (!isEmbedding),
+                value: sidecar?.supportsThinking ?? derivedSupportsThinking,
                 provenance: sidecar?.supportsThinking != nil ? .configured : .derived,
                 effect: .perRequest
             ),
@@ -1014,6 +1068,12 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 provenance: sidecar?.sampling.thinkingBudget != nil ? .configured : .notApplicable,
                 effect: .perRequest
             ),
+            reasoningFormat: ProvenanceField(
+                value: templateInfo.reasoningFormat.wireIdentifier,
+                provenance: .derived,
+                effect: .reload
+            ),
+            thinkingControls: templateInfo.thinkingControls,
             templateSource: templateField,
             tags: tags
         )
@@ -1193,7 +1253,7 @@ enum SimpleTOML {
 }
 
 /// Pure-Swift GGUF v2/v3 binary header reader that inspects magic bytes, version,
-/// tensor/KV counts, and string/integer metadata without spawning a C++ process.
+/// tensor/KV counts, and string/integer/boolean/float metadata without spawning a C++ process.
 public enum GGUFHeaderReader {
     public struct HeaderSummary: Sendable, Equatable {
         public let version: UInt32
@@ -1201,19 +1261,25 @@ public enum GGUFHeaderReader {
         public let metadataKVCount: UInt64
         public let stringMetadata: [String: String]
         public let uintMetadata: [String: UInt64]
+        public let boolMetadata: [String: Bool]
+        public let doubleMetadata: [String: Double]
 
         public init(
             version: UInt32,
             tensorCount: UInt64,
             metadataKVCount: UInt64,
             stringMetadata: [String: String] = [:],
-            uintMetadata: [String: UInt64] = [:]
+            uintMetadata: [String: UInt64] = [:],
+            boolMetadata: [String: Bool] = [:],
+            doubleMetadata: [String: Double] = [:]
         ) {
             self.version = version
             self.tensorCount = tensorCount
             self.metadataKVCount = metadataKVCount
             self.stringMetadata = stringMetadata
             self.uintMetadata = uintMetadata
+            self.boolMetadata = boolMetadata
+            self.doubleMetadata = doubleMetadata
         }
 
         public var architecture: String? {
@@ -1232,6 +1298,50 @@ public enum GGUFHeaderReader {
                 return Int(entry.value)
             }
             return nil
+        }
+
+        public var hasVisionEncoder: Bool {
+            boolMetadata["clip.has_vision_encoder"] == true
+        }
+
+        public var hasAudioEncoder: Bool {
+            boolMetadata["clip.has_audio_encoder"] == true
+        }
+
+        /// True when the GGUF header declares a hybrid-recurrent SSM architecture (`*.ssm.conv_kernel`,
+        /// `*.ssm.inner_size`, or `*.ssm.state_size`), requiring `--cache-ram 8192` in `llama-server`.
+        public var isHybridRecurrent: Bool {
+            uintMetadata.keys.contains { key in
+                key.hasSuffix(".ssm.conv_kernel")
+                    || key.hasSuffix(".ssm.inner_size")
+                    || key.hasSuffix(".ssm.state_size")
+            }
+        }
+
+        /// True when the GGUF header declares built-in Multi-Token Prediction layers (`*.nextn_predict_layers > 0`).
+        public var hasBuiltInMTP: Bool {
+            uintMetadata.contains { key, val in
+                key.hasSuffix(".nextn_predict_layers") && val > 0
+            }
+        }
+
+        /// Extracts vendor sampling recommendations (`general.sampling.*`) embedded in the GGUF header.
+        public var vendorSampling: SamplerSettings? {
+            let temp = doubleMetadata["general.sampling.temp"]
+            let topP = doubleMetadata["general.sampling.top_p"]
+            let minP = doubleMetadata["general.sampling.min_p"]
+            let topK = uintMetadata["general.sampling.top_k"].map(Int.init)
+            let repPen = doubleMetadata["general.sampling.penalty_repeat"]
+            guard temp != nil || topP != nil || minP != nil || topK != nil || repPen != nil else {
+                return nil
+            }
+            return SamplerSettings(
+                temperature: temp,
+                topP: topP,
+                topK: topK,
+                minP: minP,
+                repetitionPenalty: repPen
+            )
         }
     }
 
@@ -1255,6 +1365,8 @@ public enum GGUFHeaderReader {
         var offset = 24
         var strings: [String: String] = [:]
         var uints: [String: UInt64] = [:]
+        var bools: [String: Bool] = [:]
+        var doubles: [String: Double] = [:]
 
         func readUInt32() -> UInt32? {
             guard offset + 4 <= data.count else { return nil }
@@ -1290,9 +1402,15 @@ public enum GGUFHeaderReader {
                 offset += 1
                 if let key { uints[key] = UInt64(b) }
                 return true
-            case 1, 7: // INT8, BOOL
+            case 1: // INT8
                 guard offset + 1 <= data.count else { return false }
                 offset += 1
+                return true
+            case 7: // BOOL
+                guard offset + 1 <= data.count else { return false }
+                let b = data[offset]
+                offset += 1
+                if let key { bools[key] = (b != 0) }
                 return true
             case 2: // UINT16
                 guard offset + 2 <= data.count else { return false }
@@ -1310,9 +1428,15 @@ public enum GGUFHeaderReader {
                 guard let v = readUInt32() else { return false }
                 if let key { uints[key] = UInt64(v) }
                 return true
-            case 5, 6: // INT32, FLOAT32
+            case 5: // INT32
                 guard offset + 4 <= data.count else { return false }
                 offset += 4
+                return true
+            case 6: // FLOAT32
+                guard let bits = readUInt32() else { return false }
+                if let key {
+                    doubles[key] = Double(Float(bitPattern: bits))
+                }
                 return true
             case 8: // STRING
                 guard let str = readString() else { return false }
@@ -1328,9 +1452,15 @@ public enum GGUFHeaderReader {
                 guard let v = readUInt64() else { return false }
                 if let key { uints[key] = v }
                 return true
-            case 11, 12: // INT64, FLOAT64
+            case 11: // INT64
                 guard offset + 8 <= data.count else { return false }
                 offset += 8
+                return true
+            case 12: // FLOAT64
+                guard let bits = readUInt64() else { return false }
+                if let key {
+                    doubles[key] = Double(bitPattern: bits)
+                }
                 return true
             default:
                 return false
@@ -1351,21 +1481,30 @@ public enum GGUFHeaderReader {
             tensorCount: tensorCount,
             metadataKVCount: kvCount,
             stringMetadata: strings,
-            uintMetadata: uints
+            uintMetadata: uints,
+            boolMetadata: bools,
+            doubleMetadata: doubles
         )
     }
 
-    /// Builds a valid GGUF v2/v3 binary header with embedded string and uint32 KV entries.
+    /// Builds a valid GGUF v2/v3 binary header with embedded string, uint32, bool, and float32 KV entries.
     public static func buildMinimalGGUF(
         version: UInt32 = 3,
         tensorCount: UInt64 = 0,
         stringMetadata: [String: String] = [:],
-        uint32Metadata: [String: UInt32] = [:]
+        uint32Metadata: [String: UInt32] = [:],
+        boolMetadata: [String: Bool] = [:],
+        float32Metadata: [String: Float] = [:]
     ) -> Data {
         var data = Data("GGUF".utf8)
         var verLE = version.littleEndian
         var tcLE = tensorCount.littleEndian
-        let totalKV = UInt64(stringMetadata.count + uint32Metadata.count)
+        let totalKV = UInt64(
+            stringMetadata.count
+                + uint32Metadata.count
+                + boolMetadata.count
+                + float32Metadata.count
+        )
         var kvLE = totalKV.littleEndian
 
         withUnsafeBytes(of: &verLE) { data.append(contentsOf: $0) }
@@ -1393,6 +1532,16 @@ public enum GGUFHeaderReader {
             appendString(k)
             appendUInt32(4) // UINT32
             appendUInt32(v)
+        }
+        for (k, v) in boolMetadata.sorted(by: { $0.key < $1.key }) {
+            appendString(k)
+            appendUInt32(7) // BOOL
+            data.append(v ? 1 : 0)
+        }
+        for (k, v) in float32Metadata.sorted(by: { $0.key < $1.key }) {
+            appendString(k)
+            appendUInt32(6) // FLOAT32
+            appendUInt32(v.bitPattern)
         }
         return data
     }

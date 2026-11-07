@@ -1520,7 +1520,6 @@ struct HeylookTests {
         #expect(preview.prompt.contains("<start_of_turn>user"))
 
         // Dynamic port pool assigns non-colliding ports and releases on unload
-        GGUFPortPool.shared.releaseAll()
         let descA = EngineDescription(modelID: "gguf-model-a", provider: .gguf, modelPath: ggufURL.path)
         let descB = EngineDescription(modelID: "gguf-model-b", provider: .gguf, modelPath: ggufURL.path)
         let provA = GGUFSubprocessProvider(description: descA)
@@ -1724,5 +1723,253 @@ struct HeylookTests {
         // Verify unified defaultStoreURL and defaultVectorStoreURL share defaultAppSupportDirectory
         #expect(HeylookConfig.defaultStoreURL.deletingLastPathComponent() == HeylookConfig.defaultAppSupportDirectory)
         #expect(HeylookConfig.defaultVectorStoreURL.deletingLastPathComponent() == HeylookConfig.defaultAppSupportDirectory)
+    }
+
+    @Test("File-derived ModelTemplateInfo, 4-protocol ReasoningParser, CoreAI 0.2 manifest, and GGUF BOOL/FLOAT32/SSM metadata")
+    func testModelTemplateInfoMultiProtocolReasoningParserCoreAISchema02AndGGUFExtendedMetadata() async throws {
+        let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_model_families_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        // 1. Qwen 3.5 / 3.8 template (`<think>` prefill + `enable_thinking`)
+        let qwenInfo = ModelTemplateInfo.analyze(
+            templateText: """
+            {% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}
+            """,
+            specialTokens: ["<|im_end|>"]
+        )
+        #expect(qwenInfo.reasoningFormat == .tagPair(open: "<think>", close: "</think>", prefillsThinking: true))
+        #expect(qwenInfo.thinkingControls.supportsThinking == true)
+        #expect(qwenInfo.thinkingControls.switchVariable == "enable_thinking")
+        #expect(qwenInfo.strippableSpecialTokens.contains("<|im_end|>") == true)
+        #expect(qwenInfo.strippableSpecialTokens.contains("<think>") == false)
+
+        // 2. Gemma 4 template + tokenizer.json (`<|channel>thought\n...<channel|>` + `<turn|>`)
+        let gemma4Dir = tempRoot.appendingPathComponent("Gemma-4-31B-IT", isDirectory: true)
+        try FileManager.default.createDirectory(at: gemma4Dir, withIntermediateDirectories: true)
+        try """
+        {
+          "added_tokens": [
+            {"id": 100, "content": "<|channel>", "special": true},
+            {"id": 101, "content": "<channel|>", "special": true},
+            {"id": 102, "content": "<turn|>", "special": true}
+          ]
+        }
+        """.write(to: gemma4Dir.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try """
+        {% if enable_thinking is defined and enable_thinking %}<|channel>thought\n{% endif %}{{ content }}<turn|>
+        """.write(to: gemma4Dir.appendingPathComponent("chat_template.jinja"), atomically: true, encoding: .utf8)
+
+        let gemma4Info = ModelTemplateInfo.inspect(modelDirectory: gemma4Dir)
+        #expect(gemma4Info.reasoningFormat == .gemmaChannel(openPrefix: "<|channel>", closeTag: "<channel|>"))
+        #expect(gemma4Info.thinkingControls.supportsThinking == true)
+        #expect(gemma4Info.thinkingControls.defaultEnabled == false)
+        #expect(gemma4Info.strippableSpecialTokens.contains("<turn|>") == true)
+        #expect(gemma4Info.strippableSpecialTokens.contains("<|channel>") == false)
+
+        // Stream Gemma 4 labeled channel across chunk boundaries
+        var gemmaParser = ReasoningParser(format: gemma4Info.reasoningFormat, thinkingEnabled: true)
+        var gemmaScrubber = StripSpecials(tokens: Array(gemma4Info.strippableSpecialTokens))
+        let gemmaChunks = ["<|chan", "nel>thought\n", "Step 1: check ", "Gemma 4<chan", "nel|>Final ", "answer<tu", "rn|>"]
+        var gemmaThinking = ""
+        var gemmaText = ""
+        for piece in gemmaChunks {
+            let d = gemmaParser.feed(piece)
+            gemmaThinking += d.thinking
+            gemmaText += gemmaScrubber.feed(d.text)
+        }
+        let gemmaTail = gemmaParser.finalize()
+        gemmaThinking += gemmaTail.thinking
+        gemmaText += gemmaScrubber.feed(gemmaTail.text) + gemmaScrubber.finalize()
+        #expect(gemmaThinking == "Step 1: check Gemma 4")
+        #expect(gemmaText == "Final answer")
+
+        // 3. OpenAI Harmony channel (`<|channel|>analysis<|message|>...` + `reasoning_effort`)
+        let harmonyInfo = ModelTemplateInfo.analyze(
+            templateText: """
+            {% if reasoning_effort in ["low", "medium", "high"] %}<|start|>assistant<|channel|>analysis<|message|>{% endif %}
+            """
+        )
+        #expect(harmonyInfo.reasoningFormat == .harmonyChannel)
+        #expect(harmonyInfo.thinkingControls.depthVariable == "reasoning_effort")
+        #expect(harmonyInfo.thinkingControls.depthValues == ["low", "medium", "high"])
+
+        var harmonyParser = ReasoningParser(format: .harmonyChannel)
+        let harmonyStream = [
+            "<|channel|>analy",
+            "sis<|message|>Weighing ",
+            "tradeoffs<|end|><|start|>assistant<|channel|>fin",
+            "al<|message|>Harmony reply<|end|>"
+        ]
+        var harmonyThinking = ""
+        var harmonyText = ""
+        for piece in harmonyStream {
+            let d = harmonyParser.feed(piece)
+            harmonyThinking += d.thinking
+            harmonyText += d.text
+        }
+        let harmonyTail = harmonyParser.finalize()
+        harmonyThinking += harmonyTail.thinking
+        harmonyText += harmonyTail.text
+        #expect(harmonyThinking == "Weighing tradeoffs")
+        #expect(harmonyText == "Harmony reply")
+
+        // 4. Muse-Glimmer Recipient channel (`to=self<|message|>...<|eom|>` + `reasoning_strength`)
+        let recipientInfo = ModelTemplateInfo.analyze(
+            templateText: """
+            {% if reasoning_strength in ['none', 'low', 'medium', 'high', 'max'] %}to=self<|message|>...<|eom|>to=user<|message|>...<|eot|>{% endif %}
+            """
+        )
+        #expect(recipientInfo.reasoningFormat == .recipientChannel)
+        #expect(recipientInfo.thinkingControls.depthVariable == "reasoning_strength")
+        #expect(recipientInfo.thinkingControls.depthValues == ["none", "low", "medium", "high", "max"])
+
+        var recipientParser = ReasoningParser(format: .recipientChannel)
+        let recipientStream = [
+            "to=se",
+            "lf<|message|>Drafting ",
+            "plan<|eom|><|start|>assistant to=us",
+            "er<|message|>Visible Muse response<|eot|>"
+        ]
+        var recipientThinking = ""
+        var recipientText = ""
+        for piece in recipientStream {
+            let d = recipientParser.feed(piece)
+            recipientThinking += d.thinking
+            recipientText += d.text
+        }
+        let recipientTail = recipientParser.finalize()
+        recipientThinking += recipientTail.thinking
+        recipientText += recipientTail.text
+        #expect(recipientThinking == "Drafting plan")
+        #expect(recipientText == "Visible Muse response")
+
+        // 5. Non-thinking template (e.g. Llama 3.2) -> supportsThinking == false
+        let plainInfo = ModelTemplateInfo.analyze(
+            templateText: "<|begin_of_text|>{% for m in messages %}{{ m.content }}<|eot_id|>{% endfor %}"
+        )
+        #expect(plainInfo.reasoningFormat == .none)
+        #expect(plainInfo.thinkingControls.supportsThinking == false)
+
+        // 6. CoreAI Schema 0.2 nested `.aimodel/metadata.json` inspection
+        let coreaiBundle = tempRoot.appendingPathComponent("Qwen3_5_VLM.aimodel", isDirectory: true)
+        try FileManager.default.createDirectory(at: coreaiBundle, withIntermediateDirectories: true)
+        try """
+        {
+          "schema_version": "0.2",
+          "model_type": "vlm",
+          "tokenizer": "Qwen/Qwen3.5-4B",
+          "assets": {
+            "main": "main.mlmodelc",
+            "vision": "vision.mlmodelc",
+            "drafter": "dflash.mlmodelc",
+            "tokenizer_dir": "tokenizer"
+          },
+          "language": {
+            "max_context_length": 32768,
+            "prefill_chunk_size": 128,
+            "vocab_size": 151936
+          },
+          "vision": {
+            "backbone": "qwen3_5_vit",
+            "token_merge": 2
+          },
+          "speculative": {
+            "drafter_kind": "dflash",
+            "num_prediction_heads": 4
+          }
+        }
+        """.write(to: coreaiBundle.appendingPathComponent("metadata.json"), atomically: true, encoding: .utf8)
+
+        let manifest = try CoreAIBundleManifest.inspect(at: coreaiBundle)
+        #expect(manifest.schemaVersion == "0.2")
+        #expect(manifest.name == "Qwen3.5-4B")
+        #expect(manifest.kind == "vlm")
+        #expect(manifest.maxContextLength == 32768)
+        #expect(manifest.prefillChunkSize == 128)
+        #expect(manifest.hasVisionComponent == true)
+        #expect(manifest.visionBackbone == "qwen3_5_vit")
+        #expect(manifest.hasDrafterComponent == true)
+        #expect(manifest.drafterKind == "dflash")
+
+        // 7. GGUF BOOL (`clip.has_audio_encoder`), FLOAT32 (`general.sampling.temp`), and SSM (`*.ssm.conv_kernel`)
+        let ggufDir = tempRoot.appendingPathComponent("Qwen3.5-Omni-GGUF", isDirectory: true)
+        try FileManager.default.createDirectory(at: ggufDir, withIntermediateDirectories: true)
+        let mainGGUF = GGUFHeaderReader.buildMinimalGGUF(
+            stringMetadata: [
+                "general.architecture": "qwen35",
+                "tokenizer.chat_template": "{% if enable_thinking %}<think>\n{% endif %}",
+            ],
+            uint32Metadata: [
+                "qwen35.context_length": 65536,
+                "qwen35.ssm.conv_kernel": 4,
+                "qwen35.nextn_predict_layers": 1,
+                "general.sampling.top_k": 20,
+            ],
+            float32Metadata: [
+                "general.sampling.temp": 0.6,
+                "general.sampling.top_p": 0.95,
+            ]
+        )
+        let mmprojGGUF = GGUFHeaderReader.buildMinimalGGUF(
+            boolMetadata: [
+                "clip.has_vision_encoder": true,
+                "clip.has_audio_encoder": true,
+            ]
+        )
+        let mainGGUFURL = ggufDir.appendingPathComponent("Qwen3.5-9B-Q8_0.gguf")
+        try mainGGUF.write(to: mainGGUFURL)
+        try mmprojGGUF.write(to: ggufDir.appendingPathComponent("mmproj-Qwen3.5-9B-f16.gguf"))
+
+        let mainHeader = try #require(GGUFHeaderReader.readFileHeader(at: mainGGUFURL))
+        #expect(mainHeader.isHybridRecurrent == true)
+        #expect(mainHeader.hasBuiltInMTP == true)
+        #expect(abs((mainHeader.vendorSampling?.temperature ?? 0) - 0.6) < 1e-4)
+        #expect(mainHeader.vendorSampling?.topK == 20)
+
+        let discoveredGGUF = try #require(HeylookConfig.discoverModels(in: [ggufDir]).first)
+        #expect(discoveredGGUF.supportsVision.value == true)
+        #expect(discoveredGGUF.supportsAudio.value == true)
+        #expect(discoveredGGUF.supportsThinking.value == true)
+        #expect(discoveredGGUF.tags.contains("mtp") == true)
+        #expect(discoveredGGUF.tags.contains("audio") == true)
+
+        // Verify GGUFSpawnConfig.autoSized enables `--cache-ram 8192` and `--spec-type draft-mtp` even with 0 GB extra headroom
+        let spawn = GGUFSpawnConfig.autoSized(for: discoveredGGUF, headroomGB: 2.0)
+        #expect(spawn.cacheRAMMiB == 8192)
+        #expect(spawn.specType == "draft-mtp")
+        GGUFPortPool.shared.releasePort(for: discoveredGGUF.modelID)
+
+        // 8. MessagesRequest decodes both `thinking_depth` and `reasoning_effort` into `samplerOverlay.thinkingDepth`
+        let effortJSON = Data("""
+        {
+          "model": "gpt-oss-20b",
+          "messages": [{"role": "user", "content": "Solve this"}],
+          "reasoning_effort": "high"
+        }
+        """.utf8)
+        let decodedReq = try JSONDecoder().decode(MessagesRequest.self, from: effortJSON)
+        #expect(decodedReq.thinkingDepth == "high")
+        #expect(decodedReq.samplerOverlay.thinkingDepth == "high")
+
+        // 9. CoreAIProvider reports `dflash` speculative mode from Schema 0.2 manifest
+        let coreaiProvider = CoreAIProvider(
+            description: EngineDescription(
+                modelID: "qwen3.5-coreai",
+                provider: .coreai,
+                modelPath: coreaiBundle.path
+            )
+        )
+        var coreaiFinal = GenerationChunk()
+        for try await chunk in await coreaiProvider.generate(
+            requestID: "req_coreai_02",
+            request: decodedReq,
+            effectiveSampling: decodedReq.samplerOverlay,
+            registry: RequestRegistry()
+        ) {
+            coreaiFinal = chunk
+        }
+        #expect(coreaiFinal.speculativeReport?.mode == "dflash")
     }
 }

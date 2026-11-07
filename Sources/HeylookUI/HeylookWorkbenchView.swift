@@ -456,6 +456,7 @@ public final class HeylookWorkbenchViewModel {
             minP: userOverriddenSamplerKeys.contains("min_p") ? minPOverride : nil,
             maxTokens: userOverriddenSamplerKeys.contains("max_tokens") ? maxTokensOverride : nil,
             thinking: userOverriddenSamplerKeys.contains("thinking") ? thinkingEnabled : nil,
+            thinkingDepth: userOverriddenSamplerKeys.contains("thinking_depth") ? thinkingDepth : nil,
             thinkingBudget: userOverriddenSamplerKeys.contains("thinking_budget") ? thinkingBudgetOverride : nil
         )
         return HeylookConfig.resolveEffectiveSampling(
@@ -634,6 +635,7 @@ public final class HeylookWorkbenchViewModel {
                 minP: minPOverride,
                 stream: true,
                 thinking: thinkingEnabled,
+                thinkingDepth: activeModelDescription?.thinkingControls?.depthVariable != nil ? thinkingDepth : nil,
                 thinkingBudget: thinkingBudgetOverride
             )
             let resolved = currentResolvedSamplers
@@ -726,7 +728,8 @@ public final class HeylookWorkbenchViewModel {
             in: dirURL,
             system: draftSystemPrompt.isEmpty ? nil : draftSystemPrompt,
             messages: turns,
-            thinkingEnabled: thinkingEnabled
+            thinkingEnabled: thinkingEnabled,
+            thinkingDepth: activeModelDescription?.thinkingControls?.depthVariable != nil ? thinkingDepth : nil
         ).prompt
     }
 
@@ -1469,6 +1472,22 @@ struct ChatWorkbenchSurface: View {
                     Toggle("Thinking", isOn: $viewModel.thinkingEnabled)
                         .toggleStyle(.button)
                         .controlSize(.small)
+                        .disabled(viewModel.activeModelDescription?.supportsThinking.value == false)
+
+                    if let controls = viewModel.activeModelDescription?.thinkingControls,
+                       !controls.depthValues.isEmpty {
+                        Picker("Depth", selection: $viewModel.thinkingDepth) {
+                            ForEach(controls.depthValues, id: \.self) { level in
+                                Text(level).tag(level)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .controlSize(.small)
+                        .frame(maxWidth: 210)
+                        .onChange(of: viewModel.thinkingDepth) { _, _ in
+                            viewModel.userOverriddenSamplerKeys.insert("thinking_depth")
+                        }
+                    }
 
                     Spacer()
 
@@ -3160,7 +3179,7 @@ struct ModelsInspectorSurface: View {
                 }
 
                 Text(
-                    "Path: \(model.modelPath) • Arch: \(model.architecture.value) (\(model.architecture.provenance.rawValue)) • Quant: \(model.quantization.value) • Ctx: \(model.contextSize.value) (\(model.contextSize.provenance.rawValue)) • Template: \(model.templateSource.value)"
+                    "Path: \(model.modelPath) • Arch: \(model.architecture.value) (\(model.architecture.provenance.rawValue)) • Quant: \(model.quantization.value) • Ctx: \(model.contextSize.value) (\(model.contextSize.provenance.rawValue)) • Reasoning: \(model.reasoningFormat.value) • Template: \(model.templateSource.value)"
                 )
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)

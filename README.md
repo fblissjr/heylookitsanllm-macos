@@ -5,9 +5,9 @@ Native Swift 6.2 personal inference workbench, multimodal media/embedding finder
 ## Key Capabilities
 
 - **Unified 3-Tier Engine Contract + Remote Sync (`HeylookEngines`)**:
-  - **`MLXSwiftProvider`**: In-process Metal GPU LLM, VLM (`CIImage` inputs), and `EmbeddingGemma 2` inference (`mlx-swift` + `mlx-swift-lm` with `default.metallib` & `#huggingFaceTokenizerLoader()`), automatic prompt prefix caching (`PrefixCacheTracker`), `startsInThinking` for `qwen3` / `deepseek` reasoning checkpoints, per-tower ANE offload (`ANECoreMLRuntime`), and deterministic `unload()` (`MLX.GPU.clearCache()`).
-  - **`CoreAIProvider`**: In-process execution of `.aimodel` bundles (`CoreAILanguageModels`, `CoreAISpeech`, `CoreAIDiffusion`) and `argmax-oss-swift` (`WhisperKit`, `TTSKit`, `SpeakerKit`) on the Apple Neural Engine and GPU with `SpeculativeReport` telemetry.
-  - **`GGUFSubprocessProvider` (macOS)**: Crash-isolated `llama-server` subprocess per loaded model (`-np 1`) managed by `SubprocessLifecycleRegistry` (`SIGTERM` -> `SIGKILL` + `atexit` teardown on unload, LRU eviction, or server stop), with 192 GB auto-sizing (`-ub 2048`, `-cram`), 4-rung `chat_template` ladder (`chat_template_path` > `chat_template.heylook.jinja` > `chat_template.jinja` > `gguf_embedded`), automatic `[MTP]` speculative drafter pairing (`dspark`, `-MTP-`, `-assistant`), `--mmproj` vision projector discovery, multi-turn `reasoning_content` forwarding, and mid-stream `/v1/chat/completions/control` `reasoning_end`.
+  - **`MLXSwiftProvider`**: In-process Metal GPU LLM, VLM (`CIImage` inputs), and `EmbeddingGemma 2` inference (`mlx-swift` + `mlx-swift-lm` with `default.metallib` & `#huggingFaceTokenizerLoader()`), file-derived `ModelTemplateInfo` (`extraEOSTokens`, `eosTokenIds`, `ReasoningConfig`, and `reasoning_effort`/`reasoning_strength` depth controls), 4-protocol `ReasoningParser` (`.tagPair`, `.gemmaChannel`, `.harmonyChannel`, `.recipientChannel`), automatic prompt prefix caching (`PrefixCacheTracker`), per-tower ANE offload (`ANECoreMLRuntime`), and deterministic `unload()` (`MLX.GPU.clearCache()`).
+  - **`CoreAIProvider`**: In-process execution of Schema `0.1` and `0.2` `.aimodel` bundles (`CoreAILanguageModels`, `CoreAISpeech`, `CoreAIDiffusion`) and `argmax-oss-swift` (`WhisperKit`, `TTSKit`, `SpeakerKit`) on the Apple Neural Engine and GPU with `dflash` / `mtp` `SpeculativeReport` telemetry.
+  - **`GGUFSubprocessProvider` (macOS)**: Crash-isolated `llama-server` subprocess per loaded model (`-np 1`) managed by `SubprocessLifecycleRegistry` (`SIGTERM` -> `SIGKILL` + `atexit` teardown on unload, LRU eviction, or server stop), with 192 GB auto-sizing (`-ub 2048`, `-cram`, and hybrid-recurrent SSM `--cache-ram 8192`), 4-rung `chat_template` ladder (`chat_template_path` > `chat_template.heylook.jinja` > `chat_template.jinja` > `gguf_embedded`), automatic `[MTP]` speculative drafter pairing (`dspark`, `-MTP-`, `-assistant`, and built-in `*.nextn_predict_layers`), `--mmproj` vision/audio projector discovery, multi-turn `reasoning_content` forwarding, and mid-stream `/v1/chat/completions/control` `reasoning_end`.
   - **`RemoteHeylookProvider`**: Connects the native `iOS 27.2+` app (or secondary Mac) to a Mac Studio `HeylookServer` over HTTP/SSE with Bonjour `_heylook._tcp` auto-discovery (`BonjourServiceBrowser`) alongside local on-device ANE/MLX models.
 - **Dual-Lane Heterogeneous Compute Scheduler (`ComputeScheduler`)**:
   - Serializes heavy Metal GPU generation through a FIFO `GenerationGate` (`max_queue_depth`, HTTP `503 model_overloaded` on overflow), automatically invokes `provider.unload()` on unpinned GPU LRU eviction or `unloadAllModels()`, and lets ANE-resident models (`EmbeddingGemma 2` ANE towers, `CoreAI` ANE `.aimodel` assets, speech models) run concurrently on the Neural Engine without evicting pinned 192 GB GPU models.
@@ -27,7 +27,7 @@ Native Swift 6.2 personal inference workbench, multimodal media/embedding finder
 ## Quick Start
 
 ```bash
-# Fast SwiftPM build & 24-suite verification run
+# Fast SwiftPM build & 26-suite verification run
 swift build
 swift test
 swift run heylook-cli eval-lab
@@ -58,4 +58,5 @@ swift run heylook-cli eval-lab
 - [VISION.md](./VISION.md) — Core principles and project boundaries.
 - [AGENTS.md](./AGENTS.md) — Operating guide and repository rules.
 - [docs/wiki/architecture_overview.md](./docs/wiki/architecture_overview.md) — System topology and subsystem deep dive.
+- [docs/wiki/model_family_onboarding.md](./docs/wiki/model_family_onboarding.md) — 100% Swift model-family support matrix, file-derived `ModelTemplateInfo`, and Tier 1 / Tier 2 porting playbooks.
 - [docs/project/CURRENT.md](./docs/project/CURRENT.md) & [docs/project/TODO.md](./docs/project/TODO.md) — Status and roadmap.

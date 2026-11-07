@@ -114,3 +114,20 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
   - Added `POST /v1/conversations/{id}/voice-generate` (`ConversationVoiceGenerateRequest` + `event: heylook_voice_transcribed` + `event: heylook_saved`) in `HeylookRouter` and `HeylookWorkbenchViewModel.sendVoiceTurn(wavData:)` combining ANE speech transcription with disconnect-resilient server-owned generation.
 - [x] **10.4 Verification Suite**:
   - Expanded `HeylookTests` to **24/24** passing unit, lifecycle, and wire-contract suites (`0.144s`).
+
+---
+
+## Phase 11: Zero-Hardcoding Pure-Swift Model Family Onboarding (Done)
+
+- [x] **11.1 File-Derived `ModelTemplateInfo` & `ThinkingControls` (`HeylookCore`)**:
+  - Added `ModelTemplateInfo`, `ReasoningFormat` (`.tagPair`, `.gemmaChannel`, `.harmonyChannel`, `.recipientChannel`, `.none`), and `ThinkingControls` (`supportsThinking`, `canDisableThinking`, `defaultEnabled`, `switchVariable`, `depthVariable`, `depthValues`), inspecting `chat_template.jinja`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`, and `VLMTypeRegistry` / `LLMTypeRegistry` model types without hardcoded model-family branches.
+- [x] **11.2 4-Protocol `ReasoningParser` & Dynamic `StripSpecials`**:
+  - Upgraded `ReasoningParser` to stream `.tagPair` (`<think>...</think>`), `.gemmaChannel` (`<|channel>thought\n...<channel|>`), `.harmonyChannel` (`<|channel|>analysis<|message|>...`), and `.recipientChannel` (`to=self<|message|>...<|eom|>`) across arbitrary token chunk boundaries, and seeded `StripSpecials` from checkpoint-declared special tokens (`<turn|>`, `<|eot|>`, `<|eom|>`).
+- [x] **11.3 `CoreAIBundleManifest` Schema 0.2 & `GGUFHeaderReader` Extended KV Metadata**:
+  - Added `coreai-models` Schema 0.2 nested `metadata.json` support (`language.*`, `vision.backbone`, `speculative.drafter_kind`, `assets.*`) in `CoreAIBundleManifest`, wired `CoreAIProvider` to report `drafterKind` (`dflash` / `mtp`) and `ModelTemplateInfo` provenance, and extended `GGUFHeaderReader` to parse `BOOL` (`clip.has_vision_encoder`, `clip.has_audio_encoder`), `FLOAT32`/`FLOAT64` (`general.sampling.*`), hybrid-recurrent SSM (`*.ssm.*` -> `--cache-ram 8192`), and built-in MTP (`*.nextn_predict_layers` -> `--spec-type draft-mtp`).
+- [x] **11.4 End-to-End Wire, Provider & SwiftUI `ThinkingControls` Integration**:
+  - Wired `thinking_depth` and `reasoning_effort` decoding on `MessagesRequest` into `SamplerCascade`, connected `ModelTemplateInfo` (`extraEOSTokens`, `eosTokenIds`, `ReasoningConfig`, and `depthVariable` `additionalContext`) into `MLXSwiftProvider`, and added dynamic **Think** toggle disabling and **Depth** segmented picker (`low`/`medium`/`high`/`max`) to `HeylookWorkbenchView` and `heylook-cli models`.
+- [x] **11.5 Model Family Onboarding & Porting Playbook (`docs/wiki/model_family_onboarding.md`)**:
+  - Documented the 3-tier pure-Swift model support matrix and step-by-step playbooks for porting new architectures to Tier 1 (`mlx-swift-lm`) and Tier 2 (`coreai-models` / ANE).
+- [x] **11.6 Verification Suite**:
+  - Expanded `HeylookTests` to **26/26** passing unit, lifecycle, and wire-contract suites (`0.155s`).

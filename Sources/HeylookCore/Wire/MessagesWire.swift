@@ -179,6 +179,7 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
     public var minP: Double?
     public var stream: Bool?
     public var thinking: Bool?
+    public var thinkingDepth: String?
     public var thinkingBudget: Int?
     public var stopSequences: [String]?
 
@@ -193,6 +194,8 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         case minP = "min_p"
         case stream
         case thinking
+        case thinkingDepth = "thinking_depth"
+        case reasoningEffort = "reasoning_effort"
         case thinkingBudget = "thinking_budget"
         case stopSequences = "stop_sequences"
     }
@@ -208,6 +211,7 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         minP: Double? = nil,
         stream: Bool? = false,
         thinking: Bool? = nil,
+        thinkingDepth: String? = nil,
         thinkingBudget: Int? = nil,
         stopSequences: [String]? = nil
     ) {
@@ -221,8 +225,44 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         self.minP = minP
         self.stream = stream
         self.thinking = thinking
+        self.thinkingDepth = thinkingDepth
         self.thinkingBudget = thinkingBudget
         self.stopSequences = stopSequences
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.model = try container.decode(String.self, forKey: .model)
+        self.messages = try container.decode([MessageTurn].self, forKey: .messages)
+        self.system = try container.decodeIfPresent(String.self, forKey: .system)
+        self.maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens)
+        self.temperature = try container.decodeIfPresent(Double.self, forKey: .temperature)
+        self.topP = try container.decodeIfPresent(Double.self, forKey: .topP)
+        self.topK = try container.decodeIfPresent(Int.self, forKey: .topK)
+        self.minP = try container.decodeIfPresent(Double.self, forKey: .minP)
+        self.stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
+        self.thinking = try container.decodeIfPresent(Bool.self, forKey: .thinking)
+        self.thinkingDepth = try container.decodeIfPresent(String.self, forKey: .thinkingDepth)
+            ?? container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        self.thinkingBudget = try container.decodeIfPresent(Int.self, forKey: .thinkingBudget)
+        self.stopSequences = try container.decodeIfPresent([String].self, forKey: .stopSequences)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(model, forKey: .model)
+        try container.encode(messages, forKey: .messages)
+        try container.encodeIfPresent(system, forKey: .system)
+        try container.encodeIfPresent(maxTokens, forKey: .maxTokens)
+        try container.encodeIfPresent(temperature, forKey: .temperature)
+        try container.encodeIfPresent(topP, forKey: .topP)
+        try container.encodeIfPresent(topK, forKey: .topK)
+        try container.encodeIfPresent(minP, forKey: .minP)
+        try container.encodeIfPresent(stream, forKey: .stream)
+        try container.encodeIfPresent(thinking, forKey: .thinking)
+        try container.encodeIfPresent(thinkingDepth, forKey: .thinkingDepth)
+        try container.encodeIfPresent(thinkingBudget, forKey: .thinkingBudget)
+        try container.encodeIfPresent(stopSequences, forKey: .stopSequences)
     }
 
     public var samplerOverlay: SamplerSettings {
@@ -233,6 +273,7 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
             minP: minP,
             maxTokens: maxTokens,
             thinking: thinking,
+            thinkingDepth: thinkingDepth,
             thinkingBudget: thinkingBudget,
             stopSequences: stopSequences
         )
