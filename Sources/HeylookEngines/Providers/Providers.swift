@@ -20,6 +20,7 @@ import MLXVLM
 
 #if canImport(CoreAILanguageModels)
 import CoreAILanguageModels
+import Tokenizers
 #endif
 
 /// Re-export `HeylookCore.GGUFHeaderReader` for callers importing `HeylookEngines`.
@@ -834,40 +835,21 @@ public actor MLXSwiftProvider: InferenceProvider {
     }
 
     #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
-    private static func mlxReasoningConfig(from info: ModelTemplateInfo) -> ReasoningConfig? {
-        switch info.reasoningFormat {
-        case .gemmaChannel:
-            return .gemma4
-        case .tagPair(let open, let close, _):
-            let strategy: ReasoningPromptStrategy = if let switchVar = info.thinkingControls.switchVariable {
-                .templateFlag(key: switchVar, defaultOn: info.thinkingControls.defaultEnabled)
-            } else if info.thinkingControls.canDisableThinking {
-                .templateFlag(key: "enable_thinking", defaultOn: info.thinkingControls.defaultEnabled)
-            } else {
-                .alwaysOn
-            }
-            return ReasoningConfig(
-                startDelimiter: open,
-                endDelimiter: close,
-                promptStrategy: strategy,
-                isSpecialToken: info.specialTokens.contains(open)
-            )
-        default:
-            return nil
-        }
-    }
-
     private func ensureContainerLoaded() async throws -> ModelContainer {
         if let loadedContainer {
             return loadedContainer
         }
         let dirURL = URL(fileURLWithPath: descriptionState.modelPath)
         let loader: any TokenizerLoader = #huggingFaceTokenizerLoader()
+        // Pass `reasoningConfig: nil` so `mlx-swift-lm` yields raw token chunks without running a
+        // competing internal `StreamingReasoningParser`; `HeylookCore.ReasoningParser` handles all
+        // 4 reasoning protocols (`.tagPair`, `.gemmaChannel`, `.harmonyChannel`, `.recipientChannel`)
+        // and mid-stream `forceEndReasoning()` in a single canonical pipeline.
         let modelConfig = ModelConfiguration(
             directory: dirURL,
             extraEOSTokens: self.templateInfo.strippableSpecialTokens,
             eosTokenIds: Set(self.templateInfo.eosTokenIDs),
-            reasoningConfig: Self.mlxReasoningConfig(from: self.templateInfo)
+            reasoningConfig: nil
         )
         let resolvedConfig = modelConfig.resolved(
             modelDirectory: dirURL,
@@ -876,11 +858,27 @@ public actor MLXSwiftProvider: InferenceProvider {
         let container: ModelContainer
         #if canImport(MLXVLM)
         if descriptionState.supportsVision.value {
-            let ctx = try await VLMModelFactory.shared._load(
-                configuration: resolvedConfig,
-                tokenizerLoader: loader
-            )
-            container = VLMModelFactory.shared._wrap(ctx)
+            do {
+                let ctx = try await VLMModelFactory.shared._load(
+                    configuration: resolvedConfig,
+                    tokenizerLoader: loader
+                )
+                container = VLMModelFactory.shared._wrap(ctx)
+            } catch {
+                // If a checkpoint ships a `vision_config` stub in `config.json` but its `model_type`
+                // is only registered in `LLMTypeRegistry`, fall back to `LLMModelFactory` and record
+                // `.observed` `supportsVision = false`.
+                let ctx = try await LLMModelFactory.shared._load(
+                    configuration: resolvedConfig,
+                    tokenizerLoader: loader
+                )
+                container = LLMModelFactory.shared._wrap(ctx)
+                descriptionState.supportsVision = ProvenanceField(
+                    value: false,
+                    provenance: .observed,
+                    effect: .reload
+                )
+            }
         } else {
             let ctx = try await LLMModelFactory.shared._load(
                 configuration: resolvedConfig,
@@ -960,16 +958,38 @@ public actor MLXSwiftProvider: InferenceProvider {
                         repetitionContextSize: effectiveSampling.repetitionContextSize ?? 64
                     )
 
-                    if let existingCaches = self.cachedKVCaches, cacheReport.outcome == .reused {
-                        for cache in existingCaches where cache.isTrimmable && cache.offset > cacheReport.cachedTokens {
-                            _ = cache.trim(cache.offset - cacheReport.cachedTokens)
+                    let totalPromptTokens = lmInput.text.tokens.size
+                    let existingCaches = self.cachedKVCaches
+                    let (stream, updatedCaches): (AsyncStream<Generation>, [KVCache]) = try await container.perform { context in
+                        let activeCaches: [KVCache]
+                        let effectiveInput: LMInput
+                        if cacheReport.outcome == .reused,
+                           let existingCaches,
+                           lmInput.image == nil,
+                           lmInput.video == nil,
+                           lmInput.audio == nil,
+                           cacheReport.cachedTokens > 0,
+                           cacheReport.cachedTokens < totalPromptTokens
+                        {
+                            for cache in existingCaches where cache.isTrimmable && cache.offset > cacheReport.cachedTokens {
+                                _ = cache.trim(cache.offset - cacheReport.cachedTokens)
+                            }
+                            activeCaches = existingCaches
+                            effectiveInput = LMInput(text: lmInput.text[cacheReport.cachedTokens...])
+                        } else {
+                            activeCaches = context.model.newCache(parameters: genParams)
+                            effectiveInput = lmInput
                         }
-                    } else {
-                        self.cachedKVCaches = await container.perform { context in
-                            context.model.newCache(parameters: genParams)
-                        }
+                        let genStream = try MLXLMCommon.generate(
+                            input: effectiveInput,
+                            cache: activeCaches,
+                            parameters: genParams,
+                            context: context
+                        )
+                        return (genStream, activeCaches)
                     }
-                    self.kvSession.cachedTokenCount = max(cacheReport.cachedTokens, lmInput.text.tokens.size)
+                    self.cachedKVCaches = updatedCaches
+                    self.kvSession.cachedTokenCount = max(cacheReport.cachedTokens, totalPromptTokens)
 
                     var reasoningParser = ReasoningParser(
                         format: self.templateInfo.reasoningFormat,
@@ -985,7 +1005,6 @@ public actor MLXSwiftProvider: InferenceProvider {
                     var visibleReply = ""
                     let memGB = Double(HardwareMemoryMonitor.snapshot().processResidentMB) / 1024.0
 
-                    let stream = try await container.generate(input: lmInput, parameters: genParams)
                     for await event in stream {
                         let state = await registry.state(for: requestID)
                         if state.isAborted || Task.isCancelled {
@@ -1115,6 +1134,12 @@ public actor CoreAIProvider: InferenceProvider {
     private var bundleManifest: CoreAIBundleManifest?
     private var unloadCount: Int = 0
 
+    #if canImport(CoreAILanguageModels)
+    private var loadedCoreAIBundle: LanguageModelBundle?
+    private var loadedCoreAITokenizer: (any Tokenizer)?
+    private var loadedCoreAIEngine: (any InferenceEngine)?
+    #endif
+
     public init(description: EngineDescription, allowSyntheticFallback: Bool = true) {
         self.modelID = description.modelID
         self.allowSyntheticFallback = allowSyntheticFallback
@@ -1179,6 +1204,14 @@ public actor CoreAIProvider: InferenceProvider {
         unloadCount += 1
         prefixCache.reset()
         descriptionState.isLoaded = false
+        #if canImport(CoreAILanguageModels)
+        if let engine = loadedCoreAIEngine {
+            try? await engine.reset()
+        }
+        loadedCoreAIEngine = nil
+        loadedCoreAITokenizer = nil
+        loadedCoreAIBundle = nil
+        #endif
     }
 
     public func generate(
@@ -1212,6 +1245,24 @@ public actor CoreAIProvider: InferenceProvider {
             )
             : nil
 
+        #if canImport(CoreAILanguageModels)
+        if let mainComp = bundleManifest?.mainComponent,
+           FileManager.default.fileExists(
+               atPath: URL(fileURLWithPath: descriptionState.modelPath).appendingPathComponent(mainComp).path
+           ) {
+            return generateWithCoreAIEngine(
+                requestID: requestID,
+                request: request,
+                effectiveSampling: effectiveSampling,
+                cacheReport: cacheReport,
+                speculativeReport: specReport,
+                enableThinking: enableThinking,
+                placement: placement,
+                registry: registry
+            )
+        }
+        #endif
+
         var tokens: [String] = []
         if enableThinking {
             tokens.append(contentsOf: ["<think>", "Running CoreAI .aimodel state graph on ANE...", "</think>\n"])
@@ -1238,6 +1289,174 @@ public actor CoreAIProvider: InferenceProvider {
     private func recordAssistantTurn(_ reply: String) {
         prefixCache.recordAssistantReply(reply)
     }
+
+    #if canImport(CoreAILanguageModels)
+    private func ensureCoreAILoaded() async throws -> (LanguageModelBundle, any Tokenizer, any InferenceEngine) {
+        if let b = loadedCoreAIBundle, let t = loadedCoreAITokenizer, let e = loadedCoreAIEngine {
+            return (b, t, e)
+        }
+        let bundleURL = URL(fileURLWithPath: descriptionState.modelPath)
+        let bundle = try LanguageModelBundle(at: bundleURL)
+        let tokenizer = try await bundle.loadTokenizer()
+        let runner = CoreAIRunner(bundle: bundle)
+        let engine = try await runner.makeInferenceEngine()
+        loadedCoreAIBundle = bundle
+        loadedCoreAITokenizer = tokenizer
+        loadedCoreAIEngine = engine
+        descriptionState.isLoaded = true
+        return (bundle, tokenizer, engine)
+    }
+
+    private func generateWithCoreAIEngine(
+        requestID: String,
+        request: MessagesRequest,
+        effectiveSampling: SamplerSettings,
+        cacheReport: CacheReport,
+        speculativeReport: SpeculativeReport?,
+        enableThinking: Bool,
+        placement: ComputePlacement,
+        registry: RequestRegistry
+    ) -> AsyncThrowingStream<GenerationChunk, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    let (_, tokenizer, engine) = try await self.ensureCoreAILoaded()
+                    let rendered = HeylookConfig.renderPromptPreview(
+                        in: URL(fileURLWithPath: self.descriptionState.modelPath),
+                        system: request.system,
+                        messages: request.messages.map { ($0.role, $0.content, $0.thinking) },
+                        thinkingEnabled: enableThinking,
+                        thinkingDepth: effectiveSampling.thinkingDepth ?? request.thinkingDepth
+                    )
+                    let promptTokenIds = tokenizer.encode(text: rendered.prompt)
+                    let samplingCfg = SamplingConfiguration(
+                        temperature: effectiveSampling.temperature ?? 0.7,
+                        topK: effectiveSampling.topK,
+                        topP: effectiveSampling.topP,
+                        minP: effectiveSampling.minP,
+                        repetitionPenalty: effectiveSampling.repetitionPenalty,
+                        repetitionPenaltyWindow: effectiveSampling.repetitionContextSize,
+                        seed: effectiveSampling.seed.map { UInt64(bitPattern: Int64($0)) }
+                    )
+                    let maxTokens = effectiveSampling.maxTokens ?? 2048
+
+                    var reasoningParser = ReasoningParser(
+                        format: self.templateInfo.reasoningFormat,
+                        thinkingEnabled: enableThinking
+                    )
+                    var stripSpecials = StripSpecials(
+                        tokens: Array(self.templateInfo.strippableSpecialTokens)
+                    )
+                    let eosSet = Set(self.templateInfo.eosTokenIDs)
+                    var generatedCount = 0
+                    var visibleReply = ""
+                    let startTime = Date.timeIntervalSinceReferenceDate
+                    var firstTokenTime: TimeInterval?
+                    let memGB = Double(HardwareMemoryMonitor.snapshot().processResidentMB) / 1024.0
+
+                    let tokenStream = try await engine.generate(
+                        with: promptTokenIds.map(Int32.init),
+                        samplingConfiguration: samplingCfg,
+                        inferenceOptions: .extend(maxTokens: maxTokens)
+                    )
+                    for try await step in tokenStream {
+                        let state = await registry.state(for: requestID)
+                        if state.isAborted || Task.isCancelled {
+                            try? await engine.cancel()
+                            let flushed = reasoningParser.finalize()
+                            let cleanText = stripSpecials.feed(flushed.text) + stripSpecials.finalize()
+                            continuation.yield(
+                                GenerationChunk(
+                                    text: cleanText,
+                                    thinking: flushed.thinking,
+                                    tokenCount: generatedCount,
+                                    promptTokens: promptTokenIds.count,
+                                    peakMemoryGB: memGB,
+                                    stopReason: .cancelled,
+                                    cacheReport: cacheReport,
+                                    activeComputePlacement: placement
+                                )
+                            )
+                            continuation.finish()
+                            return
+                        }
+                        if state.isReasoningEndRequested && !reasoningParser.reasoningEndedForced {
+                            let forced = reasoningParser.forceEndReasoning()
+                            let cleanForced = stripSpecials.feed(forced.text)
+                            visibleReply.append(cleanForced)
+                            if !cleanForced.isEmpty || !forced.thinking.isEmpty {
+                                continuation.yield(
+                                    GenerationChunk(
+                                        text: cleanForced,
+                                        thinking: forced.thinking,
+                                        tokenCount: generatedCount,
+                                        promptTokens: promptTokenIds.count,
+                                        peakMemoryGB: memGB,
+                                        activeComputePlacement: placement
+                                    )
+                                )
+                            }
+                        }
+                        let tokenInt = Int(step.tokenId)
+                        if tokenInt == tokenizer.eosTokenId || eosSet.contains(tokenInt) {
+                            break
+                        }
+                        if firstTokenTime == nil {
+                            firstTokenTime = Date.timeIntervalSinceReferenceDate
+                        }
+                        generatedCount += 1
+                        let piece = tokenizer.decode(tokens: [tokenInt])
+                        let delta = reasoningParser.feed(piece)
+                        let cleanText = stripSpecials.feed(delta.text)
+                        visibleReply.append(cleanText)
+                        if !cleanText.isEmpty || !delta.thinking.isEmpty {
+                            continuation.yield(
+                                GenerationChunk(
+                                    text: cleanText,
+                                    thinking: delta.thinking,
+                                    tokenCount: generatedCount,
+                                    promptTokens: promptTokenIds.count,
+                                    peakMemoryGB: memGB,
+                                    activeComputePlacement: placement
+                                )
+                            )
+                        }
+                    }
+
+                    let endTime = Date.timeIntervalSinceReferenceDate
+                    let promptElapsed = max(1e-4, (firstTokenTime ?? endTime) - startTime)
+                    let genElapsed = max(1e-4, endTime - (firstTokenTime ?? startTime))
+                    let promptTPS = Double(promptTokenIds.count) / promptElapsed
+                    let genTPS = Double(generatedCount) / genElapsed
+
+                    let tail = reasoningParser.finalize()
+                    let tailText = stripSpecials.feed(tail.text) + stripSpecials.finalize()
+                    visibleReply.append(tailText)
+                    self.recordAssistantTurn(visibleReply)
+
+                    continuation.yield(
+                        GenerationChunk(
+                            text: tailText,
+                            thinking: tail.thinking,
+                            tokenCount: generatedCount,
+                            promptTokens: promptTokenIds.count,
+                            generationTPS: genTPS,
+                            promptTPS: promptTPS,
+                            peakMemoryGB: memGB,
+                            stopReason: .endTurn,
+                            cacheReport: cacheReport,
+                            speculativeReport: speculativeReport,
+                            activeComputePlacement: placement
+                        )
+                    )
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+    #endif
 
     /// Result of transcribing a 16 kHz mono WAV utterance on the ANE lane (`CoreAIProvider` / `WhisperKit`)
     /// without acquiring the Metal GPU `GenerationGate`.
@@ -1525,6 +1744,7 @@ public actor GGUFSubprocessProvider: InferenceProvider {
     public nonisolated let modelID: String
     public nonisolated let providerKind: EngineProviderKind = .gguf
     public nonisolated let allowSyntheticFallback: Bool
+    private var templateInfo: ModelTemplateInfo
     private var descriptionState: EngineDescription
     public nonisolated let spawnConfig: GGUFSpawnConfig
     private var prefixCache = PrefixCacheTracker()
@@ -1543,6 +1763,10 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         self.descriptionState = description
         self.spawnConfig = spawnConfig ?? GGUFSpawnConfig.autoSized(for: description)
         self.allowSyntheticFallback = allowSyntheticFallback
+        self.templateInfo = ModelTemplateInfo.inspect(
+            modelDirectory: URL(fileURLWithPath: description.modelPath),
+            modelID: description.modelID
+        )
     }
 
     /// Builds the `llama-server` CLI flag array matching `llama_server_provider.py`.
@@ -1759,7 +1983,8 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         )
     }
 
-    /// Upgrades `descriptionState.contextSize` and `descriptionState.templateSource` to `.observed`
+    /// Upgrades `descriptionState.contextSize` and `descriptionState.templateSource` (plus
+    /// `reasoningFormat` and `thinkingControls` when `props.chatTemplate` is present) to `.observed`
     /// provenance from `llama-server` `GET /props`.
     public func applyObservedProps(_ props: GGUFServerProps) {
         let newCtx = (props.contextSize ?? 0) > 0
@@ -1768,6 +1993,18 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         let newTmpl = (props.chatTemplate?.isEmpty == false)
             ? ProvenanceField(value: "llama-server:/props", provenance: .observed, effect: .reload)
             : descriptionState.templateSource
+        if let observedTemplate = props.chatTemplate, !observedTemplate.isEmpty {
+            self.templateInfo = ModelTemplateInfo.analyze(
+                templateText: observedTemplate,
+                specialTokens: self.templateInfo.specialTokens,
+                eosTokenIDs: self.templateInfo.eosTokenIDs,
+                templateSource: "llama-server:/props",
+                modelID: descriptionState.modelID
+            )
+        }
+        let newReasoningFmt: ProvenanceField<String> = (props.chatTemplate?.isEmpty == false)
+            ? ProvenanceField(value: self.templateInfo.reasoningFormat.wireIdentifier, provenance: .observed, effect: .reload)
+            : descriptionState.reasoningFormat
         descriptionState = EngineDescription(
             modelID: descriptionState.modelID,
             provider: descriptionState.provider,
@@ -1784,6 +2021,8 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             supportsEmbeddings: descriptionState.supportsEmbeddings,
             supportsThinking: descriptionState.supportsThinking,
             thinkingBudget: descriptionState.thinkingBudget,
+            reasoningFormat: newReasoningFmt,
+            thinkingControls: self.templateInfo.thinkingControls,
             templateSource: newTmpl,
             estimatedMemoryMB: descriptionState.estimatedMemoryMB,
             tags: descriptionState.tags
@@ -1864,6 +2103,9 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             rawTokens: tokens,
             cacheReport: cacheReport,
             startsInThinking: false,
+            reasoningFormat: templateInfo.reasoningFormat,
+            thinkingEnabled: enableThinking,
+            strippableSpecialTokens: Array(templateInfo.strippableSpecialTokens),
             computePlacement: .ggufSubprocess,
             registry: registry,
             onComplete: { [weak self] reply in
@@ -1945,8 +2187,17 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                     urlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
                     let wireMessages = Self.buildOpenAIChatMessages(from: request)
+                    let activeTemplate = self.templateInfo
+                    var templateKwargs: [String: Any] = [
+                        activeTemplate.thinkingControls.switchVariable ?? "enable_thinking": enableThinking
+                    ]
+                    if let depthVar = activeTemplate.thinkingControls.depthVariable,
+                       let depthVal = effectiveSampling.thinkingDepth ?? request.thinkingDepth,
+                       !depthVal.isEmpty {
+                        templateKwargs[depthVar] = depthVal
+                    }
 
-                    let body: [String: Any] = [
+                    var body: [String: Any] = [
                         "messages": wireMessages,
                         "stream": true,
                         "cache_prompt": true,
@@ -1955,8 +2206,17 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                         "top_k": effectiveSampling.topK ?? 40,
                         "min_p": effectiveSampling.minP ?? 0.0,
                         "max_tokens": effectiveSampling.maxTokens ?? 2048,
-                        "chat_template_kwargs": ["enable_thinking": enableThinking],
+                        "chat_template_kwargs": templateKwargs,
                     ]
+                    if let repPen = effectiveSampling.repetitionPenalty {
+                        body["repeat_penalty"] = repPen
+                    }
+                    if let presPen = effectiveSampling.presencePenalty {
+                        body["presence_penalty"] = presPen
+                    }
+                    if let seed = effectiveSampling.seed {
+                        body["seed"] = seed
+                    }
                     urlReq.httpBody = try JSONSerialization.data(withJSONObject: body)
 
                     let (bytes, _) = try await URLSession.shared.bytes(for: urlReq)
@@ -1969,13 +2229,24 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                     var draftedTokens: Int?
                     var acceptedTokens: Int?
                     var visibleReply = ""
+                    var reasoningParser = ReasoningParser(
+                        format: activeTemplate.reasoningFormat,
+                        thinkingEnabled: enableThinking
+                    )
+                    var stripSpecials = StripSpecials(
+                        tokens: Array(activeTemplate.strippableSpecialTokens)
+                    )
                     let memGB = Double(HardwareMemoryMonitor.snapshot().processResidentMB) / 1024.0
 
                     for try await line in bytes.lines {
                         let state = await registry.state(for: requestID)
                         if state.isAborted || Task.isCancelled {
+                            let flushed = reasoningParser.finalize()
+                            let cleanText = stripSpecials.feed(flushed.text) + stripSpecials.finalize()
                             continuation.yield(
                                 GenerationChunk(
+                                    text: cleanText,
+                                    thinking: flushed.thinking,
                                     tokenCount: generatedCount,
                                     promptTokens: promptTokens,
                                     generationTPS: generationTPS,
@@ -1996,6 +2267,25 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                             ctrlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
                             ctrlReq.httpBody = Data("{\"action\":\"reasoning_end\"}".utf8)
                             _ = try? await URLSession.shared.data(for: ctrlReq)
+                            if !reasoningParser.reasoningEndedForced {
+                                let forced = reasoningParser.forceEndReasoning()
+                                let cleanForced = stripSpecials.feed(forced.text)
+                                visibleReply.append(cleanForced)
+                                if !cleanForced.isEmpty || !forced.thinking.isEmpty {
+                                    continuation.yield(
+                                        GenerationChunk(
+                                            text: cleanForced,
+                                            thinking: forced.thinking,
+                                            tokenCount: generatedCount,
+                                            promptTokens: promptTokens,
+                                            generationTPS: generationTPS,
+                                            promptTPS: promptTPS,
+                                            peakMemoryGB: memGB,
+                                            activeComputePlacement: .ggufSubprocess
+                                        )
+                                    )
+                                }
+                            }
                         }
 
                         guard let delta = Self.parseOpenAISSEDataLine(line) else { continue }
@@ -2006,12 +2296,14 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                         if let d = delta.draftedTokens { draftedTokens = d }
                         if let a = delta.acceptedTokens { acceptedTokens = a }
 
-                        if !delta.content.isEmpty || !delta.reasoningContent.isEmpty {
+                        if !delta.reasoningContent.isEmpty {
+                            // `llama-server` already split reasoning into `reasoning_content`
                             generatedCount += 1
-                            visibleReply.append(delta.content)
+                            let cleanText = stripSpecials.feed(delta.content)
+                            visibleReply.append(cleanText)
                             continuation.yield(
                                 GenerationChunk(
-                                    text: delta.content,
+                                    text: cleanText,
                                     thinking: delta.reasoningContent,
                                     tokenCount: generatedCount,
                                     promptTokens: promptTokens,
@@ -2021,9 +2313,31 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                                     activeComputePlacement: .ggufSubprocess
                                 )
                             )
+                        } else if !delta.content.isEmpty {
+                            generatedCount += 1
+                            let parsed = reasoningParser.feed(delta.content)
+                            let cleanText = stripSpecials.feed(parsed.text)
+                            visibleReply.append(cleanText)
+                            if !cleanText.isEmpty || !parsed.thinking.isEmpty {
+                                continuation.yield(
+                                    GenerationChunk(
+                                        text: cleanText,
+                                        thinking: parsed.thinking,
+                                        tokenCount: generatedCount,
+                                        promptTokens: promptTokens,
+                                        generationTPS: generationTPS,
+                                        promptTPS: promptTPS,
+                                        peakMemoryGB: memGB,
+                                        activeComputePlacement: .ggufSubprocess
+                                    )
+                                )
+                            }
                         }
                     }
 
+                    let tail = reasoningParser.finalize()
+                    let tailText = stripSpecials.feed(tail.text) + stripSpecials.finalize()
+                    visibleReply.append(tailText)
                     self.recordAssistantTurn(visibleReply)
                     let finalCache = CacheReport(
                         promptTokens: promptTokens,
@@ -2033,12 +2347,19 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                         cause: cachedTokens > 0 ? nil : fallbackCacheReport.cause
                     )
                     let specReport: SpeculativeReport? = if let d = draftedTokens, let a = acceptedTokens, d > 0 {
-                        SpeculativeReport(drafterID: cfg.draftModelPath ?? "drafter", mode: "draft", draftedTokens: d, acceptedTokens: a)
+                        SpeculativeReport(
+                            drafterID: cfg.draftModelPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "\(self.modelID)-drafter",
+                            mode: cfg.specType ?? "draft",
+                            draftedTokens: d,
+                            acceptedTokens: a
+                        )
                     } else {
                         nil
                     }
                     continuation.yield(
                         GenerationChunk(
+                            text: tailText,
+                            thinking: tail.thinking,
                             tokenCount: generatedCount,
                             promptTokens: promptTokens,
                             generationTPS: generationTPS,
@@ -2203,8 +2524,15 @@ public actor RemoteHeylookProvider: InferenceProvider {
                     wireReq.temperature = effectiveSampling.temperature
                     wireReq.topP = effectiveSampling.topP
                     wireReq.topK = effectiveSampling.topK
+                    wireReq.minP = effectiveSampling.minP
                     wireReq.maxTokens = effectiveSampling.maxTokens
+                    wireReq.repetitionPenalty = effectiveSampling.repetitionPenalty
+                    wireReq.repetitionContextSize = effectiveSampling.repetitionContextSize
+                    wireReq.presencePenalty = effectiveSampling.presencePenalty
+                    wireReq.seed = effectiveSampling.seed
                     wireReq.thinking = effectiveSampling.thinking
+                    wireReq.thinkingBudget = effectiveSampling.thinkingBudget
+                    wireReq.thinkingDepth = effectiveSampling.thinkingDepth ?? request.thinkingDepth
                     urlReq.httpBody = try JSONEncoder().encode(wireReq)
 
                     if useStream {

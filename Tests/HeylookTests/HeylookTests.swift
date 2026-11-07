@@ -1971,5 +1971,42 @@ struct HeylookTests {
             coreaiFinal = chunk
         }
         #expect(coreaiFinal.speculativeReport?.mode == "dflash")
+
+        // 10. File-derived vision detection (`ModelTemplateInfo.hasVisionConfiguration`) and 4-protocol `renderPromptPreview`
+        #expect(ModelTemplateInfo.hasVisionConfiguration(in: coreaiBundle) == true)
+
+        let harmonyDir = tempRoot.appendingPathComponent("gpt-oss-harmony", isDirectory: true)
+        try FileManager.default.createDirectory(at: harmonyDir, withIntermediateDirectories: true)
+        #expect(ModelTemplateInfo.hasVisionConfiguration(in: harmonyDir) == false)
+        try "{% if reasoning_effort in ['low', 'medium', 'high'] %}<|channel|>analysis<|message|>...<|end|>{% endif %}".write(
+            to: harmonyDir.appendingPathComponent("chat_template.jinja"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let harmonyPreview = HeylookConfig.renderPromptPreview(
+            in: harmonyDir,
+            system: "Be concise.",
+            messages: [(role: "user", content: "Test Harmony", thinking: nil)],
+            thinkingEnabled: true,
+            thinkingDepth: "high"
+        )
+        #expect(harmonyPreview.source == "chat_template.jinja")
+        #expect(harmonyPreview.prompt.contains("# reasoning_effort = high"))
+        #expect(harmonyPreview.prompt.contains("<|start|>user<|message|>Test Harmony<|end|>"))
+        #expect(harmonyPreview.prompt.contains("<|channel|>analysis<|message|>"))
+
+        // 11. GGUFSubprocessProvider.applyObservedProps upgrades `reasoningFormat` and `thinkingControls` to `.observed`
+        let ggufProv = GGUFSubprocessProvider(description: discoveredGGUF)
+        let harmonyProps = GGUFSubprocessProvider.GGUFServerProps(
+            contextSize: 131072,
+            chatTemplate: "{% if reasoning_effort in ['low', 'medium', 'high'] %}<|channel|>analysis<|message|>...<|end|>{% endif %}",
+            totalSlots: 1
+        )
+        await ggufProv.applyObservedProps(harmonyProps)
+        let observedGGUFDesc = await ggufProv.describe()
+        #expect(observedGGUFDesc.reasoningFormat.value == "harmony")
+        #expect(observedGGUFDesc.reasoningFormat.provenance == .observed)
+        #expect(observedGGUFDesc.thinkingControls?.depthVariable == "reasoning_effort")
+        await ggufProv.unload()
     }
 }

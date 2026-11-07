@@ -684,47 +684,111 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         let usesGemmaTurnMarkers = templateText.contains("<start_of_turn>")
             || templateText.contains("<|turn>")
             || modelType.contains("gemma")
+        let reasoningFormat = templateInfo?.reasoningFormat ?? .tagPair(open: "<think>", close: "</think>", prefillsThinking: false)
 
         var lines: [String] = []
         if let depth = thinkingDepth, !depth.isEmpty,
            let depthVar = templateInfo?.thinkingControls.depthVariable {
             lines.append("# \(depthVar) = \(depth)")
         }
-        if usesGemmaTurnMarkers {
-            let isGemma4Channel = (templateInfo?.reasoningFormat == .gemmaChannel(openPrefix: "<|channel>", closeTag: "<channel|>"))
+
+        switch reasoningFormat {
+        case .harmonyChannel:
+            if let sys = system, !sys.isEmpty {
+                lines.append("<|start|>system<|message|>\(sys)<|end|>")
+            }
+            for msg in messages {
+                if msg.role == "assistant" {
+                    if let thinking = msg.thinking, !thinking.isEmpty {
+                        lines.append("<|start|>assistant<|channel|>analysis<|message|>\(thinking)<|end|>")
+                    }
+                    lines.append("<|start|>assistant<|channel|>final<|message|>\(msg.content)<|end|>")
+                } else {
+                    lines.append("<|start|>\(msg.role)<|message|>\(msg.content)<|end|>")
+                }
+            }
+            lines.append("<|start|>assistant")
+            if thinkingEnabled {
+                lines.append("<|channel|>analysis<|message|>")
+            }
+
+        case .recipientChannel:
+            if let sys = system, !sys.isEmpty {
+                lines.append("<|bos|><|start|>system<|message|>\(sys)<|eot|>")
+            }
+            for msg in messages {
+                if msg.role == "assistant" {
+                    if let thinking = msg.thinking, !thinking.isEmpty {
+                        lines.append("<|start|>assistant to=self<|message|>\(thinking)<|eom|>")
+                    }
+                    lines.append("<|start|>assistant to=user<|message|>\(msg.content)<|eot|>")
+                } else {
+                    lines.append("<|start|>\(msg.role)<|message|>\(msg.content)<|eot|>")
+                }
+            }
+            lines.append("<|start|>assistant")
+            if thinkingEnabled {
+                lines.append("to=self<|message|>")
+            }
+
+        case .gemmaChannel(let openPrefix, let closeTag):
             if let sys = system, !sys.isEmpty {
                 lines.append("<start_of_turn>system\n\(sys)<end_of_turn>")
             }
             for msg in messages {
                 let gemmaRole = msg.role == "assistant" ? "model" : msg.role
                 if let thinking = msg.thinking, !thinking.isEmpty {
-                    if isGemma4Channel {
-                        lines.append("<start_of_turn>\(gemmaRole)\n<|channel>thought\n\(thinking)<channel|>\(msg.content)<end_of_turn>")
-                    } else {
-                        lines.append("<start_of_turn>\(gemmaRole)\n<thought>\n\(thinking)\n</thought>\n\(msg.content)<end_of_turn>")
-                    }
+                    lines.append("<start_of_turn>\(gemmaRole)\n\(openPrefix)thought\n\(thinking)\(closeTag)\(msg.content)<end_of_turn>")
                 } else {
                     lines.append("<start_of_turn>\(gemmaRole)\n\(msg.content)<end_of_turn>")
                 }
             }
             lines.append("<start_of_turn>model")
             if thinkingEnabled {
-                lines.append(isGemma4Channel ? "<|channel>thought" : "<thought>")
+                lines.append("\(openPrefix)thought")
             }
-        } else {
-            if let sys = system, !sys.isEmpty {
-                lines.append("<|im_start|>system\n\(sys)<|im_end|>")
+
+        case .tagPair, .none:
+            let effectiveOpen: String
+            let effectiveClose: String
+            if case .tagPair(let openTag, let closeTag, _) = reasoningFormat {
+                effectiveOpen = openTag
+                effectiveClose = closeTag
+            } else {
+                effectiveOpen = "<think>"
+                effectiveClose = "</think>"
             }
-            for msg in messages {
-                if let thinking = msg.thinking, !thinking.isEmpty {
-                    lines.append("<|im_start|>\(msg.role)\n<think>\n\(thinking)\n</think>\n\(msg.content)<|im_end|>")
-                } else {
-                    lines.append("<|im_start|>\(msg.role)\n\(msg.content)<|im_end|>")
+            if usesGemmaTurnMarkers {
+                if let sys = system, !sys.isEmpty {
+                    lines.append("<start_of_turn>system\n\(sys)<end_of_turn>")
                 }
-            }
-            lines.append("<|im_start|>assistant")
-            if thinkingEnabled {
-                lines.append("<think>")
+                for msg in messages {
+                    let gemmaRole = msg.role == "assistant" ? "model" : msg.role
+                    if let thinking = msg.thinking, !thinking.isEmpty {
+                        lines.append("<start_of_turn>\(gemmaRole)\n\(effectiveOpen)\n\(thinking)\n\(effectiveClose)\n\(msg.content)<end_of_turn>")
+                    } else {
+                        lines.append("<start_of_turn>\(gemmaRole)\n\(msg.content)<end_of_turn>")
+                    }
+                }
+                lines.append("<start_of_turn>model")
+                if thinkingEnabled {
+                    lines.append(effectiveOpen)
+                }
+            } else {
+                if let sys = system, !sys.isEmpty {
+                    lines.append("<|im_start|>system\n\(sys)<|im_end|>")
+                }
+                for msg in messages {
+                    if let thinking = msg.thinking, !thinking.isEmpty {
+                        lines.append("<|im_start|>\(msg.role)\n\(effectiveOpen)\n\(thinking)\n\(effectiveClose)\n\(msg.content)<|im_end|>")
+                    } else {
+                        lines.append("<|im_start|>\(msg.role)\n\(msg.content)<|im_end|>")
+                    }
+                }
+                lines.append("<|im_start|>assistant")
+                if thinkingEnabled {
+                    lines.append(effectiveOpen)
+                }
             }
         }
         return (lines.joined(separator: "\n"), source)
@@ -947,26 +1011,11 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             || archString.localizedCaseInsensitiveContains("embedding")
         let mmprojPath = provider == .gguf ? discoverMMProj(in: candidateDir) : nil
         let mmprojHeader = mmprojPath.flatMap { GGUFHeaderReader.readFileHeader(at: URL(fileURLWithPath: $0)) }
-        let rawHasVision = configJSON?["vision_config"] != nil
+        let rawHasVision = ModelTemplateInfo.hasVisionConfiguration(in: candidateDir, configJSON: configJSON)
             || mmprojHeader?.hasVisionEncoder == true
             || mmprojPath != nil
-            || modelID.localizedCaseInsensitiveContains("vl")
-            || modelID.localizedCaseInsensitiveContains("vision")
             || isEmbedding
-        let hasVision: Bool
-        if let explicitVision = sidecar?.supportsVision {
-            hasVision = explicitVision
-        } else if provider == .mlx,
-                  let modelType = configJSON?["model_type"] as? String,
-                  configJSON?["vision_config"] != nil,
-                  !isEmbedding,
-                  ModelTemplateInfo.mlxSwiftLLMModelTypes.contains(modelType.lowercased()),
-                  !ModelTemplateInfo.supportsMLXSwiftVision(modelType: modelType) {
-            // Checkpoint has vision_config but MLX Swift only registers its model_type in LLMTypeRegistry
-            hasVision = false
-        } else {
-            hasVision = rawHasVision
-        }
+        let hasVision = sidecar?.supportsVision ?? rawHasVision
         let hasAudio = configJSON?["audio_config"] != nil
             || mmprojHeader?.hasAudioEncoder == true
             || isEmbedding
@@ -976,6 +1025,10 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             ?? ggufHeader?.contextLength
             ?? 8192
 
+        let templateInfo = ModelTemplateInfo.inspect(
+            modelDirectory: candidateDir,
+            modelID: modelID
+        )
         let templateField: ProvenanceField<String>
         if provider == .gguf {
             let ownTemplate = resolveGGUFTemplate(in: candidateDir, sidecar: sidecar)
@@ -985,13 +1038,15 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 templateField = ownTemplate.source
             }
         } else {
-            templateField = ProvenanceField(value: "tokenizer_config.json", provenance: .derived, effect: .reload)
+            let resolvedSource = templateInfo.templateSource == "default_chatml"
+                ? "tokenizer_config.json"
+                : templateInfo.templateSource
+            templateField = ProvenanceField(
+                value: resolvedSource,
+                provenance: resolvedSource == "chat_template.heylook.jinja" ? .configured : .derived,
+                effect: .reload
+            )
         }
-
-        let templateInfo = ModelTemplateInfo.inspect(
-            modelDirectory: candidateDir,
-            modelID: modelID
-        )
         let derivedSupportsThinking: Bool
         if isEmbedding {
             derivedSupportsThinking = false

@@ -177,6 +177,10 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
     public var topP: Double?
     public var topK: Int?
     public var minP: Double?
+    public var repetitionPenalty: Double?
+    public var repetitionContextSize: Int?
+    public var presencePenalty: Double?
+    public var seed: Int?
     public var stream: Bool?
     public var thinking: Bool?
     public var thinkingDepth: String?
@@ -192,6 +196,10 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         case topP = "top_p"
         case topK = "top_k"
         case minP = "min_p"
+        case repetitionPenalty = "repetition_penalty"
+        case repetitionContextSize = "repetition_context_size"
+        case presencePenalty = "presence_penalty"
+        case seed
         case stream
         case thinking
         case thinkingDepth = "thinking_depth"
@@ -209,6 +217,10 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         topP: Double? = nil,
         topK: Int? = nil,
         minP: Double? = nil,
+        repetitionPenalty: Double? = nil,
+        repetitionContextSize: Int? = nil,
+        presencePenalty: Double? = nil,
+        seed: Int? = nil,
         stream: Bool? = false,
         thinking: Bool? = nil,
         thinkingDepth: String? = nil,
@@ -223,6 +235,10 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         self.topP = topP
         self.topK = topK
         self.minP = minP
+        self.repetitionPenalty = repetitionPenalty
+        self.repetitionContextSize = repetitionContextSize
+        self.presencePenalty = presencePenalty
+        self.seed = seed
         self.stream = stream
         self.thinking = thinking
         self.thinkingDepth = thinkingDepth
@@ -240,6 +256,10 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         self.topP = try container.decodeIfPresent(Double.self, forKey: .topP)
         self.topK = try container.decodeIfPresent(Int.self, forKey: .topK)
         self.minP = try container.decodeIfPresent(Double.self, forKey: .minP)
+        self.repetitionPenalty = try container.decodeIfPresent(Double.self, forKey: .repetitionPenalty)
+        self.repetitionContextSize = try container.decodeIfPresent(Int.self, forKey: .repetitionContextSize)
+        self.presencePenalty = try container.decodeIfPresent(Double.self, forKey: .presencePenalty)
+        self.seed = try container.decodeIfPresent(Int.self, forKey: .seed)
         self.stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
         self.thinking = try container.decodeIfPresent(Bool.self, forKey: .thinking)
         self.thinkingDepth = try container.decodeIfPresent(String.self, forKey: .thinkingDepth)
@@ -258,6 +278,10 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
         try container.encodeIfPresent(topP, forKey: .topP)
         try container.encodeIfPresent(topK, forKey: .topK)
         try container.encodeIfPresent(minP, forKey: .minP)
+        try container.encodeIfPresent(repetitionPenalty, forKey: .repetitionPenalty)
+        try container.encodeIfPresent(repetitionContextSize, forKey: .repetitionContextSize)
+        try container.encodeIfPresent(presencePenalty, forKey: .presencePenalty)
+        try container.encodeIfPresent(seed, forKey: .seed)
         try container.encodeIfPresent(stream, forKey: .stream)
         try container.encodeIfPresent(thinking, forKey: .thinking)
         try container.encodeIfPresent(thinkingDepth, forKey: .thinkingDepth)
@@ -271,7 +295,11 @@ public struct MessagesRequest: Codable, Sendable, Equatable {
             topP: topP,
             topK: topK,
             minP: minP,
+            repetitionPenalty: repetitionPenalty,
+            repetitionContextSize: repetitionContextSize,
+            presencePenalty: presencePenalty,
             maxTokens: maxTokens,
+            seed: seed,
             thinking: thinking,
             thinkingDepth: thinkingDepth,
             thinkingBudget: thinkingBudget,

@@ -105,52 +105,39 @@ public struct ModelTemplateInfo: Sendable, Equatable {
     public let eosTokenIDs: [Int]
     public let templateSource: String
 
-    /// Known `model_type` values registered in `mlx-swift-lm` `VLMTypeRegistry` (`VLMModelFactory.swift`).
-    public static let mlxSwiftVLMModelTypes: Set<String> = [
-        "paligemma",
-        "qwen2_vl",
-        "qwen2_5_vl",
-        "qwen3_vl",
-        "qwen3_vl_moe",
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_8",
-        "qwen3_8_moe",
-        "gemma3",
-        "gemma4",
-        "gemma4_unified",
-        "muse_glimmer",
-        "pixtral",
-        "mistral3",
-        "lfm2_vl",
-        "glm_ocr",
-        "idefics3",
-        "smolvlm",
-        "fastvlm",
-        "llava_qwen2",
-    ]
-
-    /// Known `model_type` values registered in `mlx-swift-lm` `LLMTypeRegistry` (`LLMModelFactory.swift`).
-    public static let mlxSwiftLLMModelTypes: Set<String> = [
-        "mistral", "llama", "phi", "phi3", "phimoe",
-        "gemma", "gemma2", "gemma3", "gemma3_text", "gemma3n",
-        "gemma4", "gemma4_unified", "gemma4_text",
-        "qwen2", "qwen3", "qwen3_moe", "qwen3_next",
-        "qwen3_5", "qwen3_5_moe", "qwen3_5_text",
-        "qwen3_8", "qwen3_8_moe", "qwen3_8_text",
-        "starcoder2", "cohere", "openelm", "internlm2", "deepseek_v2", "deepseek_v3",
-        "granite", "granitemoehybrid", "mimo", "mimo_v2_flash",
-        "glm4", "glm4_moe", "glm4_moe_lite", "acereason", " falcon_h1", "bitnet",
-        "smollm3", "ernie4_5", "lfm2", "lfm2_moe", "baichuan_m1", "exaone4",
-        "gpt_oss", "lille-130m", "olmoe", "olmo2", "olmo3", "bailing_moe",
-        "kimi_vl", "minicpm", "minimax", "hunyuan_v1_dense", "apertus", "jamba",
-        "mamba2", "nemotron_h", "nemotron_labs_diffusion", "mistral3", "mixtral",
-        "afmoe", "nanochat", "nanbeige", "mellum", "helium",
-    ]
-
-    /// Returns true if `mlx-swift-lm`'s `VLMTypeRegistry` supports loading `modelType` as a vision-language model.
-    public static func supportsMLXSwiftVision(modelType: String) -> Bool {
-        mlxSwiftVLMModelTypes.contains(modelType.lowercased())
+    /// Inspects checkpoint files (`config.json`, `processor_config.json`, `preprocessor_config.json`,
+    /// or `.aimodel/metadata.json`) to determine if the model directory ships a vision tower or image processor.
+    /// Does not rely on hardcoded model_type lists or directory name substrings.
+    public static func hasVisionConfiguration(
+        in modelDirectory: URL,
+        configJSON: [String: Any]? = nil
+    ) -> Bool {
+        let dirURL = modelDirectory.pathExtension.lowercased() == "gguf"
+            ? modelDirectory.deletingLastPathComponent()
+            : modelDirectory
+        let cfg = configJSON ?? loadJSON(at: dirURL.appendingPathComponent("config.json"))
+        if let visionCfg = cfg?["vision_config"] as? [String: Any], !visionCfg.isEmpty {
+            return true
+        }
+        if let procCfg = loadJSON(at: dirURL.appendingPathComponent("processor_config.json")) {
+            if procCfg["image_processor"] != nil || procCfg["patch_size"] != nil || procCfg["max_soft_tokens"] != nil {
+                return true
+            }
+        }
+        if let preprocCfg = loadJSON(at: dirURL.appendingPathComponent("preprocessor_config.json")) {
+            if preprocCfg["image_processor_type"] != nil || preprocCfg["size"] != nil || preprocCfg["patch_size"] != nil {
+                return true
+            }
+        }
+        if let metaCfg = loadJSON(at: dirURL.appendingPathComponent("metadata.json")) {
+            if (metaCfg["model_type"] as? String)?.lowercased() == "vlm" || metaCfg["vision"] != nil {
+                return true
+            }
+            if let assets = metaCfg["assets"] as? [String: Any], assets["vision"] != nil {
+                return true
+            }
+        }
+        return false
     }
 
     public init(

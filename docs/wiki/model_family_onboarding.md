@@ -28,8 +28,9 @@ Following `VISION.md` Principle 2 (*"Derive, don't copy"*), `HeylookCore` derive
    - Marks non-reasoning templates (`Llama 3.2`, `Gemma 2`, `Mistral`) as `supportsThinking = false` so the UI and `/v1/models` never advertise dead thinking controls.
 3. **Dynamic Special & Turn-End Token Scrubbing (`StripSpecials`)**:
    - Unions `"special": true` tokens from `tokenizer.json` (`added_tokens`) and `tokenizer_config.json` (`added_tokens_decoder`), stripping checkpoint-specific turn markers (`<turn|>`, `<|eot|>`, `<|eom|>`) while keeping `reasoningFormat.structuralDelimiters` intact until `ReasoningParser` consumes them.
-4. **Library-Aware Vision Gating (`ModelTemplateInfo.supportsMLXSwiftVision`)**:
-   - Verifies that an MLX checkpoint with `vision_config` in `config.json` is actually registered in `mlx-swift-lm`'s `VLMTypeRegistry` before advertising `supportsVision = true`.
+4. **File-Derived Vision Inspection & Runtime VLM-to-LLM Fallback (`ModelTemplateInfo.hasVisionConfiguration`)**:
+   - Inspects `config.json` (`vision_config`), `processor_config.json`, `preprocessor_config.json`, and `.aimodel/metadata.json` (`vision.backbone`) directly on disk without maintaining static `model_type` string sets.
+   - At load time, `MLXSwiftProvider.ensureContainerLoaded()` attempts `VLMModelFactory.shared` first when `supportsVision` is true and automatically falls back to `LLMModelFactory.shared` (updating `supportsVision = false` with `.observed` provenance) if a checkpoint ships a `vision_config` stub for an LLM-only `model_type`.
 
 ---
 
@@ -48,7 +49,7 @@ Porting a new LLM or VLM architecture to **Tier 1 (`mlx-swift-lm`)** takes **~2â
    - Implement `sanitize(weights: [String: MLXArray]) -> [String: MLXArray]` to strip `model.` prefixes or drop unused tower weights when loading a unified checkpoint as text-only.
    - Conform to `ChatConventionsProviding` if the family has an intrinsic `ReasoningConfig` or `ToolCallFormat`.
 2. **Register `model_type` (1 Line)**:
-   - Add the `model_type` entry to `LLMTypeRegistry` (`LLMModelFactory.swift`) and/or `VLMTypeRegistry` (`VLMModelFactory.swift`), plus `ModelTemplateInfo.mlxSwiftLLMModelTypes` / `mlxSwiftVLMModelTypes` in `HeylookCore`.
+   - Add the `model_type` entry to `LLMTypeRegistry` (`LLMModelFactory.swift`) and/or `VLMTypeRegistry` (`VLMModelFactory.swift`). No static `model_type` table updates are needed in `HeylookCore`.
 3. **Verify in `heylookitsanllm-macos`**:
    - Drop the checkpoint into the watched models directory and run `swift run heylook-cli models` and `swift run heylook-cli eval-lab`.
 
