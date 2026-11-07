@@ -73,3 +73,99 @@ When targeting 100% ANE residency (so the model runs on the ANE lane concurrentl
 4. **Verify PSNR & ANE Residency**:
    - Check layer-by-layer PSNR (`>= 70 dB` layout parity in PyTorch, `>= 40 dB` compiled FP16 vs. reference, `>= 35 dB` after 4-bit palettization).
    - Run `swift run heylook-cli inspect-ane <path>` to confirm `MLComputePlan` reports `99–100%` Neural Engine residency with zero unexpected CPU/GPU fallbacks.
+
+---
+
+## 5. Model Conversion & Quantization Pipelines (Native Swift vs. Native Core AI)
+
+### 5.1 Converting Models to Native MLX Swift (`MLXModelConverter` & `heylook-cli convert-mlx`)
+
+`mlx-swift-lm` executes `.safetensors` weights directly on Metal GPU via `MLXSwiftProvider`, giving you three ways to onboard or quantize a model:
+
+1. **Zero-Conversion Drop-In (`.safetensors` `BF16` / `FP16` / Pre-Quantized / ParoQuant)**:
+   - Unquantized Hugging Face `.safetensors` checkpoints, `mlx-community` checkpoints, and **ParoQuant** (`quantization_config.quant_method == "paroquant"`, Givens rotations + channel scales) load directly with zero conversion step. Every model class in `mlx-swift-lm` runs `sanitize(weights:)` in Swift on load.
+2. **100% Pure-Swift In-Process Quantization & Sharded Export (`MLXModelConverter` / `MLXLMCommon.convert`)**:
+   - `HeylookEngines.MLXModelConverter` wraps `LLMModelFactory.shared.convert` and `MLXLMCommon.convert` (`Libraries/MLXLMCommon/ModelConversion.swift` in `mlx-swift-lm`) to quantize, shard (`<= 5 GB` per shard + `model.safetensors.index.json`), copy sidecars (`*.json`, `*.jinja`, `*.tiktoken`), and write `"quantization"` into `config.json` entirely in Swift:
+     ```bash
+     # Inspect conversion plan (offline / dry-run)
+     swift run heylook-cli convert-mlx ./raw-model ./quantized-model --bits 4 --group-size 64 --mode affine --dry-run
+
+     # Execute full pure-Swift Metal quantization & sharded safetensors export
+     ./scripts/build_native.sh cli convert-mlx ./raw-model ./quantized-model --bits 4 --group-size 64 --mode affine
+     ./scripts/build_native.sh cli convert-mlx ./raw-model ./quantized-q4-0 --calibration q4_zero
+     ./scripts/build_native.sh cli convert-mlx ./raw-model ./quantized-mxfp8 --mode mxfp8
+     ```
+   - Supported pure-Swift quantization modes (`MLXQuantizationMode`):
+     - `affine` (`4-bit` or `8-bit`, default `group_size = 64`, or `calibration = q4_zero` for exact symmetric 32-element `Q4_0` lattice alignment)
+     - `mxfp4` (`4-bit`, default `group_size = 32`)
+     - `mxfp8` (`8-bit`, default `group_size = 32`)
+     - `nvfp4` (`4-bit`, default `group_size = 32`)
+3. **Offline AWQ / DWQ Quantization (`mlx_lm.convert` / `mlx_vlm.convert`)**:
+   - When calibration-dataset AWQ or Distilled Weight Quantization (DWQ) is desired, run `mlx_lm.convert` or `mlx_vlm.convert` to produce standard MLX `.safetensors` shards.
+
+---
+
+### 5.2 Converting Models to Native Core AI (`scripts/export_coreai.sh` & `scripts/export_ane_coreml.py`)
+
+Core AI models are exported as `.aimodel` resource bundles (`metadata.json` Schema `0.2` + `main.aimodel` + optional `prefill.aimodel`, `vision.aimodel`, `dflash.aimodel`) or 3-tower CoreML `.mlmodelc` bundles:
+
+1. **Catalog & Experimental `.aimodel` Export (`./scripts/export_coreai.sh`)**:
+   ```bash
+   # List supported LLM, diffusion, and utility presets in coreai-models
+   ./scripts/export_coreai.sh list --type llm
+
+   # Export macOS 27.2+ GPU .aimodel (defaults to 4-bit block-32 + prefill function)
+   ./scripts/export_coreai.sh llm Qwen/Qwen3.5-9B
+
+   # Export macOS 27.2+ with FP4 weights + FP8 activations + FP8 KV cache
+   ./scripts/export_coreai.sh llm Qwen/Qwen3.5-9B --compression fp4_weights_fp8_activations_fp8_kv_cache
+
+   # Export iOS 27.2+ / ANE .aimodel (defaults to 4-bit group-32 LUT palettization + INT8 embeddings)
+   ./scripts/export_coreai.sh llm Qwen/Qwen3-1.7B --platform iOS
+
+   # Export Gemma 4 with static context buckets, INT8 PLE sidecar, and multi-bucket vision encoder
+   ./scripts/export_coreai.sh gemma4 google/gemma-4-E4B-it --include-vision
+
+   # Export EmbeddingGemma 2 .aimodel (macOS GPU or iOS ANE)
+   ./scripts/export_coreai.sh embedding embeddinggemma-2 --platform iOS
+
+   # Optional Ahead-of-Time (AOT) compilation via xcrun coreai-build
+   ./scripts/export_coreai.sh compile ~/.heylook/models/Qwen3.5-9B/main.aimodel --platform macOS
+   ```
+
+2. **`coreai-opt` Compression Presets (`macOS 27.2+` vs. `iOS 27.2+` / ANE)**:
+
+   | Target | `--compression` Preset | Hardware Representation |
+   | :--- | :--- | :--- |
+   | `macOS` | `4bit` *(default)* | INT4 weight-only, block size 32 |
+   | `macOS` | `4bit_weights_8bit_kv_cache` | INT4 per-block weights + INT8 symmetric per-tensor KV cache |
+   | `macOS 27.2+` | `fp4_weights_fp8_activations_fp8_kv_cache` | Per-block **FP4 (`e2m1`)** weights + **FP8 (`e4m3`)** activations & KV cache |
+   | `macOS 27.2+` | `fp8_weights_fp8_activations_fp8_kv_cache` | Per-tensor **FP8 (`e4m3`)** weights, activations, and KV cache |
+   | `iOS / ANE` | `4bit_weight_palettized_group32` *(default)* | 4-bit LUT palettization (channel group size 32) + INT8 embedding table |
+   | `iOS / ANE` | `4bit_weight_palettized_group8` | Higher-accuracy 4-bit LUT palettization (channel group size 8) |
+
+3. **3-Tower `EmbeddingGemma 2` CoreML ANE Exporter (`./scripts/export_ane_coreml.py`)**:
+   Compiles `EmbeddingGemma2VisionANE.mlmodelc` (100% ANE), `EmbeddingGemma2AudioANE.mlmodelc` (99% ANE), `EmbeddingGemma2TextANE.mlmodelc` (100% ANE), and `embed_tokens_fp16.bin` with `ANESafeRMSNorm` FP16 overflow pre-scaling (`1/16`):
+   ```bash
+   uv run --python 3.12 --with coremltools --with safetensors --with "torch<2.8" --with "numpy<2" \
+     python ./scripts/export_ane_coreml.py --compile
+   ```
+
+---
+
+## 6. Hybrid Compute Placement (ANE + GPU + CPU) & When to Choose Core AI vs. Native MLX Swift
+
+### 6.1 Running Across ANE + GPU + CPU
+Core AI supports heterogeneous execution at two levels:
+- **Multi-Asset / Multi-Tower Bundles (Recommended)**: A single `.aimodel` directory assigns each sub-model to the compute unit that matches its memory/compute profile—for example, `token_table` / `ple` lookup tables on **CPU/GPU**, `vision` / `audio` / `embedding` / `dflash` drafter towers on **ANE** (`BC1S` `(B, D, 1, S)` with `1x1 Conv2d`), and the `main` / `prefill` autoregressive decoder on **GPU** (`(B, S, D)` with `nn.Linear` and fused SDPA).
+- **Single-Graph Partitioning (Avoid Mid-Layer Transfers)**: While `CoreAI` automatically falls back to GPU/CPU for ops unsupported on ANE (such as `fp32` intermediates or rank > 5 tensors), switching `ANE <-> GPU <-> CPU` *inside* a decoder layer segments the compiled graph and inserts expensive `BC1S <-> BSD` layout transposes. Keep each compiled function 99–100% resident on its target accelerator.
+
+### 6.2 Why Not Use Core AI Everywhere Instead of Native MLX Swift?
+
+| Dimension | Native MLX Swift (`MLXSwiftProvider`) | Native Core AI (`CoreAIProvider` & `ANECoreMLRuntime`) |
+| :--- | :--- | :--- |
+| **Target Accelerator on macOS** | Metal GPU + Accelerate CPU (800 GB/s+ unified memory bandwidth on Mac Studio) | `macOS` exports run on Metal GPU/CPU; `iOS` / `BC1S` exports run on ANE (~38–50 TOPS, ideal for `< 8B` low-wattage models) |
+| **Onboarding & Load Time** | **Zero export step**: `mmap`s Hugging Face `.safetensors` directly in seconds | Requires offline `torch.export` + `coreai-opt` + `TorchConverter` export and device specialization |
+| **Multi-Turn KV Cache Slicing** | **Dynamic `[KVCache]` in Swift**: grows incrementally and trims in place (`cache.trim(n)`) on message edits/branches | Stateful `NDArray` buffers bound to compiled `max_context_length` or static `(context_bucket, query_length)` functions |
+| **Architecture Breadth** | **61 LLMs + 20 VLMs** in pure Swift (`mlx-swift-lm`) | ~15 LLM families + utility/speech/diffusion recipes in `coreai-models` |
+| **Best Workload Fit** | Primary Mac Studio interactive LLMs & VLMs (`0.8B` to `122B-A10B`), multi-turn branching chat, dynamic vision resolution | **ANE Co-Resident Lane** (always-on `EmbeddingGemma 2`, `Whisper`/`Parakeet` voice transcription, vision pre-encoding), **`iOS 27.2+` palettized ANE models**, **`DFlash` block-diffusion**, and **`macOS 27.2+` `FP4`/`FP8` KV-cache bundles** |

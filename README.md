@@ -42,6 +42,14 @@ swift run heylook-cli eval-lab
 ./scripts/build_native.sh cli inspect-ane ./models/embeddinggemma-2-MLX-BF16
 ./scripts/build_native.sh cli inspect-checkpoint ./models/embeddinggemma-2-MLX-BF16
 
+# Quantize a safetensors checkpoint in 100% pure Swift (affine, mxfp4, mxfp8, nvfp4, q4_zero)
+./scripts/build_native.sh cli convert-mlx ./models/raw-bf16 ./models/quant-4bit --bits 4 --group-size 64 --mode affine
+
+# Export Core AI (.aimodel) bundles (macOS GPU 4bit/FP4/FP8 or iOS ANE 4-bit palettized)
+./scripts/export_coreai.sh list --type llm
+./scripts/export_coreai.sh llm Qwen/Qwen3.5-9B
+./scripts/export_coreai.sh gemma4 google/gemma-4-E4B-it --include-vision
+
 # Stream live Metal GPU inference from a configured MLX checkpoint
 ./scripts/build_native.sh cli chat --model Qwen3.5-0.8B-MLX-8bit --max-tokens 96 "Explain unified memory + ANE co-residency."
 

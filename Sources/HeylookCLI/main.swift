@@ -34,6 +34,8 @@ struct HeylookCLI {
             await runChat(args: Array(args.dropFirst()))
         case "eval-lab":
             await runEvalLab()
+        case "convert-mlx":
+            await runConvertMLX(args: Array(args.dropFirst()))
         default:
             printUsage()
         }
@@ -492,6 +494,72 @@ struct HeylookCLI {
         }
     }
 
+    static func runConvertMLX(args: [String]) async {
+        let positional = args.filter { !$0.hasPrefix("--") }
+        guard positional.count >= 2 else {
+            print("Usage: heylook-cli convert-mlx <src-dir> <dst-dir> [--bits 4|8] [--group-size 32|64] [--mode affine|mxfp4|mxfp8|nvfp4] [--calibration standard|q4_zero] [--overwrite] [--dry-run]")
+            exit(1)
+        }
+        let srcURL = URL(fileURLWithPath: positional[0])
+        let dstURL = URL(fileURLWithPath: positional[1])
+
+        var bits: Int? = nil
+        if let bIdx = args.firstIndex(of: "--bits"), bIdx + 1 < args.count {
+            bits = Int(args[bIdx + 1])
+        }
+        var groupSize: Int? = nil
+        if let gIdx = args.firstIndex(of: "--group-size"), gIdx + 1 < args.count {
+            groupSize = Int(args[gIdx + 1])
+        }
+        var mode: MLXQuantizationMode = .affine
+        if let mIdx = args.firstIndex(of: "--mode"), mIdx + 1 < args.count,
+           let parsed = MLXQuantizationMode(rawValue: args[mIdx + 1].lowercased()) {
+            mode = parsed
+        }
+        var calibration: MLXQuantizationCalibration = .standard
+        if let cIdx = args.firstIndex(of: "--calibration"), cIdx + 1 < args.count,
+           let parsed = MLXQuantizationCalibration(rawValue: args[cIdx + 1].lowercased()) {
+            calibration = parsed
+        }
+        let overwrite = args.contains("--overwrite")
+        let dryRun = args.contains("--dry-run")
+
+        let spec = MLXConversionSpec(
+            bits: bits,
+            groupSize: groupSize,
+            mode: mode,
+            calibration: calibration,
+            overwriteExistingOutput: overwrite
+        )
+
+        do {
+            let plan = try MLXModelConverter.planConversion(from: srcURL, to: dstURL, spec: spec)
+            print("=== Pure-Swift MLX Model Conversion Plan ===")
+            print("  Source      : \(plan.sourceDirectory.path)")
+            print("  Output      : \(plan.outputDirectory.path)")
+            print("  Model Type  : \(plan.modelType) (\(plan.isVisionModel ? "VLM" : "LLM"), reasoning=\(plan.reasoningFormat))")
+            print("  Quantization: \(plan.resolvedBits)-bit \(plan.mode.rawValue) (group_size=\(plan.resolvedGroupSize), calibration=\(plan.calibration.rawValue))")
+            print("  Safetensors : \(plan.safetensorsFiles.joined(separator: ", "))")
+            print("  Sidecars    : \(plan.sidecarFiles.joined(separator: ", "))")
+
+            if dryRun {
+                return
+            }
+
+            let (_, writtenURLs) = try await MLXModelConverter.convert(
+                from: srcURL,
+                to: dstURL,
+                spec: spec
+            ) { status in
+                print("  \(status)")
+            }
+            print("Conversion complete! Wrote \(writtenURLs.count) shard(s) to \(plan.outputDirectory.path)")
+        } catch {
+            print("MLX conversion error: \(error.localizedDescription)")
+            exit(1)
+        }
+    }
+
     static func printUsage() {
         print("""
         Usage: heylook-cli <command> [args]
@@ -505,6 +573,8 @@ struct HeylookCLI {
           watched                                       List FSEvents-watched folders in the vector store
           inspect-ane [dir]                             Inspect CoreML ANE tower packages and op compatibility
           inspect-checkpoint [dir]                      Inspect local EmbeddingGemma-2-2B safetensors checkpoint
+          convert-mlx <src-dir> <dst-dir> [--bits 4|8] [--group-size 32|64] [--mode affine|mxfp4|mxfp8|nvfp4] [--calibration standard|q4_zero] [--overwrite] [--dry-run]
+                                                        Quantize & shard a safetensors LLM/VLM checkpoint in pure Swift
           eval-lab                                      Run multi-turn KV chain, VLM parity, and MRL Recall@K probes
           chat <prompt>                                 Stream a chat completion with thinking traces
           serve [port]                                  Run the embedded /v1/messages & /v1/embeddings server

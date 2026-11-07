@@ -2620,3 +2620,289 @@ public actor RemoteHeylookProvider: InferenceProvider {
         }
     }
 }
+
+// MARK: - 5. Pure-Swift MLX Model Conversion (`MLXModelConverter` -> `MLXLMCommon.convert`)
+
+public enum MLXQuantizationMode: String, Sendable, Codable, CaseIterable {
+    case affine = "affine"
+    case mxfp4 = "mxfp4"
+    case mxfp8 = "mxfp8"
+    case nvfp4 = "nvfp4"
+
+    public var defaultBits: Int {
+        switch self {
+        case .mxfp8:
+            return 8
+        case .affine, .mxfp4, .nvfp4:
+            return 4
+        }
+    }
+
+    public var defaultGroupSize: Int {
+        switch self {
+        case .mxfp4, .mxfp8, .nvfp4:
+            return 32
+        case .affine:
+            return 64
+        }
+    }
+}
+
+public enum MLXQuantizationCalibration: String, Sendable, Codable, CaseIterable {
+    case standard = "standard"
+    case q4Zero = "q4_zero"
+}
+
+public struct MLXConversionSpec: Sendable, Equatable {
+    public var bits: Int?
+    public var groupSize: Int?
+    public var mode: MLXQuantizationMode
+    public var calibration: MLXQuantizationCalibration
+    public var maxShardSizeBytes: Int64
+    public var overwriteExistingOutput: Bool
+
+    public init(
+        bits: Int? = nil,
+        groupSize: Int? = nil,
+        mode: MLXQuantizationMode = .affine,
+        calibration: MLXQuantizationCalibration = .standard,
+        maxShardSizeBytes: Int64 = 5 * 1024 * 1024 * 1024,
+        overwriteExistingOutput: Bool = false
+    ) {
+        self.bits = bits
+        self.groupSize = groupSize
+        self.mode = mode
+        self.calibration = calibration
+        self.maxShardSizeBytes = maxShardSizeBytes
+        self.overwriteExistingOutput = overwriteExistingOutput
+    }
+
+    public var resolvedBits: Int {
+        if calibration == .q4Zero { return 4 }
+        return bits ?? mode.defaultBits
+    }
+
+    public var resolvedGroupSize: Int {
+        if calibration == .q4Zero { return 32 }
+        return groupSize ?? mode.defaultGroupSize
+    }
+}
+
+public enum MLXModelConversionError: LocalizedError, Sendable, Equatable {
+    case missingConfigJSON(URL)
+    case noSafetensorsFiles(URL)
+    case unsupportedPyTorchWeights(URL)
+    case sourceAlreadyQuantized(URL, String)
+    case outputDirectoryExists(URL)
+    case outputDirectoryOverlapsSource(URL)
+    case incompatibleCalibration(MLXQuantizationCalibration, Int, Int, MLXQuantizationMode)
+    case runtimeUnavailable(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingConfigJSON(let dir):
+            return "Missing config.json in source directory \(dir.path)"
+        case .noSafetensorsFiles(let dir):
+            return "No .safetensors weight files found in \(dir.path)"
+        case .unsupportedPyTorchWeights(let dir):
+            return "PyTorch .bin weights in \(dir.path) are not supported; convert from .safetensors"
+        case .sourceAlreadyQuantized(let dir, let detail):
+            return "Source model in \(dir.path) is already quantized (\(detail))"
+        case .outputDirectoryExists(let dir):
+            return "Output directory \(dir.path) already exists (pass --overwrite to replace)"
+        case .outputDirectoryOverlapsSource(let dir):
+            return "Output directory \(dir.path) cannot overlap the source checkpoint directory"
+        case .incompatibleCalibration(let cal, let bits, let gs, let mode):
+            return "Calibration '\(cal.rawValue)' requires bits=4, groupSize=32, mode=affine (got bits=\(bits), groupSize=\(gs), mode=\(mode.rawValue))"
+        case .runtimeUnavailable(let detail):
+            return detail
+        }
+    }
+}
+
+public struct MLXConversionPlan: Sendable, Equatable {
+    public let sourceDirectory: URL
+    public let outputDirectory: URL
+    public let modelType: String
+    public let isVisionModel: Bool
+    public let resolvedBits: Int
+    public let resolvedGroupSize: Int
+    public let mode: MLXQuantizationMode
+    public let calibration: MLXQuantizationCalibration
+    public let safetensorsFiles: [String]
+    public let sidecarFiles: [String]
+    public let reasoningFormat: String
+}
+
+public enum MLXModelConverter {
+    private static let sidecarExtensions: Set<String> = [
+        "json", "jsonl", "jinja", "txt", "model", "tiktoken", "py",
+    ]
+
+    /// Validates a source `.safetensors` directory and returns the resolved `MLXConversionPlan`
+    /// matching `mlx-swift-lm`'s `ModelConversion.swift` preflight rules.
+    public static func planConversion(
+        from sourceDirectory: URL,
+        to outputDirectory: URL,
+        spec: MLXConversionSpec = .init()
+    ) throws -> MLXConversionPlan {
+        let fm = FileManager.default
+        let srcCanonical = sourceDirectory.resolvingSymlinksInPath().standardizedFileURL
+        let dstCanonical = outputDirectory.resolvingSymlinksInPath().standardizedFileURL
+
+        if srcCanonical.pathComponents.starts(with: dstCanonical.pathComponents)
+            || dstCanonical.pathComponents.starts(with: srcCanonical.pathComponents) {
+            throw MLXModelConversionError.outputDirectoryOverlapsSource(outputDirectory)
+        }
+
+        if fm.fileExists(atPath: dstCanonical.path) && !spec.overwriteExistingOutput {
+            throw MLXModelConversionError.outputDirectoryExists(outputDirectory)
+        }
+
+        if spec.calibration == .q4Zero {
+            let b = spec.bits ?? 4
+            let g = spec.groupSize ?? 32
+            if b != 4 || g != 32 || spec.mode != .affine {
+                throw MLXModelConversionError.incompatibleCalibration(.q4Zero, b, g, spec.mode)
+            }
+        }
+
+        let configURL = srcCanonical.appendingPathComponent("config.json")
+        guard let configData = try? Data(contentsOf: configURL),
+              let configJSON = try? JSONSerialization.jsonObject(with: configData) as? [String: Any] else {
+            throw MLXModelConversionError.missingConfigJSON(sourceDirectory)
+        }
+
+        if let qDict = configJSON["quantization"] as? [String: Any] {
+            let bits = qDict["bits"] as? Int ?? 4
+            let mode = qDict["mode"] as? String ?? "affine"
+            throw MLXModelConversionError.sourceAlreadyQuantized(sourceDirectory, "\(bits)-bit \(mode)")
+        }
+        if let qCfg = configJSON["quantization_config"] as? [String: Any] {
+            let method = qCfg["quant_method"] as? String ?? "quantized"
+            throw MLXModelConversionError.sourceAlreadyQuantized(sourceDirectory, method)
+        }
+
+        let entries = (try? fm.contentsOfDirectory(
+            at: srcCanonical,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        let safetensors = entries
+            .filter { $0.pathExtension.lowercased() == "safetensors" }
+            .map(\.lastPathComponent)
+            .sorted()
+
+        if safetensors.isEmpty {
+            if entries.contains(where: { $0.pathExtension.lowercased() == "bin" }) {
+                throw MLXModelConversionError.unsupportedPyTorchWeights(sourceDirectory)
+            }
+            throw MLXModelConversionError.noSafetensorsFiles(sourceDirectory)
+        }
+
+        let sidecars = entries
+            .filter { sidecarExtensions.contains($0.pathExtension.lowercased()) }
+            .map(\.lastPathComponent)
+            .sorted()
+
+        let modelType = (configJSON["model_type"] as? String) ?? "unknown"
+        let isVision = ModelTemplateInfo.hasVisionConfiguration(in: srcCanonical, configJSON: configJSON)
+        let templateInfo = ModelTemplateInfo.inspect(modelDirectory: srcCanonical)
+
+        return MLXConversionPlan(
+            sourceDirectory: srcCanonical,
+            outputDirectory: dstCanonical,
+            modelType: modelType,
+            isVisionModel: isVision,
+            resolvedBits: spec.resolvedBits,
+            resolvedGroupSize: spec.resolvedGroupSize,
+            mode: spec.mode,
+            calibration: spec.calibration,
+            safetensorsFiles: safetensors,
+            sidecarFiles: sidecars,
+            reasoningFormat: templateInfo.reasoningFormat.wireIdentifier
+        )
+    }
+
+    /// Executes 100% pure-Swift `.safetensors` quantization and sharded export using `mlx-swift-lm`
+    /// (`LLMModelFactory.shared.convert` / `MLXLMCommon.convert`).
+    public static func convert(
+        from sourceDirectory: URL,
+        to outputDirectory: URL,
+        spec: MLXConversionSpec = .init(),
+        progressHandler: @Sendable (String) -> Void = { _ in }
+    ) async throws -> (plan: MLXConversionPlan, weightsURLs: [URL]) {
+        let plan = try planConversion(from: sourceDirectory, to: outputDirectory, spec: spec)
+
+        #if canImport(MLX) && canImport(MLXNN) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXVLM)
+        let mlxMode: QuantizationMode
+        switch spec.mode {
+        case .affine:
+            mlxMode = .affine
+        case .mxfp4:
+            mlxMode = .mxfp4
+        case .mxfp8:
+            mlxMode = .mxfp8
+        case .nvfp4:
+            mlxMode = .nvfp4
+        }
+
+        let mlxCalibration: ModelConversionQuantizationCalibration =
+            (spec.calibration == .q4Zero) ? .q4Zero : .standard
+
+        let options = ModelConversionOptions(
+            bits: plan.resolvedBits,
+            groupSize: plan.resolvedGroupSize,
+            mode: mlxMode,
+            calibration: mlxCalibration,
+            maxShardSize: spec.maxShardSizeBytes,
+            overwriteExistingOutput: spec.overwriteExistingOutput
+        )
+
+        let result: ModelConversionResult
+        if plan.isVisionModel {
+            let configURL = plan.sourceDirectory.appendingPathComponent("config.json")
+            let configData = try Data(contentsOf: configURL)
+            if let vlmModel = try? await VLMModelFactory.shared.typeRegistry.createModel(
+                configuration: configData,
+                modelType: plan.modelType
+            ) {
+                result = try MLXLMCommon.convert(
+                    modelDirectory: plan.sourceDirectory,
+                    tokenizerDirectory: plan.sourceDirectory,
+                    model: vlmModel,
+                    to: plan.outputDirectory,
+                    options: options,
+                    progressHandler: { prog in
+                        progressHandler("[\(prog.stage.rawValue)] \(prog.message ?? "")")
+                    }
+                )
+            } else {
+                result = try await LLMModelFactory.shared.convert(
+                    from: plan.sourceDirectory,
+                    to: plan.outputDirectory,
+                    options: options,
+                    progressHandler: { prog in
+                        progressHandler("[\(prog.stage.rawValue)] \(prog.message ?? "")")
+                    }
+                )
+            }
+        } else {
+            result = try await LLMModelFactory.shared.convert(
+                from: plan.sourceDirectory,
+                to: plan.outputDirectory,
+                options: options,
+                progressHandler: { prog in
+                    progressHandler("[\(prog.stage.rawValue)] \(prog.message ?? "")")
+                }
+            )
+        }
+        return (plan, result.weightsURLs)
+        #else
+        throw MLXModelConversionError.runtimeUnavailable(
+            "Pure-Swift MLX weight quantization requires MLXLMCommon & Metal shaders. Run via `./scripts/build_native.sh cli convert-mlx ...`."
+        )
+        #endif
+    }
+}

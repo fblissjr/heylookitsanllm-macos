@@ -2008,5 +2008,64 @@ struct HeylookTests {
         #expect(observedGGUFDesc.reasoningFormat.provenance == .observed)
         #expect(observedGGUFDesc.thinkingControls?.depthVariable == "reasoning_effort")
         await ggufProv.unload()
+
+        // 12. Pure-Swift MLXModelConverter preflight validation & conversion planning (`affine`, `mxfp8`, `q4Zero`)
+        let unquantDir = tempRoot.appendingPathComponent("qwen3_8_bf16", isDirectory: true)
+        try FileManager.default.createDirectory(at: unquantDir, withIntermediateDirectories: true)
+        try """
+        {
+          "model_type": "qwen3_8",
+          "vision_config": { "hidden_size": 1152 },
+          "text_config": { "max_position_embeddings": 131072 }
+        }
+        """.write(to: unquantDir.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{% if enable_thinking %}<think>{% endif %}".write(
+            to: unquantDir.appendingPathComponent("chat_template.jinja"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try Data([0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).write(
+            to: unquantDir.appendingPathComponent("model.safetensors")
+        )
+
+        let out4BitDir = tempRoot.appendingPathComponent("qwen3_8_4bit", isDirectory: true)
+        let plan4Bit = try MLXModelConverter.planConversion(
+            from: unquantDir,
+            to: out4BitDir,
+            spec: MLXConversionSpec(bits: nil, groupSize: nil, mode: .affine, calibration: .q4Zero)
+        )
+        #expect(plan4Bit.modelType == "qwen3_8")
+        #expect(plan4Bit.isVisionModel == true)
+        #expect(plan4Bit.resolvedBits == 4)
+        #expect(plan4Bit.resolvedGroupSize == 32)
+        #expect(plan4Bit.calibration == .q4Zero)
+        #expect(plan4Bit.safetensorsFiles == ["model.safetensors"])
+        #expect(plan4Bit.sidecarFiles.contains("config.json"))
+        #expect(plan4Bit.sidecarFiles.contains("chat_template.jinja"))
+
+        let planMXFP8 = try MLXModelConverter.planConversion(
+            from: unquantDir,
+            to: out4BitDir,
+            spec: MLXConversionSpec(mode: .mxfp8)
+        )
+        #expect(planMXFP8.resolvedBits == 8)
+        #expect(planMXFP8.resolvedGroupSize == 32)
+
+        // Reject incompatible q4Zero with bits=8
+        #expect(throws: MLXModelConversionError.self) {
+            _ = try MLXModelConverter.planConversion(
+                from: unquantDir,
+                to: out4BitDir,
+                spec: MLXConversionSpec(bits: 8, groupSize: 64, mode: .affine, calibration: .q4Zero)
+            )
+        }
+        // Reject overlapping source/output directories
+        #expect(throws: MLXModelConversionError.self) {
+            _ = try MLXModelConverter.planConversion(
+                from: unquantDir,
+                to: unquantDir.appendingPathComponent("sub"),
+                spec: MLXConversionSpec()
+            )
+        }
     }
 }
