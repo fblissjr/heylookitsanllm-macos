@@ -15,6 +15,7 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
     public var flashAttn: Bool?
     public var supportsVision: Bool?
     public var supportsThinking: Bool?
+    public var imageMaxTokens: Int?
     public var draftModel: String?
     public var specType: String?
     public var chatTemplatePath: String?
@@ -35,6 +36,7 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
         flashAttn: Bool? = nil,
         supportsVision: Bool? = nil,
         supportsThinking: Bool? = nil,
+        imageMaxTokens: Int? = nil,
         draftModel: String? = nil,
         specType: String? = nil,
         chatTemplatePath: String? = nil,
@@ -54,6 +56,7 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
         self.flashAttn = flashAttn
         self.supportsVision = supportsVision
         self.supportsThinking = supportsThinking
+        self.imageMaxTokens = imageMaxTokens
         self.draftModel = draftModel
         self.specType = specType
         self.chatTemplatePath = chatTemplatePath
@@ -92,6 +95,7 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
         config.flashAttn = kv["flash_attn"]?.boolValue
         config.supportsVision = kv["vision"]?.boolValue
         config.supportsThinking = kv["thinking_capable"]?.boolValue ?? kv["supports_thinking"]?.boolValue
+        config.imageMaxTokens = kv["image_max_tokens"]?.intValue
         config.draftModel = kv["draft_model"]?.stringValue ?? kv["draft_model_path"]?.stringValue
         config.specType = kv["spec_type"]?.stringValue
         config.chatTemplatePath = kv["chat_template_path"]?.stringValue
@@ -132,6 +136,7 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
         if let flashAttn { lines.append("flash_attn = \(flashAttn)") }
         if let supportsVision { lines.append("vision = \(supportsVision)") }
         if let supportsThinking { lines.append("thinking_capable = \(supportsThinking)") }
+        if let imageMaxTokens { lines.append("image_max_tokens = \(imageMaxTokens)") }
         if let draftModel { lines.append("draft_model = \"\(draftModel)\"") }
         if let specType { lines.append("spec_type = \"\(specType)\"") }
         if let chatTemplatePath { lines.append("chat_template_path = \"\(chatTemplatePath)\"") }
@@ -1361,6 +1366,19 @@ public enum GGUFHeaderReader {
 
         public var hasAudioEncoder: Bool {
             boolMetadata["clip.has_audio_encoder"] == true
+        }
+
+        public var clipProjectorType: String? {
+            stringMetadata["clip.projector_type"]
+        }
+
+        /// True when `clip.projector_type` is a non-causal vision projector (`gemma4v`, `qwen2vl`,
+        /// `qwen2.5vl`, `qwen3vl`, `pixtral`, `internvl`) where `llama-server` requires
+        /// `--image-max-tokens <= n_ubatch` so `llama_context::decode` does not abort.
+        public var hasNonCausalVisionProjector: Bool {
+            guard let proj = clipProjectorType?.lowercased() else { return false }
+            let nonCausal = ["gemma4", "qwen2vl", "qwen2.5vl", "qwen3vl", "qwen3_5", "pixtral", "internvl", "minicpmv"]
+            return nonCausal.contains(where: { proj.contains($0) })
         }
 
         /// True when the GGUF header declares a hybrid-recurrent SSM architecture (`*.ssm.conv_kernel`,

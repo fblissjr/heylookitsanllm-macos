@@ -707,6 +707,23 @@ public actor HeylookRouter {
                 message: "Model '\(request.model)' does not support audio attachments (supports_audio = false)."
             )
         }
+        if let requestedDepth = request.thinkingDepth, !requestedDepth.isEmpty,
+           let controls = desc.thinkingControls {
+            if controls.depthVariable == nil && controls.depthValues.isEmpty {
+                return .error(
+                    status: 400,
+                    type: "invalid_request_error",
+                    message: "Model '\(request.model)' does not support variable thinking_depth / reasoning_effort."
+                )
+            }
+            if !controls.depthValues.isEmpty && !controls.depthValues.contains(requestedDepth) {
+                return .error(
+                    status: 400,
+                    type: "invalid_request_error",
+                    message: "Model '\(request.model)' does not support thinking_depth '\(requestedDepth)'. Allowed values: \(controls.depthValues.joined(separator: ", "))."
+                )
+            }
+        }
 
         let resolvedSampling = HeylookConfig.resolveEffectiveSampling(
             modelPath: desc.modelPath,
@@ -719,118 +736,21 @@ public actor HeylookRouter {
                 Task { await registry.finish(requestID: requestID) }
             }
             let useStream = request.stream ?? false
-            var fullText = ""
-            var fullThinking = ""
-            var finalChunk = GenerationChunk()
-            var sseLines: [String] = []
-
-            if useStream {
-                let startPayload: [String: Any] = [
-                    "type": "message_start",
-                    "message": [
-                        "id": requestID,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": request.model,
-                        "content": [],
-                    ],
-                ]
-                if let startData = try? JSONSerialization.data(withJSONObject: startPayload),
-                   let startStr = String(data: startData, encoding: .utf8) {
-                    let frame = "event: message_start\ndata: \(startStr)\n\n"
-                    sseLines.append(frame)
-                    if let onSSEFrame { await onSSEFrame(frame) }
-                }
-            }
-
             let stream = await provider.generate(
                 requestID: requestID,
                 request: request,
                 effectiveSampling: resolvedSampling.effective,
                 registry: registry
             )
-            for try await chunk in stream {
-                if !chunk.thinking.isEmpty {
-                    fullThinking.append(chunk.thinking)
-                    if useStream {
-                        let deltaObj: [String: Any] = [
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": [
-                                "type": "thinking_delta",
-                                "thinking": chunk.thinking,
-                            ],
-                        ]
-                        if let d = try? JSONSerialization.data(withJSONObject: deltaObj),
-                           let s = String(data: d, encoding: .utf8) {
-                            let frame = "event: content_block_delta\ndata: \(s)\n\n"
-                            sseLines.append(frame)
-                            if let onSSEFrame { await onSSEFrame(frame) }
-                        }
-                    }
-                }
-                if !chunk.text.isEmpty {
-                    fullText.append(chunk.text)
-                    if useStream {
-                        let deltaObj: [String: Any] = [
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": [
-                                "type": "text_delta",
-                                "text": chunk.text,
-                            ],
-                        ]
-                        if let d = try? JSONSerialization.data(withJSONObject: deltaObj),
-                           let s = String(data: d, encoding: .utf8) {
-                            let frame = "event: content_block_delta\ndata: \(s)\n\n"
-                            sseLines.append(frame)
-                            if let onSSEFrame { await onSSEFrame(frame) }
-                        }
-                    }
-                }
-                finalChunk = chunk
-            }
-
-            let perfExt = MessagesResponse.PerformanceExtension(
-                generationTPS: finalChunk.generationTPS,
-                promptTPS: finalChunk.promptTPS,
-                computePlacement: finalChunk.activeComputePlacement,
-                cache: finalChunk.cacheReport,
-                speculative: finalChunk.speculativeReport
+            let consumed = try await Self.consumeStreamAndFormatSSE(
+                requestID: requestID,
+                modelID: request.model,
+                stream: stream,
+                emitSSE: useStream,
+                onSSEFrame: onSSEFrame
             )
 
             if useStream {
-                struct MessageDeltaFrame: Encodable {
-                    struct DeltaBody: Encodable {
-                        let stopReason: StopReason
-                        enum CodingKeys: String, CodingKey {
-                            case stopReason = "stop_reason"
-                        }
-                    }
-                    let type = "message_delta"
-                    let delta: DeltaBody
-                    let usage: MessagesResponse.Usage
-                    let performance: MessagesResponse.PerformanceExtension
-                }
-                let msgDelta = MessageDeltaFrame(
-                    delta: .init(stopReason: finalChunk.stopReason ?? .endTurn),
-                    usage: MessagesResponse.Usage(
-                        inputTokens: finalChunk.cacheReport?.processedTokens ?? finalChunk.promptTokens,
-                        outputTokens: finalChunk.tokenCount,
-                        cacheReadInputTokens: finalChunk.cacheReport?.cachedTokens
-                    ),
-                    performance: perfExt
-                )
-                if let deltaData = try? JSONEncoder().encode(msgDelta),
-                   let deltaStr = String(data: deltaData, encoding: .utf8) {
-                    let frame = "event: message_delta\ndata: \(deltaStr)\n\n"
-                    sseLines.append(frame)
-                    if let onSSEFrame { await onSSEFrame(frame) }
-                }
-                let stopFrame = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-                sseLines.append(stopFrame)
-                if let onSSEFrame { await onSSEFrame(stopFrame) }
-
                 return HeylookHTTPResponse(
                     status: 200,
                     headers: [
@@ -838,21 +758,134 @@ public actor HeylookRouter {
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
                     ],
-                    body: Data(sseLines.joined().utf8)
+                    body: Data(consumed.sseLines.joined().utf8)
                 )
             }
 
             var blocks: [MessagesResponse.ContentBlock] = []
-            if !fullThinking.isEmpty {
-                blocks.append(.thinking(fullThinking))
+            if !consumed.fullThinking.isEmpty {
+                blocks.append(.thinking(consumed.fullThinking))
             }
-            blocks.append(.text(fullText))
+            blocks.append(.text(consumed.fullText))
 
             let response = MessagesResponse(
                 id: requestID,
                 model: request.model,
                 content: blocks,
-                stopReason: finalChunk.stopReason ?? .endTurn,
+                stopReason: consumed.finalChunk.stopReason ?? .endTurn,
+                usage: MessagesResponse.Usage(
+                    inputTokens: consumed.finalChunk.cacheReport?.processedTokens ?? consumed.finalChunk.promptTokens,
+                    outputTokens: consumed.finalChunk.tokenCount,
+                    cacheReadInputTokens: consumed.finalChunk.cacheReport?.cachedTokens
+                ),
+                performance: consumed.performance
+            )
+            return try HeylookHTTPResponse.json(response)
+        }
+    }
+
+    private static func consumeStreamAndFormatSSE(
+        requestID: String,
+        modelID: String,
+        stream: AsyncThrowingStream<GenerationChunk, Error>,
+        emitSSE: Bool,
+        onSSEFrame: (@Sendable (String) async -> Void)?
+    ) async throws -> (
+        fullText: String,
+        fullThinking: String,
+        finalChunk: GenerationChunk,
+        performance: MessagesResponse.PerformanceExtension,
+        sseLines: [String]
+    ) {
+        var fullText = ""
+        var fullThinking = ""
+        var finalChunk = GenerationChunk()
+        var sseLines: [String] = []
+
+        if emitSSE {
+            let startPayload: [String: Any] = [
+                "type": "message_start",
+                "message": [
+                    "id": requestID,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": modelID,
+                    "content": [],
+                ],
+            ]
+            if let startData = try? JSONSerialization.data(withJSONObject: startPayload),
+               let startStr = String(data: startData, encoding: .utf8) {
+                let frame = "event: message_start\ndata: \(startStr)\n\n"
+                sseLines.append(frame)
+                if let onSSEFrame { await onSSEFrame(frame) }
+            }
+        }
+
+        for try await chunk in stream {
+            if !chunk.thinking.isEmpty {
+                fullThinking.append(chunk.thinking)
+                if emitSSE {
+                    let deltaObj: [String: Any] = [
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": [
+                            "type": "thinking_delta",
+                            "thinking": chunk.thinking,
+                        ],
+                    ]
+                    if let d = try? JSONSerialization.data(withJSONObject: deltaObj),
+                       let s = String(data: d, encoding: .utf8) {
+                        let frame = "event: content_block_delta\ndata: \(s)\n\n"
+                        sseLines.append(frame)
+                        if let onSSEFrame { await onSSEFrame(frame) }
+                    }
+                }
+            }
+            if !chunk.text.isEmpty {
+                fullText.append(chunk.text)
+                if emitSSE {
+                    let deltaObj: [String: Any] = [
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": [
+                            "type": "text_delta",
+                            "text": chunk.text,
+                        ],
+                    ]
+                    if let d = try? JSONSerialization.data(withJSONObject: deltaObj),
+                       let s = String(data: d, encoding: .utf8) {
+                        let frame = "event: content_block_delta\ndata: \(s)\n\n"
+                        sseLines.append(frame)
+                        if let onSSEFrame { await onSSEFrame(frame) }
+                    }
+                }
+            }
+            finalChunk = chunk
+        }
+
+        let perfExt = MessagesResponse.PerformanceExtension(
+            generationTPS: finalChunk.generationTPS,
+            promptTPS: finalChunk.promptTPS,
+            computePlacement: finalChunk.activeComputePlacement,
+            cache: finalChunk.cacheReport,
+            speculative: finalChunk.speculativeReport
+        )
+
+        if emitSSE {
+            struct MessageDeltaFrame: Encodable {
+                struct DeltaBody: Encodable {
+                    let stopReason: StopReason
+                    enum CodingKeys: String, CodingKey {
+                        case stopReason = "stop_reason"
+                    }
+                }
+                let type = "message_delta"
+                let delta: DeltaBody
+                let usage: MessagesResponse.Usage
+                let performance: MessagesResponse.PerformanceExtension
+            }
+            let msgDelta = MessageDeltaFrame(
+                delta: .init(stopReason: finalChunk.stopReason ?? .endTurn),
                 usage: MessagesResponse.Usage(
                     inputTokens: finalChunk.cacheReport?.processedTokens ?? finalChunk.promptTokens,
                     outputTokens: finalChunk.tokenCount,
@@ -860,8 +893,18 @@ public actor HeylookRouter {
                 ),
                 performance: perfExt
             )
-            return try HeylookHTTPResponse.json(response)
+            if let deltaData = try? JSONEncoder().encode(msgDelta),
+               let deltaStr = String(data: deltaData, encoding: .utf8) {
+                let frame = "event: message_delta\ndata: \(deltaStr)\n\n"
+                sseLines.append(frame)
+                if let onSSEFrame { await onSSEFrame(frame) }
+            }
+            let stopFrame = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            sseLines.append(stopFrame)
+            if let onSSEFrame { await onSSEFrame(stopFrame) }
         }
+
+        return (fullText, fullThinking, finalChunk, perfExt, sseLines)
     }
 
     /// Disconnect-resilient server-owned generation (`POST /v1/conversations/{id}/generate`).
@@ -919,40 +962,19 @@ public actor HeylookRouter {
                 defer {
                     Task { await registry.finish(requestID: requestID) }
                 }
-                var sseLines: [String] = []
-                var fullText = ""
-                var fullThinking = ""
-                var finalChunk = GenerationChunk()
-
                 let stream = await provider.generate(
                     requestID: requestID,
                     request: msgReq,
                     effectiveSampling: resolvedSampling.effective,
                     registry: registry
                 )
-                for try await chunk in stream {
-                    if !chunk.thinking.isEmpty {
-                        fullThinking.append(chunk.thinking)
-                        let deltaJSON = try String(
-                            data: JSONEncoder().encode(["type": "thinking_delta", "thinking": chunk.thinking]),
-                            encoding: .utf8
-                        ) ?? "{}"
-                        let frame = "event: content_block_delta\ndata: \(deltaJSON)\n\n"
-                        sseLines.append(frame)
-                        if let onSSEFrame { await onSSEFrame(frame) }
-                    }
-                    if !chunk.text.isEmpty {
-                        fullText.append(chunk.text)
-                        let deltaJSON = try String(
-                            data: JSONEncoder().encode(["type": "text_delta", "text": chunk.text]),
-                            encoding: .utf8
-                        ) ?? "{}"
-                        let frame = "event: content_block_delta\ndata: \(deltaJSON)\n\n"
-                        sseLines.append(frame)
-                        if let onSSEFrame { await onSSEFrame(frame) }
-                    }
-                    finalChunk = chunk
-                }
+                var consumed = try await Self.consumeStreamAndFormatSSE(
+                    requestID: requestID,
+                    modelID: generateRequest.model,
+                    stream: stream,
+                    emitSSE: true,
+                    onSSEFrame: onSSEFrame
+                )
 
                 let assistantPos = nextPos + 1
                 let savedAssistant = try store.appendMessage(
@@ -960,14 +982,14 @@ public actor HeylookRouter {
                         conversationID: conversationID,
                         position: assistantPos,
                         role: "assistant",
-                        content: fullText,
-                        thinking: fullThinking.isEmpty ? nil : fullThinking,
+                        content: consumed.fullText,
+                        thinking: consumed.fullThinking.isEmpty ? nil : consumed.fullThinking,
                         modelID: generateRequest.model,
-                        stopReason: finalChunk.stopReason ?? .endTurn,
-                        cacheReport: finalChunk.cacheReport,
-                        speculativeReport: finalChunk.speculativeReport,
-                        generationTPS: finalChunk.generationTPS,
-                        computePlacement: finalChunk.activeComputePlacement
+                        stopReason: consumed.finalChunk.stopReason ?? .endTurn,
+                        cacheReport: consumed.finalChunk.cacheReport,
+                        speculativeReport: consumed.finalChunk.speculativeReport,
+                        generationTPS: consumed.finalChunk.generationTPS,
+                        computePlacement: consumed.finalChunk.activeComputePlacement
                     )
                 )
 
@@ -976,13 +998,13 @@ public actor HeylookRouter {
                     userMessageID: userMsg.id,
                     assistantMessageID: savedAssistant.id,
                     position: assistantPos,
-                    stopReason: finalChunk.stopReason ?? .endTurn
+                    stopReason: consumed.finalChunk.stopReason ?? .endTurn
                 )
                 let savedJSON = try String(data: JSONEncoder().encode(savedEvent), encoding: .utf8) ?? "{}"
                 let savedFrame = "event: heylook_saved\ndata: \(savedJSON)\n\n"
-                sseLines.append(savedFrame)
+                consumed.sseLines.append(savedFrame)
                 if let onSSEFrame { await onSSEFrame(savedFrame) }
-                return Data(sseLines.joined().utf8)
+                return Data(consumed.sseLines.joined().utf8)
             }
         }
 
@@ -1445,8 +1467,14 @@ public enum EvalLabSuite {
             isLoaded: true,
             supportsVision: ProvenanceField(value: false, provenance: .derived, effect: .reload)
         )
-        await scheduler.register(provider: MLXSwiftProvider(description: vlmDesc), description: vlmDesc)
-        await scheduler.register(provider: MLXSwiftProvider(description: txtDesc), description: txtDesc)
+        await scheduler.register(
+            provider: MLXSwiftProvider(description: vlmDesc, allowSyntheticFallback: true),
+            description: vlmDesc
+        )
+        await scheduler.register(
+            provider: MLXSwiftProvider(description: txtDesc, allowSyntheticFallback: true),
+            description: txtDesc
+        )
         let router = HeylookRouter(store: store, scheduler: scheduler)
 
         let planResp = await router.handle(method: "POST", path: "/v1/models/eval-vlm/image-plan", body: Data("{}".utf8))

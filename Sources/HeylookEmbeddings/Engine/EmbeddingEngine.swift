@@ -246,7 +246,7 @@ public struct DeterministicHashEmbeddingEngine: EmbeddingEngine, Sendable {
     public let nativeDimensions: Int = Matryoshka.gemma2NativeDimensions
     public let supportedDimensions: [Int] = Matryoshka.gemma2Dimensions
 
-    public init(modelID: String = "embeddinggemma-2-MLX-BF16") {
+    public init(modelID: String = "deterministic-hash-768d") {
         self.modelID = modelID
     }
 

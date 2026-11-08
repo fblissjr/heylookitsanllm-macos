@@ -134,7 +134,23 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 ---
 
-## Next Horizons (Optional Post-Phase 11 Frontiers)
+## Phase 12: Architectural Simplification, Truthful Runtime & LLM Knowledge Wiki (Done)
+
+- [x] **12.1 Truthful Runtime (Zero Silent Synthetic Fallbacks)**:
+  - Defaulted `allowSyntheticFallback = false` across `MLXSwiftProvider`, `CoreAIProvider`, `GGUFSubprocessProvider`, and `ProviderFactory.makeProvider`; removed silent fake model registration and fake corpus seeding from `HeylookWorkbenchViewModel.bootstrap()`, `heylook-cli search`, and `heylook-cli chat` (exposing explicit `loadSampleDemoWorkspace()` in UI); and set `DeterministicHashEmbeddingEngine` / `HybridLocalEmbeddingEngine` fallback `modelID` to `"deterministic-hash-768d"` so hash vectors never poison `VectorStore.isUpToDate` for `"embeddinggemma-2-MLX-BF16"`, while wiring `HybridLocalEmbeddingEngine` to execute compiled Vision/Audio/Text `.mlmodelc` ANE towers via `ANECoreMLRuntime` when present.
+- [x] **12.2 Codebase Simplification & Modular File Splits**:
+  - Split monolithic `Sources/HeylookEngines/Providers/Providers.swift` (2,923 lines) into `StreamingPipeline.swift` (unifying the 4 token-streaming loops into a single `StreamingPipeline.transformEventStream` state machine + `ProviderFactory`), `MLXSwiftProvider.swift`, `CoreAIProvider.swift`, `GGUFSubprocessProvider.swift`, `RemoteHeylookProvider.swift`, and `SubprocessSupport.swift`.
+  - Split monolithic `Sources/HeylookUI/HeylookWorkbenchView.swift` (4,155 lines) into `HeylookWorkbenchViewModel.swift`, `HeylookWorkbenchView.swift`, and `Surfaces/` (`ChatWorkbenchSurface.swift`, `NotebookAndEmbeddingsSurfaces.swift`, `ModelsAndSystemSurfaces.swift`), and unified SSE framing in `HeylookRouter.consumeStreamAndFormatSSE`.
+- [x] **12.3 Engine & Wire Contract Hardening**:
+  - Preserved `reasoningFormat` and `thinkingControls` in `ComputeScheduler.applySidecarUpdate`; wired `HeylookWorkbenchViewModel.streamAssistantReply` to honor `currentResolvedSamplers` (`SamplerCascade`) and store clean `MessageRecord.content` without `[IMAGE: ...]` prefix pollution; added HTTP `400` validation for unsupported `thinking_depth` / `reasoning_effort` on `POST /v1/messages`; added `clip.projector_type` non-causal vision detection in `GGUFHeaderReader` + `--image-max-tokens <= ubatchSize` clamping in `GGUFSpawnConfig.autoSized`; and surfaced mid-stream `llama-server` `data: {"error": ...}` SSE frames.
+- [x] **12.4 LLM Knowledge Wiki & `AGENTS.md` Index Router**:
+  - Created the 8-page `docs/wiki/` knowledge base (`README.md`, `architecture_overview.md`, `engine_contract_and_provenance.md`, `providers_and_heterogeneous_compute.md`, `multimodal_embeddings_and_ane.md`, `wire_api_and_sqlite_store.md`, `model_family_onboarding.md`, `sharp_edges.md`) and refactored `AGENTS.md` as an Index Router.
+- [x] **12.5 Verification Suite**:
+  - Expanded `HeylookTests` to **28/28** passing unit, lifecycle, truthful-runtime, and wire-contract suites (`0.165s`).
+
+---
+
+## Next Horizons (Optional Post-Phase 12 Frontiers)
 
 - [ ] **H.1 Live Hardware Conversion & Throughput Certification (192 GB M2 Ultra Mac Studio)**:
   - Run live `heylook-cli convert-mlx` (`4-bit affine`, `mxfp4`, `q4_zero`) and `scripts/export_coreai.sh` against resident unquantized BF16 checkpoints and compare prefill/decode throughput and memory residency across Tier 1 (`MLXSwiftProvider`) and Tier 2 (`CoreAIProvider`).

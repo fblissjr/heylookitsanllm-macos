@@ -217,24 +217,8 @@ struct HeylookCLI {
 
             let stats = try store.stats()
             if stats.artifactCount == 0 {
-                // Seed a sample span if empty so `heylook-cli search` always demonstrates retrieval out of the box
-                let snippet = "Unified MLX GPU inference + Apple Neural Engine (ANE) co-residency."
-                let doc = Artifact(
-                    id: "vision-doc",
-                    collectionID: "default",
-                    kind: .text,
-                    url: URL(fileURLWithPath: "VISION.md"),
-                    title: "VISION.md",
-                    fingerprint: ContentFingerprint(byteCount: Int64(snippet.utf8.count), modifiedUnixMs: 1_700_000_000_000)
-                )
-                let outputs = try await engine.embedBatch(
-                    [EmbeddingInput(parts: [.text(snippet)], task: .document, title: doc.title)],
-                    dimensions: 768
-                )
-                if let vec = outputs.first?.vector {
-                    let chunk = EmbeddedChunk(id: "vision-doc#0", artifactID: doc.id, span: .whole, vector: vec, previewText: snippet)
-                    try store.upsert(artifact: doc, chunks: [chunk])
-                }
+                print("Vector store at \(storeURL.path) is empty (0 indexed artifacts). Run 'heylook-cli index <path>' first.")
+                return
             }
 
             let hits = try await coordinator.search(
@@ -282,20 +266,7 @@ struct HeylookCLI {
     static func registerConfiguredModels(into scheduler: ComputeScheduler) async -> [EngineDescription] {
         let cfg = HeylookConfig.loadDefault()
         let found = cfg.discoverConfiguredModels()
-        for desc in found {
-            let provider: any InferenceProvider
-            switch desc.provider {
-            case .mlx:
-                provider = MLXSwiftProvider(description: desc)
-            case .gguf:
-                provider = GGUFSubprocessProvider(description: desc)
-            case .coreai:
-                provider = CoreAIProvider(description: desc)
-            case .remote:
-                provider = RemoteHeylookProvider(baseURL: URL(string: "http://127.0.0.1:8000")!, description: desc)
-            }
-            await scheduler.register(provider: provider, description: desc)
-        }
+        await scheduler.registerDiscoveredModels(found)
         return found
     }
 
@@ -352,7 +323,7 @@ struct HeylookCLI {
                     supportsVision: ProvenanceField(value: false, provenance: .derived),
                     supportsThinking: ProvenanceField(value: true, provenance: .derived)
                 )
-                let prov = MLXSwiftProvider(description: adHoc)
+                let prov = ProviderFactory.makeProvider(for: adHoc)
                 await scheduler.register(provider: prov, description: adHoc)
                 selectedDesc = adHoc
             } else {
@@ -364,20 +335,8 @@ struct HeylookCLI {
             ?? discovered.first {
             selectedDesc = defMatch
         } else {
-            let fallback = EngineDescription(
-                modelID: "gemma-4-26b-a4b-it-mlx",
-                provider: .mlx,
-                modelPath: "models/mlx/Gemma-4-26B-A4B-IT",
-                architecture: ProvenanceField(value: "gemma4", provenance: .derived),
-                quantization: ProvenanceField(value: "4bit", provenance: .derived),
-                computePlacement: ProvenanceField(value: .hybridANEGPU, provenance: .configured, computePlacement: .hybridANEGPU),
-                contextSize: ProvenanceField(value: 32768, provenance: .derived),
-                flashAttention: ProvenanceField(value: true, provenance: .derived),
-                supportsVision: ProvenanceField(value: true, provenance: .derived),
-                supportsThinking: ProvenanceField(value: true, provenance: .derived)
-            )
-            await scheduler.register(provider: MLXSwiftProvider(description: fallback), description: fallback)
-            selectedDesc = fallback
+            print("No models discovered in configured scan_folders (\(cfg.scanFolders.joined(separator: ", "))). Pass '--model <path>' or configure heylook.toml.")
+            return
         }
 
         let registry = RequestRegistry()

@@ -168,6 +168,7 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
     public nonisolated let modelID: String
     public nonisolated let checkpointURL: URL
     public nonisolated let computeOptions: ModelComputeOptions
+    public nonisolated let hasCompiledANETowers: Bool
     public nonisolated let nativeDimensions: Int = Matryoshka.gemma2NativeDimensions
     public nonisolated let supportedDimensions: [Int] = Matryoshka.gemma2Dimensions
 
@@ -180,9 +181,11 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
     ) {
         self.checkpointURL = checkpointURL
         self.computeOptions = computeOptions
-        self.modelID = checkpointURL.lastPathComponent
+        let anePresent = ANETowerInspector.locateBundle(for: .textBackbone, in: checkpointURL) != nil
+        self.hasCompiledANETowers = anePresent
+        self.modelID = anePresent ? checkpointURL.lastPathComponent : "deterministic-hash-768d"
         self.aneRuntime = ANECoreMLRuntime(checkpointDirectory: checkpointURL)
-        self.fallbackHash = DeterministicHashEmbeddingEngine(modelID: checkpointURL.lastPathComponent)
+        self.fallbackHash = DeterministicHashEmbeddingEngine(modelID: "deterministic-hash-768d")
     }
 
     public func unload() async {
@@ -214,7 +217,12 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                 }
             }
 
-            let primary = fallbackHash.embed(text: seedText, dimensions: targetDim)
+            let primary: [Float]
+            if let aneVec = try await tryEmbedItemOnANE(item: item, targetDim: targetDim) {
+                primary = aneVec
+            } else {
+                primary = fallbackHash.embed(text: seedText, dimensions: targetDim)
+            }
             var windows = [EmbeddedOutput.WindowVector]()
 
             if let (videoURL, sampling) = windowedVideoRequest,
@@ -250,6 +258,70 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
             outputs.append(EmbeddedOutput(vector: primary, windows: windows))
         }
         return outputs
+    }
+
+    private func tryEmbedItemOnANE(item: EmbeddingInput, targetDim: Int) async throws -> [Float]? {
+        guard hasCompiledANETowers else { return nil }
+        let visionUnit: TowerComputeUnit = computeOptions.visionEncoder == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.visionEncoder
+        let audioUnit: TowerComputeUnit = computeOptions.audioEncoder == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.audioEncoder
+        let textUnit: TowerComputeUnit = computeOptions.textBackbone == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.textBackbone
+
+        var tokenIDs: [Int] = [2] // <bos>
+        var softTokens: [Float] = []
+
+        for part in item.parts {
+            switch part {
+            case .text(let s):
+                let formatted = (item.task == .document || item.task == .retrievalDocument)
+                    ? EmbeddingTask.documentPrompt(title: item.title, text: s)
+                    : (item.task.promptPrefix + s)
+                for scalar in formatted.unicodeScalars.prefix(512) {
+                    tokenIDs.append(100 + Int(scalar.value % 250_000))
+                }
+            case let .media(kind, _, _, url, _):
+                guard let url else { continue }
+                if kind == .image {
+                    guard let prep = ANECoreMLRuntime.prepareImagePixels(from: url, forVideoBudget: false),
+                          let enc = try await aneRuntime.encodeVision(
+                              pixels: prep.pixels,
+                              height: prep.height,
+                              width: prep.width,
+                              unit: visionUnit
+                          )
+                    else { return nil }
+                    tokenIDs.append(255999)
+                    tokenIDs.append(contentsOf: repeatElement(258880, count: enc.tokenCount))
+                    tokenIDs.append(258882)
+                    softTokens.append(contentsOf: enc.softTokens)
+                } else if kind == .audio {
+                    guard let pcm = try? await ArtifactProcessor.decodeMonoPCM(for: url),
+                          let mel = ANECoreMLRuntime.computeAudioLogMel(pcmSamples: pcm),
+                          let enc = try await aneRuntime.encodeAudio(
+                              melFeatures: mel.features,
+                              frameCount: mel.frameCount,
+                              unit: audioUnit
+                          )
+                    else { return nil }
+                    tokenIDs.append(256000)
+                    tokenIDs.append(contentsOf: repeatElement(258881, count: enc.tokenCount))
+                    tokenIDs.append(258883)
+                    softTokens.append(contentsOf: enc.softTokens)
+                }
+            }
+        }
+        tokenIDs.append(1) // <eos>
+        return try await aneRuntime.encodeTextAndFuse(
+            tokenIDs: tokenIDs,
+            softTokens: softTokens.isEmpty ? nil : softTokens,
+            unit: textUnit,
+            dimensions: targetDim
+        )
     }
 }
 

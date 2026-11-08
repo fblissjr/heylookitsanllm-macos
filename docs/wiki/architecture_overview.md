@@ -2,6 +2,14 @@
 
 `heylookitsanllm-macos` (`heylook`) is a multi-target Swift 6.2 package targeting **`macOS 27.2+`** and **`iOS 27.2+`**. It unifies the personal inference server and power-user workbench of `heylookitsanllm` with the native multimodal embedding and ANE/GPU tower-splitting architecture of `mbed`.
 
+For deep-dive subsystem documentation, see the [LLM Knowledge Wiki Index](./README.md):
+- [Engine Contract, Provenance & Sampler Cascade](./engine_contract_and_provenance.md)
+- [Providers, Unified Streaming Pipeline & Heterogeneous Compute](./providers_and_heterogeneous_compute.md)
+- [Multimodal Embeddings, ANE Towers & Matryoshka Store](./multimodal_embeddings_and_ane.md)
+- [HTTP/SSE Wire API & SQLite Store](./wire_api_and_sqlite_store.md)
+- [Model Family Onboarding & Porting Playbooks](./model_family_onboarding.md)
+- [Sharp Edges & Incident Rationales](./sharp_edges.md)
+
 ---
 
 ## 1. Execution Model: Direct In-Process Desktop vs. Optional Embedded Server
@@ -18,24 +26,24 @@ flowchart TB
     end
 
     subgraph SharedUI["HeylookUI (SwiftUI Multiplatform)"]
-        ChatSurface["Chat Workbench"]
-        NotebookSurface["Notebook"]
-        MediaSurface["Embeddings & Media Finder Studio (3-Column mbed)"]
-        ModelsSurface["Models & EngineDescription Inspector"]
-        PerfSurface["192 GB Memory, ANE/GPU & Server Monitor"]
+        VM["HeylookWorkbenchViewModel"]
+        ChatSurface["ChatWorkbenchSurface"]
+        NotebookSurface["NotebookSurface & EmbeddingsStudioSurface"]
+        ModelsSurface["ModelsInspectorSurface & PerfServerSurface"]
     end
 
-    subgraph ServerLayer["HeylookServer (Optional Embedded Listener, macOS)"]
-        Router["/v1/* HTTP + SSE Router\n(/v1/messages, /v1/embeddings, /v1/capabilities)"]
+    subgraph ServerLayer["HeylookServer (Optional Embedded Listener)"]
+        Router["HeylookRouter + SSEConnectionStreamer\n(/v1/messages, /v1/embeddings, /v1/capabilities)"]
         GenCoord["Disconnect-Resilient Generation\n(/v1/conversations/{id}/generate + heylook_saved)"]
     end
 
     subgraph EngineLayer["HeylookEngines (Heterogeneous Compute)"]
-        Sched["ComputeScheduler\n(GPU GenerationGate FIFO + ANE Co-Resident Lane)"]
-        MLX["MLXSwiftProvider\n(mlx-swift + mlx-swift-lm + PrefixCacheTracker)"]
-        CoreAI["CoreAIProvider\n(coreai-models .aimodel + SpeculativeReport)"]
-        GGUF["GGUFSubprocessProvider\n(llama-server -np 1 + 4-Rung Template + Auto-MTP)"]
-        Remote["RemoteHeylookProvider\n(URLSession SSE Client for iOS)"]
+        Sched["ComputeScheduler + ProviderFactory\n(GPU GenerationGate FIFO + ANE Co-Resident Lane)"]
+        Pipe["StreamingPipeline\n(Unified ReasoningParser + StripSpecials State Machine)"]
+        MLX["MLXSwiftProvider + MLXModelConverter"]
+        CoreAI["CoreAIProvider (Schema 0.1/0.2 .aimodel + ANE Speech)"]
+        GGUF["GGUFSubprocessProvider\n(llama-server -np 1 + Non-Causal Vision Clamping)"]
+        Remote["RemoteHeylookProvider (Bonjour/Tailscale SSE Client)"]
     end
 
     subgraph EmbeddingLayer["HeylookEmbeddings (Folded from mbed)"]
@@ -47,8 +55,8 @@ flowchart TB
 
     subgraph CoreLayer["HeylookCore (Domain, Config, Wire, Store)"]
         EDesc["EngineDescription & ProvenanceField"]
-        Cascade["SamplerCascade & ReasoningParser"]
-        TOML["HeylookConfig (heylook.toml + model.heylook.toml)"]
+        Cascade["SamplerCascade, ModelTemplateInfo & ReasoningParser"]
+        TOML["HeylookConfig (heylook.toml + model.heylook.toml + GGUFHeaderReader)"]
         SQL["SQLiteStore (Conversations, Messages, Notebooks, Presets)"]
     end
 
@@ -68,6 +76,9 @@ flowchart TB
     Sched --> CoreAI
     Sched --> GGUF
     Sched --> Remote
+    MLX --> Pipe
+    CoreAI --> Pipe
+    GGUF --> Pipe
     EmbeddingLayer --> ANE
     EmbeddingLayer --> Vec
     EngineLayer --> CoreLayer
@@ -78,32 +89,19 @@ flowchart TB
 
 ## 2. Core Invariants
 
-1. **Visibility & Provenance (`EngineDescription`)**:
-   Every loaded or registered model publishes an `EngineDescription` where each setting is wrapped in a `ProvenanceField<T>` recording:
-   - `value`: effective value in force,
-   - `provenance`: `derived` | `configured` | `observed` | `observed_cached` | `unknown` | `not_applicable`,
-   - `effect`: `per_request` | `reload` | `restart`,
-   - `computePlacement`: `mlx_gpu` | `ane` | `hybrid_ane_gpu` | `cpu_and_gpu` | `cpu_only` | `gguf_subprocess` | `remote`.
-2. **Heterogeneous GPU + ANE Co-Residency (`ComputeScheduler`)**:
-   - **GPU Lane (`GenerationGate`)**: Serializes Metal GPU LLM/VLM generation with bounded FIFO queue depth (`max_queue_depth`), answering `503 model_overloaded` on overflow.
-   - **ANE Co-Resident Lane (`ANELane`)**: Runs ANE-assigned models and towers (`TowerComputeUnit.cpuAndNeuralEngine`) concurrently on the Apple Neural Engine without acquiring the GPU gate or evicting pinned GPU models.
-3. **Disconnect-Resilient Generation (`/v1/conversations/{id}/generate`)**:
-   - Persists the user turn to `SQLiteStore` before generation starts, runs the provider stream inside a server-owned `Task` registered in `RequestRegistry`, and persists the assistant message (including partial content + `thinking` + `stop_reason = "cancelled"` on abort) even if the mobile client drops its SSE connection mid-flight.
-4. **Matryoshka Multimodal Vector Indexing (`HeylookEmbeddings`)**:
-   - Stores full `768d` `Float32` embeddings once in SQLite (`WAL` mode) and projects/L2-normalizes to `768`, `512`, `256`, or `128` dimensions at query time via Apple `Accelerate` (`vDSP`), grouping search hits by parent `Artifact` so multi-window videos or multi-page PDFs never produce duplicate cards.
-5. **5-Layer Deterministic Sampler Cascade (`SamplerCascade`)**:
-   - Resolves `builtin` -> `vendor generation_config.json` -> `model.heylook.toml` -> `preset` -> `request`, recording per-field provenance (`derived`, `configured`, or `request`).
-6. **4-Rung GGUF Template Ladder & Operator Overrides (`HeylookConfig` & `HeylookRouter`)**:
-   - Resolves `chat_template_path` (sidecar override) > `chat_template.heylook.jinja` (operator override via `GET/PUT/DELETE /v1/admin/models/{id}/chat-template`) > `chat_template.jinja` (vendor ship) > `gguf_embedded` (`tokenizer.chat_template` in GGUF metadata), without ever mutating vendor files.
-7. **Multimodal Capability Gating & Model-Derived Inspection (`/v1/messages`, `/image-plan`, `/prompt`)**:
-   - Rejects image or audio attachments sent to text-only models with HTTP `422 invalid_request_error` naming the offending media type, computes pre-send image token budgets from `processor_config.json` / `config.json` (`vision_config`) via `POST /v1/models/{id}/image-plan` (`409` when unloaded, `200` when resident), and renders model-derived formatted prompts via `POST /v1/conversations/{id}/prompt`.
-8. **Deterministic Memory & Subprocess Reclamation (`unload()` & `SubprocessLifecycleRegistry`)**:
-   - Every `InferenceProvider` and `EmbeddingEngine` implements `unload() async`: `MLXSwiftProvider` releases `ModelContainer` + `cachedKVCaches` and calls `MLX.GPU.clearCache()`; `ANECoreMLRuntime` evicts loaded `MLModel` instances and unmaps `embed_tokens_fp16.bin`; and `GGUFSubprocessProvider` terminates its `llama-server` process via `SubprocessLifecycleRegistry` (`SIGTERM` -> `SIGKILL` + `atexit` hook). `ComputeScheduler` automatically calls `provider.unload()` on explicit unload, GPU LRU eviction, and `unloadAllModels()`.
-9. **Incremental SSE Streaming (`SSEConnectionStreamer`) & Strict Execution Errors (`ProviderExecutionError`)**:
-   - `HeylookHTTPServer` flushes each SSE frame (`message_start`, `content_block_delta`, `message_delta`, `message_stop`, `heylook_saved`) immediately over `NWConnection` as tokens are generated rather than buffering the entire stream in memory, and strict providers surface `ProviderExecutionError` (`checkpointNotFound`, `binaryNotFound`, `runtimeUnavailable`) rather than silently echoing synthetic tokens.
-10. **Stateful Multi-Turn KV Slicing, GGUF Header Inspection, ANE Voice Handoff & `EvalLabSuite`**:
-    - `PrefixCacheTracker` tracks exact token counts and branch-edit truncations (`branchTruncationsCount`) alongside `HeylookConfig.discoverDrafter` speculative drafter telemetry (`SpeculativeReport`).
-    - `GGUFHeaderReader` parses GGUF v2/v3 binary KV headers (`general.architecture`, `<arch>.context_length`, `tokenizer.chat_template`, `clip.has_vision_encoder`, `clip.has_audio_encoder`, `general.sampling.*`, `*.ssm.*` hybrid-recurrent, and `*.nextn_predict_layers` built-in MTP), while `GGUFPortPool` assigns conflict-free loopback ports per `modelID` and `GGUFSubprocessProvider` queries `llama-server` `GET /props` on startup to upgrade `contextSize` and `templateSource` to `.observed` provenance.
-    - `POST /v1/conversations/{id}/voice-generate` runs 16 kHz PCM + 128-bin HTK log-mel transcription on the ANE lane (`CoreAIProvider.transcribeAudio`), emits `event: heylook_voice_transcribed`, and streams the disconnect-resilient response (`event: heylook_saved`), verified alongside `EvalLabSuite` (`heylook-cli eval-lab`).
-11. **Zero-Hardcoding Model Family Onboarding (`ModelTemplateInfo` & 4-Protocol `ReasoningParser`)**:
-    - `ModelTemplateInfo` inspects `chat_template.jinja`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`, `.aimodel/metadata.json` (`0.1` & `0.2`), and `.gguf` headers to derive each model's `ReasoningFormat` (`.tagPair`, `.gemmaChannel`, `.harmonyChannel`, `.recipientChannel`, `.none`), `ThinkingControls` (`supportsThinking`, `canDisableThinking`, `switchVariable`, `depthVariable`, `depthValues`), `strippableSpecialTokens`, and `eosTokenIDs`—feeding `MLXSwiftProvider` (`ModelConfiguration` + `MLXLMCommon.generate(input:cache:parameters:context:)`), `CoreAIProvider` (`LanguageModelBundle` / `CoreAIRunner`), `GGUFSubprocessProvider` (`chat_template_kwargs` + `/props` `.observed` upgrades), `MessagesRequest` (`thinking_depth` / `reasoning_effort` + full `SamplerSettings`), `renderPromptPreview`, and `HeylookWorkbenchView` without per-model-family branches. See [Model Family Onboarding & Porting Playbook](./model_family_onboarding.md).
+1. **Truthful Runtime (Zero Silent Synthetic Fallbacks)**:
+   - Production providers (`MLXSwiftProvider`, `CoreAIProvider`, `GGUFSubprocessProvider`, and `ProviderFactory`) default `allowSyntheticFallback = false` and fail loudly with `ProviderExecutionError` when weights or binaries are missing.
+   - `DeterministicHashEmbeddingEngine` and `HybridLocalEmbeddingEngine` (when compiled `.mlmodelc` ANE towers are absent) report `modelID = "deterministic-hash-768d"`, never masquerading as `"embeddinggemma-2-MLX-BF16"` in `VectorStore.isUpToDate`.
+2. **Visibility & Provenance (`EngineDescription`)**:
+   - Every model setting is wrapped in `ProvenanceField<T>` recording `value`, `provenance` (`derived` | `configured` | `observed` | `observed_cached`), `effect` (`per_request` | `reload` | `restart`), and `computePlacement`.
+3. **Heterogeneous GPU + ANE Co-Residency (`ComputeScheduler`)**:
+   - **GPU Lane (`GenerationGate`)**: Serializes Metal GPU LLM/VLM generation with bounded FIFO queue depth (`max_queue_depth`), answering `503 model_overloaded` on overflow, and enforces GPU LRU eviction (`provider.unload()`).
+   - **ANE Co-Resident Lane (`ANELane`)**: Runs ANE-assigned models and towers (`TowerComputeUnit.cpuAndNeuralEngine`) concurrently on the Apple Neural Engine without acquiring the GPU gate or evicting resident GPU models.
+4. **Disconnect-Resilient Generation (`/v1/conversations/{id}/generate` & `/voice-generate`)**:
+   - Persists the user turn to `SQLiteStore` before generation starts, runs the provider stream inside a server-owned `Task` registered in `RequestRegistry`, and persists the assistant message (`event: heylook_saved`) even if a mobile client drops its SSE connection mid-flight.
+5. **Matryoshka Multimodal Vector Indexing (`HeylookEmbeddings`)**:
+   - Stores full `768d` `Float32` embeddings once in SQLite (`WAL` mode) and slices/L2-normalizes to `768`, `512`, `256`, or `128` dimensions at query time via Apple `Accelerate` (`vDSP`), grouping search hits by parent `Artifact`.
+6. **5-Layer Deterministic Sampler Cascade (`SamplerCascade`)**:
+   - Resolves `builtin` -> `vendor generation_config.json` / GGUF `general.sampling.*` -> `model.heylook.toml` -> `preset` -> `request`, honored identically across HTTP routes and `HeylookWorkbenchViewModel`.
+7. **Zero-Hardcoding Model Family Onboarding (`ModelTemplateInfo` & `StreamingPipeline`)**:
+   - `ModelTemplateInfo` inspects checkpoint files directly on disk to derive `ReasoningFormat` (`.tagPair`, `.gemmaChannel`, `.harmonyChannel`, `.recipientChannel`, `.none`), `ThinkingControls` (`enable_thinking`, `reasoning_effort`, `reasoning_strength`), `strippableSpecialTokens`, and `eosTokenIDs`, feeding `StreamingPipeline.transformEventStream` across all providers without model-name branches.

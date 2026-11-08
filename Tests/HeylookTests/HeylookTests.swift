@@ -338,7 +338,7 @@ struct HeylookTests {
             supportsVision: ProvenanceField(value: true, provenance: .derived),
             supportsThinking: ProvenanceField(value: true, provenance: .derived)
         )
-        await scheduler.register(provider: MLXSwiftProvider(description: desc), description: desc)
+        await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
 
         let router = HeylookRouter(store: store, scheduler: scheduler, bindHost: "127.0.0.1")
 
@@ -474,7 +474,7 @@ struct HeylookTests {
             supportsVision: ProvenanceField(value: false, provenance: .derived),
             supportsThinking: ProvenanceField(value: true, provenance: .derived)
         )
-        let provider = CoreAIProvider(description: baseDesc)
+        let provider = CoreAIProvider(description: baseDesc, allowSyntheticFallback: true)
         let enriched = await provider.describe()
         #expect(enriched.contextSize.value == 16384)
         #expect(enriched.contextSize.provenance == .observed)
@@ -661,7 +661,7 @@ struct HeylookTests {
             supportsVision: ProvenanceField(value: true, provenance: .derived),
             supportsThinking: ProvenanceField(value: true, provenance: .derived)
         )
-        await scheduler.register(provider: MLXSwiftProvider(description: desc), description: desc)
+        await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
         let router = HeylookRouter(store: store, scheduler: scheduler)
 
         // 1. GET /v1/capabilities
@@ -852,8 +852,8 @@ struct HeylookTests {
             supportsVision: ProvenanceField(value: true, provenance: .derived),
             supportsThinking: ProvenanceField(value: true, provenance: .derived)
         )
-        await scheduler.register(provider: MLXSwiftProvider(description: textOnlyDesc), description: textOnlyDesc)
-        await scheduler.register(provider: MLXSwiftProvider(description: visionDesc), description: visionDesc)
+        await scheduler.register(provider: MLXSwiftProvider(description: textOnlyDesc, allowSyntheticFallback: true), description: textOnlyDesc)
+        await scheduler.register(provider: MLXSwiftProvider(description: visionDesc, allowSyntheticFallback: true), description: visionDesc)
         let router = HeylookRouter(store: store, scheduler: scheduler)
 
         let badReq = MessagesRequest(model: "qwen3-text-only", messages: [turn])
@@ -1066,7 +1066,7 @@ struct HeylookTests {
             supportsThinking: ProvenanceField(value: true, provenance: .derived),
             templateSource: ProvenanceField(value: "chat_template.jinja", provenance: .derived)
         )
-        await scheduler.register(provider: MLXSwiftProvider(description: desc), description: desc)
+        await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
         let router = HeylookRouter(store: store, scheduler: scheduler)
 
         let putResp = await router.handle(
@@ -1154,7 +1154,7 @@ struct HeylookTests {
             binaryPath: "/bin/sleep",
             modelPath: "/tmp/nonexistent-qwen3.gguf"
         )
-        let ggufProvider = GGUFSubprocessProvider(description: ggufDesc, spawnConfig: sleepSpawn)
+        let ggufProvider = GGUFSubprocessProvider(description: ggufDesc, spawnConfig: sleepSpawn, allowSyntheticFallback: true)
 
         let mlxDesc = EngineDescription(
             modelID: "gemma4-mlx-evictor",
@@ -1300,7 +1300,7 @@ struct HeylookTests {
             supportsThinking: ProvenanceField(value: true, provenance: .derived),
             templateSource: ProvenanceField(value: "chat_template.jinja", provenance: .derived)
         )
-        await scheduler.register(provider: MLXSwiftProvider(description: gemmaDesc), description: gemmaDesc)
+        await scheduler.register(provider: MLXSwiftProvider(description: gemmaDesc, allowSyntheticFallback: true), description: gemmaDesc)
         let router = HeylookRouter(store: store, scheduler: scheduler)
 
         // 1. Model-derived /v1/models/{id}/image-plan returns 1024 from vision_config
@@ -1606,7 +1606,7 @@ struct HeylookTests {
             modelPath: tempDir.path,
             isLoaded: true
         )
-        await scheduler.register(provider: MLXSwiftProvider(description: desc), description: desc)
+        await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
         let router = HeylookRouter(store: store, scheduler: scheduler)
 
         let voiceReq = ConversationVoiceGenerateRequest(
@@ -1702,7 +1702,7 @@ struct HeylookTests {
         // Verify HeylookRouter honors model.heylook.toml `thinking = false` when request omits `thinking`
         let store = try SQLiteStore(databaseURL: tempRoot.appendingPathComponent("audit.sqlite"))
         let scheduler = ComputeScheduler()
-        await scheduler.register(provider: MLXSwiftProvider(description: explicitDesc), description: explicitDesc)
+        await scheduler.register(provider: MLXSwiftProvider(description: explicitDesc, allowSyntheticFallback: true), description: explicitDesc)
         let router = HeylookRouter(store: store, scheduler: scheduler)
 
         let msgReq = MessagesRequest(
@@ -1962,7 +1962,8 @@ struct HeylookTests {
                 modelID: "qwen3.5-coreai",
                 provider: .coreai,
                 modelPath: coreaiBundle.path
-            )
+            ),
+            allowSyntheticFallback: true
         )
         var coreaiFinal = GenerationChunk()
         for try await chunk in await coreaiProvider.generate(
@@ -2238,5 +2239,155 @@ struct HeylookTests {
                 spec: MLXConversionSpec(bits: 4, groupSize: 64, mode: .affine, calibration: .q4Zero)
             )
         }
+    }
+
+    // MARK: - 28. Truthful Runtime Defaults, Sidecar Preservation, Non-Causal Vision Clamping & Thinking Depth Validation
+
+    @Test("Truthful runtime defaults, sidecar update preservation, GGUF non-causal vision ubatch clamping, SSE error frame propagation, and HTTP 400 thinking_depth validation")
+    func testTruthfulRuntimeDefaultsSidecarPreservationNonCausalClampingAndThinkingDepthValidation() async throws {
+        // 1. DeterministicHashEmbeddingEngine and HybridLocalEmbeddingEngine without .mlmodelc bundles report honest modelID
+        let hashEngine = DeterministicHashEmbeddingEngine()
+        #expect(hashEngine.modelID == "deterministic-hash-768d")
+
+        let missingEmbDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("missing_emb_\(UUID().uuidString)", isDirectory: true)
+        let hybridFallback = HybridLocalEmbeddingEngine(checkpointURL: missingEmbDir, computeOptions: .hybridANETowers)
+        #expect(hybridFallback.hasCompiledANETowers == false)
+        #expect(hybridFallback.modelID == "deterministic-hash-768d")
+
+        // 2. ProviderFactory routes .remote to RemoteHeylookProvider and defaults allowSyntheticFallback to false
+        let remoteDesc = EngineDescription(
+            modelID: "remote-studio-model",
+            provider: .remote,
+            modelPath: "http://127.0.0.1:8000"
+        )
+        let remoteProvider = ProviderFactory.makeProvider(for: remoteDesc)
+        #expect(remoteProvider is RemoteHeylookProvider)
+
+        // CoreAIProvider.transcribeAudio without TEXT: marker or .aimodel bundle fails loudly by default
+        let strictSpeechProvider = CoreAIProvider(
+            description: EngineDescription(
+                modelID: "ane-speech-strict",
+                provider: .coreai,
+                modelPath: missingEmbDir.path
+            )
+        )
+        await #expect(throws: ProviderExecutionError.self) {
+            _ = try await strictSpeechProvider.transcribeAudio(wavData: Data(repeating: 0, count: 128))
+        }
+
+        // 3. ComputeScheduler.applySidecarUpdate preserves reasoningFormat and thinkingControls
+        let scheduler = ComputeScheduler()
+        let initialHarmonyDesc = EngineDescription(
+            modelID: "gpt-oss-20b-mlx",
+            provider: .mlx,
+            modelPath: missingEmbDir.path,
+            supportsThinking: ProvenanceField(value: true, provenance: .derived, effect: .perRequest),
+            reasoningFormat: ProvenanceField(value: "harmony", provenance: .derived, effect: .perRequest),
+            thinkingControls: ThinkingControls(
+                supportsThinking: true,
+                canDisableThinking: true,
+                defaultEnabled: true,
+                depthVariable: "reasoning_effort",
+                depthValues: ["low", "medium", "high"]
+            ),
+            templateSource: ProvenanceField(value: "chat_template.jinja", provenance: .derived, effect: .reload)
+        )
+        await scheduler.register(
+            provider: MLXSwiftProvider(description: initialHarmonyDesc, allowSyntheticFallback: true),
+            description: initialHarmonyDesc
+        )
+        let sidecarPatch = ModelSidecarConfig(
+            id: "gpt-oss-20b-mlx",
+            provider: .mlx,
+            pinned: true,
+            ctxSize: 65536,
+            supportsThinking: true
+        )
+        let updatedHarmony = try await scheduler.applySidecarUpdate(sidecarPatch, for: "gpt-oss-20b-mlx")
+        #expect(updatedHarmony.reasoningFormat.value == "harmony")
+        #expect(updatedHarmony.thinkingControls?.depthVariable == "reasoning_effort")
+        #expect(updatedHarmony.thinkingControls?.depthValues == ["low", "medium", "high"])
+        #expect(updatedHarmony.contextSize.value == 65536)
+
+        // 4. GGUFHeaderReader detects non-causal clip.projector_type ("gemma4v") and GGUFSpawnConfig clamps imageMaxTokens <= ubatchSize
+        let tempGGUFDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_gemma4v_gguf_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempGGUFDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempGGUFDir) }
+
+        let mainGGUF = GGUFHeaderReader.buildMinimalGGUF(
+            stringMetadata: ["general.architecture": "gemma4"],
+            uint32Metadata: ["gemma4.context_length": 32768]
+        )
+        let mmprojGGUF = GGUFHeaderReader.buildMinimalGGUF(
+            stringMetadata: ["clip.projector_type": "gemma4v"],
+            boolMetadata: ["clip.has_vision_encoder": true]
+        )
+        let mainURL = tempGGUFDir.appendingPathComponent("gemma-4-26b-Q4_K_M.gguf")
+        let mmprojURL = tempGGUFDir.appendingPathComponent("mmproj-gemma-4-f16.gguf")
+        try mainGGUF.write(to: mainURL)
+        try mmprojGGUF.write(to: mmprojURL)
+
+        let mmprojHeader = try #require(GGUFHeaderReader.readFileHeader(at: mmprojURL))
+        #expect(mmprojHeader.clipProjectorType == "gemma4v")
+        #expect(mmprojHeader.hasNonCausalVisionProjector == true)
+
+        var clampSidecar = ModelSidecarConfig()
+        clampSidecar.imageMaxTokens = 2048
+        try clampSidecar.toTOML().write(
+            to: tempGGUFDir.appendingPathComponent("model.heylook.toml"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let gemmaGGUFDesc = EngineDescription(
+            modelID: "gemma4v-gguf",
+            provider: .gguf,
+            modelPath: tempGGUFDir.path,
+            supportsVision: ProvenanceField(value: true, provenance: .derived)
+        )
+        // With low headroom (2 GB), ubatchSize is 512, so imageMaxTokens (2048) must be clamped to 512 for non-causal gemma4v
+        let clampedSpawn = GGUFSpawnConfig.autoSized(for: gemmaGGUFDesc, headroomGB: 2.0)
+        #expect(clampedSpawn.ubatchSize == 512)
+        #expect(clampedSpawn.imageMaxTokens == 512)
+        GGUFPortPool.shared.releasePort(for: gemmaGGUFDesc.modelID)
+
+        // 5. GGUFSubprocessProvider.parseOpenAISSEDataLine surfaces mid-stream error frames
+        let errFrame = #"data: {"error":{"message":"KV cache slot exhausted","type":"server_error"}}"#
+        let parsedErrDelta = GGUFSubprocessProvider.parseOpenAISSEDataLine(errFrame)
+        #expect(parsedErrDelta?.errorMessage == "KV cache slot exhausted")
+
+        // 6. HeylookRouter validates thinking_depth / reasoning_effort and returns HTTP 400 on invalid level
+        let dbURL = tempGGUFDir.appendingPathComponent("depth_validation.sqlite")
+        let store = try SQLiteStore(databaseURL: dbURL)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        let badDepthReq = MessagesRequest(
+            model: "gpt-oss-20b-mlx",
+            messages: [.init(role: "user", content: "Test invalid depth")],
+            thinkingDepth: "ultra_extreme"
+        )
+        let badDepthResp = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(badDepthReq)
+        )
+        #expect(badDepthResp.status == 400)
+        let badDepthBody = String(decoding: badDepthResp.body, as: UTF8.self)
+        #expect(badDepthBody.contains("thinking_depth"))
+
+        let okDepthReq = MessagesRequest(
+            model: "gpt-oss-20b-mlx",
+            messages: [.init(role: "user", content: "Test valid depth")],
+            thinkingDepth: "high"
+        )
+        let okDepthResp = await router.handle(
+            method: "POST",
+            path: "/v1/messages",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(okDepthReq)
+        )
+        #expect(okDepthResp.status == 200)
     }
 }

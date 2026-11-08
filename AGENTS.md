@@ -1,26 +1,39 @@
 # AGENTS.md
 
-Operating guide for `heylookitsanllm-macos` — a native Swift 6.2 multiplatform (`macOS 27.2+` and `iOS 27.2+`) personal inference workbench, multimodal media/embedding finder, and embedded Hummingbird 2 HTTP/SSE server for Apple Silicon.
+Operating guide and **LLM Knowledge Wiki Index Router** for `heylookitsanllm-macos` — a native Swift 6.2 multiplatform (`macOS 27.2+` and `iOS 27.2+`) personal inference workbench, multimodal media/embedding studio, and embedded HTTP/SSE server for Apple Silicon.
 
-## Where to look first
+## Where to Look First
 
-- [VISION.md](./VISION.md): what the project is for. Breaks ties when a design choice is unclear.
-- [docs/wiki/architecture_overview.md](./docs/wiki/architecture_overview.md): end-to-end system topology, module boundaries, dual-lane GPU/ANE scheduler, and wire contract.
-- [docs/wiki/model_family_onboarding.md](./docs/wiki/model_family_onboarding.md): 100% Swift model-family support matrix, file-derived `ModelTemplateInfo` onboarding, and playbooks for porting new architectures to Tier 1 (`mlx-swift-lm`) and Tier 2 (`coreai-models` / ANE).
-- [docs/project/CURRENT.md](./docs/project/CURRENT.md) and [docs/project/TODO.md](./docs/project/TODO.md): subsystem status and phased backlog.
+- **[VISION.md](./VISION.md)**: Core design principles (*Visibility*, *Derive, Don't Copy*, *Truthful Runtime*, *Heterogeneous Apple Silicon Co-Residency*). Breaks ties when a design choice is unclear.
+- **[docs/wiki/README.md](./docs/wiki/README.md)**: Master entrypoint to the **LLM Knowledge Wiki**.
+- **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** and **[docs/project/TODO.md](./docs/project/TODO.md)**: Subsystem readiness matrix and phased roadmap.
+
+## LLM Knowledge Wiki Router (Read Before Editing an Area)
+
+Before modifying a subsystem, read the corresponding wiki page from `docs/wiki/`:
+
+| Area / Subsystem | File Glob / Targets | Knowledge Wiki Page |
+| :--- | :--- | :--- |
+| **System Topology & Invariants** | `Package.swift`, `Sources/HeylookApp/**`, `Sources/HeylookCLI/**` | [docs/wiki/architecture_overview.md](./docs/wiki/architecture_overview.md) |
+| **Engine Contract, Provenance, Samplers & Templates** | `Sources/HeylookCore/Domain/**`, `Sources/HeylookCore/Config/**` | [docs/wiki/engine_contract_and_provenance.md](./docs/wiki/engine_contract_and_provenance.md) |
+| **Providers, Streaming Pipeline & Dual-Lane Compute** | `Sources/HeylookEngines/**` | [docs/wiki/providers_and_heterogeneous_compute.md](./docs/wiki/providers_and_heterogeneous_compute.md) |
+| **Multimodal Embeddings, ANE Towers & Matryoshka Store** | `Sources/HeylookEmbeddings/**` | [docs/wiki/multimodal_embeddings_and_ane.md](./docs/wiki/multimodal_embeddings_and_ane.md) |
+| **HTTP/SSE Wire Contract & SQLite WAL Store** | `Sources/HeylookServer/**`, `Sources/HeylookCore/Wire/**`, `Sources/HeylookCore/Store/**` | [docs/wiki/wire_api_and_sqlite_store.md](./docs/wiki/wire_api_and_sqlite_store.md) |
+| **Model Onboarding, Quantization & Export Playbooks** | `Sources/HeylookCore/Domain/ModelTemplateInfo.swift`, `scripts/**` | [docs/wiki/model_family_onboarding.md](./docs/wiki/model_family_onboarding.md) |
+| **Sharp Edges & Incident Rationales** | Cross-cutting (`HeylookCore`, `HeylookEmbeddings`, `HeylookEngines`, `HeylookServer`, `HeylookUI`) | [docs/wiki/sharp_edges.md](./docs/wiki/sharp_edges.md) |
 
 ## Module Architecture
 
-| Target | Platforms | Role |
+| Target | Platforms | Key Files & Role |
 | :--- | :--- | :--- |
-| `HeylookCore` | `macOS 27.2+`, `iOS 27.2+` | Domain models, `EngineDescription` provenance contract (with `reasoningFormat` & `thinkingControls`), 5-layer `SamplerCascade` (`builtin` -> `vendor generation_config.json` / GGUF `general.sampling.*` -> `model.heylook.toml` -> `preset` -> `request`), `ModelTemplateInfo`, 4-protocol `ReasoningParser` & dynamic `StripSpecials`, `HeylookConfig` (`heylook.toml`, `model.heylook.toml` sidecars, `discoverConfiguredModels()` merging `scan_folders` + `[[models]]`, `resolveEffectiveSampling`, `defaultStoreURL` / `defaultVectorStoreURL`, 4-rung `chat_template` ladder, `GGUFHeaderReader` KV metadata parser, `estimateImageTokenBudget`, `renderPromptPreview`, and `mmproj`/drafter auto-discovery), `SQLiteStore` (`WAL` mode for conversations, messages, notebooks, presets), and Anthropic `/v1/messages` (`thinking_depth` / `reasoning_effort`) & `/v1/embeddings` wire types. |
-| `HeylookEmbeddings` | `macOS 27.2+`, `iOS 27.2+` | Folded from `mbed` (`MbedCore`): `Artifact`, `ArtifactSpan`, `VectorStore` (`SQLite3` + `vDSP` Matryoshka `768d`/`512d`/`256d`/`128d`), `ArtifactProcessor` & `WindowPlanner` (`16s`-stride `32s` video windows, `30s` audio windows, `PDFKit` page chunking), `FolderWatcher`, `IndexCoordinator`, `EmbeddingRequestLimits` (`v2.0.239` canonical batch/media bounds), `EmbeddingLabRunner`, `ModelComputeOptions`, `ANECoreMLRuntime` (with `unload()`), and `ANETowerInspector`. |
-| `HeylookEngines` | `macOS 27.2+`, `iOS 27.2+` | `InferenceProvider` (with `unload()`) & `ProviderExecutionError`, `ComputeScheduler` (serializing Metal GPU inference via `GenerationGate`, enforcing GPU LRU eviction teardown, and allowing concurrent ANE co-residency), `SubprocessLifecycleRegistry` (`SIGTERM` -> `SIGKILL` + `atexit`), `GGUFPortPool` (`18080+`), `HardwareMemoryMonitor`, `PrefixCacheTracker` (`branchTruncationsCount`), `MLXSwiftProvider` (`KVCacheSessionState` + `MLXLMCommon.generate(input:cache:parameters:context:)`, `ModelConfiguration` `extraEOSTokens`, VLM-to-LLM factory fallback, + `SpeculativeReport`), `MLXModelConverter` (pure-Swift `.safetensors` quantization & sharding via `LLMModelFactory.shared.convert` / `MLXLMCommon.convert`), `CoreAIProvider` (Schema 0.1/0.2 `.aimodel` manifest, `CoreAILanguageModels` `LanguageModelBundle`/`CoreAIRunner`, + `transcribeAudio`), `GGUFSubprocessProvider` (macOS, `ModelTemplateInfo` `chat_template_kwargs`, `ReasoningParser`, + `/props` provenance), and `RemoteHeylookProvider`. |
-| `HeylookServer` | `macOS 27.2+`, `iOS 27.2+` | Embedded HTTP + incremental SSE server (`HeylookHTTPServer` + `SSEConnectionStreamer` + `EvalLabSuite` + `BonjourServiceBrowser` `_heylook._tcp`) implementing `/v1/messages` (with HTTP 422 multimodal capability gating), `/v1/conversations/{id}/generate` & `/v1/conversations/{id}/voice-generate` (disconnect-resilient server-owned generation + `heylook_saved`), model-derived `/v1/conversations/{id}/prompt` & `/v1/models/{id}/image-plan`, `/v1/embeddings` (structured `content`/`prompt_name`/`windows` wire + `EmbeddingRequestLimits` HTTP 422 validation), `/v1/capabilities` (`embedding_limits`), `/v1/models`, `/v1/admin/models/unload-all`, `/v1/admin/models/{id}` (`GET`/`PATCH`/`load`/`unload`/`chat-template`), `/v1/conversations`, `/v1/notebooks`, `/v1/presets`, `/v1/requests/{id}`, and `/v1/system/metrics`. |
-| `HeylookUI` | `macOS 27.2+`, `iOS 27.2+` | Shared SwiftUI 5-surface workbench: **Chat Workbench** (with model-derived `ThinkingControls` & `Depth` picker), **Notebook**, **Embeddings & Media Finder Studio** (with **Compare-to-Lab Bridge**), **Models & Engine Inspector** (with `ModelSidecarEditorSheet` & `MLXModelConverterSheet`), and **Performance & Server Control**. |
+| `HeylookCore` | `macOS 27.2+`, `iOS 27.2+` | `EngineDescription` & `ProvenanceField`, 5-layer `SamplerCascade`, file-derived `ModelTemplateInfo` & `ThinkingControls`, 4-protocol `ReasoningParser` & dynamic `StripSpecials`, `HeylookConfig` (`heylook.toml`, `model.heylook.toml` with `image_max_tokens`, `discoverConfiguredModels()`, 4-rung `chat_template` ladder, `GGUFHeaderReader` with non-causal `clip.projector_type` detection), `SQLiteStore` (`WAL` mode), and `/v1/messages` & `/v1/embeddings` wire types. |
+| `HeylookEmbeddings` | `macOS 27.2+`, `iOS 27.2+` | `Artifact` & `ArtifactSpan`, `VectorStore` (`SQLite3` + `vDSP` Matryoshka `768d`/`512d`/`256d`/`128d` + truthful `model_id` invalidation), `ArtifactProcessor` & `WindowPlanner` (`16s`-stride `32s` video windows, `30s` audio windows, `PDFKit` page chunking), `FolderWatcher`, `IndexCoordinator`, `EmbeddingRequestLimits`, `EmbeddingLabRunner`, `ModelComputeOptions`, `ANECoreMLRuntime` + `HybridLocalEmbeddingEngine` (executing compiled Vision/Audio/Text `.mlmodelc` ANE towers), and `ANETowerInspector`. |
+| `HeylookEngines` | `macOS 27.2+`, `iOS 27.2+` | `ComputeScheduler` (`GenerationGate` + `ANELane` + `registerDiscoveredModels`), `ProviderFactory` & `StreamingPipeline` (`Providers/StreamingPipeline.swift`), `MLXSwiftProvider` & `MLXModelConverter` (`Providers/MLXSwiftProvider.swift`), `CoreAIProvider` & `CoreAIBundleManifest` (`Providers/CoreAIProvider.swift`), `GGUFSubprocessProvider` & `GGUFSpawnConfig` (`Providers/GGUFSubprocessProvider.swift`), `RemoteHeylookProvider` (`Providers/RemoteHeylookProvider.swift`), and `SubprocessLifecycleRegistry` & `GGUFPortPool` (`Providers/SubprocessSupport.swift`). |
+| `HeylookServer` | `macOS 27.2+`, `iOS 27.2+` | `HeylookHTTPServer`, `HeylookRouter` (with unified `consumeStreamAndFormatSSE`), `SSEConnectionStreamer`, `EvalLabSuite`, and `BonjourServiceBrowser` (`_heylook._tcp`) serving `/v1/messages` (with HTTP `400` `thinking_depth` validation & HTTP `422` capability gating), `/v1/conversations/{id}/generate` & `/voice-generate` (`heylook_saved`), `/v1/conversations/{id}/prompt`, `/v1/models/{id}/image-plan`, `/v1/embeddings`, `/v1/capabilities`, `/v1/models`, and `/v1/admin/models/*`. |
+| `HeylookUI` | `macOS 27.2+`, `iOS 27.2+` | `HeylookWorkbenchViewModel` (`HeylookWorkbenchViewModel.swift`), `HeylookRootView` (`HeylookWorkbenchView.swift`), and modular surface views under `Surfaces/` (`ChatWorkbenchSurface.swift`, `NotebookAndEmbeddingsSurfaces.swift`, `ModelsAndSystemSurfaces.swift`). |
 | `HeylookApp` | `macOS 27.2+`, `iOS 27.2+` | Native desktop & mobile app entry point + macOS `MenuBarExtra` server & model lifecycle controller. |
 | `heylook-cli` | `macOS 27.2+` | Unified CLI (`serve`, `status`, `doctor`, `models`, `chat`, `index`, `search`, `watched`, `inspect-ane`, `inspect-checkpoint`, `convert-mlx`, `eval-lab`). |
-| `HeylookTests` | `macOS 27.2+`, `iOS 27.2+` | Swift Testing (`@Suite`, `@Test`) 27-test unit, lifecycle, and wire-contract verification suite. |
+| `HeylookTests` | `macOS 27.2+`, `iOS 27.2+` | Swift Testing (`@Suite`, `@Test`) 28-test unit, lifecycle, truthful-runtime, and wire-contract verification suite. |
 
 ## Commands
 
@@ -40,6 +53,7 @@ Operating guide for `heylookitsanllm-macos` — a native Swift 6.2 multiplatform
   - `swift run heylook-cli inspect-checkpoint [dir]`
   - `swift run heylook-cli convert-mlx <src-dir> <dst-dir> [--bits 4|8] [--group-size 32|64] [--mode affine|mxfp4|mxfp8|nvfp4] [--calibration standard|q4_zero] [--overwrite] [--dry-run]`
   - `swift run heylook-cli chat [--model <id_or_path>] [--max-tokens <n>] [--no-thinking] "<prompt>"`
+  - `swift run heylook-cli eval-lab`
   - `swift run heylook-cli serve 8000`
 - Model conversion & export scripts:
   - Pure-Swift MLX quantization (`MLXLMCommon.convert`): `./scripts/build_native.sh cli convert-mlx <src-dir> <dst-dir> --bits 4 --group-size 64 --mode affine`
@@ -53,8 +67,9 @@ Operating guide for `heylookitsanllm-macos` — a native Swift 6.2 multiplatform
 
 ## Repo Rules
 
-1. **Remote SwiftPM Dependencies Only in `Package.swift`**: Always declare external dependencies using canonical remote `.package(url: "https://github.com/...", ...)` references, never local filesystem paths (`.package(path: ...)`). Use `swift package edit` or Xcode local overrides if testing uncommitted local framework changes.
+1. **Remote SwiftPM Dependencies Only in `Package.swift`**: Always declare external dependencies using canonical remote `.package(url: "https://github.com/...", ...)` references, never local filesystem paths (`.package(path: ...)`).
 2. **Path Privacy**: Never commit personal home-directory paths or personal full names in tracked files. Use repo-relative paths, `FileManager.default.homeDirectoryForCurrentUser`, or environment variables (`HEYLOOK_CONFIG`, `HEYLOOK_MODELS_DIR`, `HEYLOOK_DB_PATH`).
-3. **Derive, Don't Copy**: Derive capabilities, sampler schemas, and provenance fields from single canonical Swift definitions and model files.
-4. **No Migration Code**: Solo deployment. Schema updates in `SQLiteStore` use idempotent `CREATE TABLE IF NOT EXISTS` or clean table recreation.
-5. **Git Hygiene**: Stage files explicitly by name (`git add <file>`), never `git add -A` or `git add .`.
+3. **Truthful Runtime (No Silent Synthetic Fallbacks)**: Production providers and embedding engines must never silently fabricate output or masquerade hash vectors as real model embeddings (`allowSyntheticFallback` defaults to `false`).
+4. **Derive, Don't Copy**: Derive capabilities, sampler schemas, and provenance fields from single canonical Swift definitions and model files.
+5. **No Migration Code**: Solo deployment. Schema updates in `SQLiteStore` and `VectorStore` use idempotent `CREATE TABLE IF NOT EXISTS` or clean table recreation.
+6. **Git Hygiene**: Stage files explicitly by name (`git add <file>`), never `git add -A` or `git add .`.

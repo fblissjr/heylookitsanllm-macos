@@ -166,6 +166,17 @@ public actor ComputeScheduler {
         }
     }
 
+    /// Registers a batch of discovered `EngineDescription` entries using `ProviderFactory`.
+    public func registerDiscoveredModels(
+        _ discovered: [EngineDescription],
+        allowSyntheticFallback: Bool = false
+    ) async {
+        for desc in discovered {
+            let provider = ProviderFactory.makeProvider(for: desc, allowSyntheticFallback: allowSyntheticFallback)
+            await register(provider: provider, description: desc)
+        }
+    }
+
     public func listModels() -> [EngineDescription] {
         descriptions.values.sorted { $0.modelID.localizedStandardCompare($1.modelID) == .orderedAscending }
     }
@@ -181,12 +192,47 @@ public actor ComputeScheduler {
     }
 
     /// Applies an updated `ModelSidecarConfig` (`model.heylook.toml`) to `modelID` in-place,
-    /// marking modified fields with `.configured` provenance.
+    /// marking modified fields with `.configured` provenance and preserving `reasoningFormat`
+    /// and `thinkingControls`.
     @discardableResult
     public func applySidecarUpdate(_ sidecar: ModelSidecarConfig, for modelID: String) throws -> EngineDescription {
         guard let existing = descriptions[modelID] else {
             throw ComputeSchedulerError.modelNotFound(modelID)
         }
+        let updatedControls: ThinkingControls?
+        if let explicitThinking = sidecar.supportsThinking, let controls = existing.thinkingControls {
+            updatedControls = ThinkingControls(
+                supportsThinking: explicitThinking,
+                canDisableThinking: controls.canDisableThinking,
+                defaultEnabled: controls.defaultEnabled,
+                switchVariable: controls.switchVariable,
+                depthVariable: controls.depthVariable,
+                depthValues: controls.depthValues
+            )
+        } else {
+            updatedControls = existing.thinkingControls
+        }
+        let updatedTemplateSource: ProvenanceField<String>
+        let inspectedChatTemplate = HeylookConfig.inspectChatTemplate(
+            in: URL(fileURLWithPath: existing.modelPath),
+            fallbackSource: existing.templateSource.value
+        )
+        if let customTemplate = sidecar.chatTemplatePath, !customTemplate.isEmpty {
+            updatedTemplateSource = ProvenanceField(
+                value: customTemplate,
+                provenance: .configured,
+                effect: .reload
+            )
+        } else if inspectedChatTemplate.hasOverride {
+            updatedTemplateSource = ProvenanceField(
+                value: inspectedChatTemplate.source,
+                provenance: .configured,
+                effect: .reload
+            )
+        } else {
+            updatedTemplateSource = existing.templateSource
+        }
+
         let updated = EngineDescription(
             modelID: existing.modelID,
             provider: sidecar.provider ?? existing.provider,
@@ -215,7 +261,9 @@ public actor ComputeScheduler {
             thinkingBudget: sidecar.sampling.thinkingBudget.map {
                 ProvenanceField(value: $0, provenance: .configured, effect: .perRequest)
             } ?? existing.thinkingBudget,
-            templateSource: existing.templateSource,
+            reasoningFormat: existing.reasoningFormat,
+            thinkingControls: updatedControls,
+            templateSource: updatedTemplateSource,
             estimatedMemoryMB: existing.estimatedMemoryMB,
             tags: sidecar.tags.isEmpty ? existing.tags : sidecar.tags
         )
