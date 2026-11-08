@@ -16,24 +16,25 @@ Native Swift 6.2 personal inference workbench, multimodal media/embedding finder
 - **Folded Multimodal Embeddings & Media Finder (`HeylookEmbeddings`)**:
   - Integrates `mbed` directly: indexes `.video` (`16s`-stride overlapping `32s` windows with fixed `1 fps` or content-aware novelty selection + optional 16 kHz soundtrack), `.audio` (`30s` windows), `.image`, `.document` (`PDFKit` pages), `.code`, and `.text` into a SQLite (`WAL`) + `Accelerate` (`vDSP`) Matryoshka (`768d`/`512d`/`256d`/`128d`) vector store.
 - **Embedded `/v1/*` Server (`HeylookServer`)**:
-  - Serves incremental SSE (`SSEConnectionStreamer`) and non-streaming `POST /v1/messages` (with HTTP `422` multimodal capability gating), disconnect-resilient `POST /v1/conversations/{id}/generate` (with `event: heylook_saved`), model-derived `POST /v1/conversations/{id}/prompt` and `POST /v1/models/{id}/image-plan`, `POST /v1/embeddings`, `GET /v1/capabilities`, `GET /v1/models` (with full `EngineDescription` provenance), `POST /v1/admin/models/unload-all`, `GET/PATCH /v1/admin/models/{id}` + `load`/`unload`/`chat-template`, `/v1/conversations/*`, `/v1/notebooks/*`, `/v1/presets/*`, `/v1/requests/{id}/reasoning-end`, and `/v1/system/metrics`.
+  - Serves incremental SSE (`SSEConnectionStreamer`) and non-streaming `POST /v1/messages` (with HTTP `422` multimodal capability gating), disconnect-resilient `POST /v1/conversations/{id}/generate` & `POST /v1/conversations/{id}/voice-generate` (with `event: heylook_saved` & `event: heylook_voice_transcribed`), model-derived `POST /v1/conversations/{id}/prompt` (with `thinking_enabled` & `thinking_depth` resolution) and `POST /v1/models/{id}/image-plan`, `POST /v1/embeddings` (structured `content`/`prompt_name`/`windows` wire + `EmbeddingRequestLimits` HTTP `422` validation), `GET /v1/capabilities` (`embedding_limits`), `GET /v1/models` (with full `EngineDescription` provenance), `POST /v1/admin/models/unload-all`, `GET/PATCH /v1/admin/models/{id}` + `load`/`unload`/`chat-template`, `/v1/conversations/*`, `/v1/notebooks/*`, `/v1/presets/*`, `/v1/requests/{id}/reasoning-end`, and `/v1/system/metrics`.
 - **5-Surface Multiplatform SwiftUI Workbench (`HeylookUI`)**:
-  1. **Chat Workbench** (Load Panel with per-slider provenance pills, Preset Bar, model-derived Prompt Preview, multimodal drag-and-drop image/audio pills with `~tok` token budget badges, collapsible Thinking Block with live **End thinking**, inline message edit + **Save & Continue**, and `Cmd+Return` / `Esc` / `Cmd+N` / `Cmd+Shift+P` shortcuts).
+  1. **Chat Workbench** (Load Panel with per-slider provenance pills, model-derived `ThinkingControls` & `Depth` picker (`low`/`medium`/`high`/`max`), Preset Bar, model-derived Prompt Preview, multimodal drag-and-drop image/audio pills with `~tok` token budget badges, hands-free ANE voice turn handoff, collapsible Thinking Block with live **End thinking**, inline message edit + **Save & Continue**, and `Cmd+Return` / `Esc` / `Cmd+N` / `Cmd+Shift+P` shortcuts).
   2. **Notebook** (continuous buffer + **Save to Conversations**).
-  3. **Embeddings & Media Finder Studio** (3-column Media Finder with `AVPlayerView` & `frameTimes` jump pills, `ScoredFeatureBreakdownCard`, Pairwise Cosine Matrix Compare, and `Recall@K` / `MRR` Embedding Lab).
-  4. **Models & Engine Inspector** (`ModelSidecarEditorSheet` for `model.heylook.toml`, Pin / Load / Unload + **Unload All Models** controls, `EngineDescription` provenance table, and per-tower ANE residency inspector).
+  3. **Embeddings & Media Finder Studio** (3-column Media Finder with `AVPlayerView` & `frameTimes` jump pills, `ScoredFeatureBreakdownCard`, Pairwise Cosine Matrix Compare, **Compare-to-Lab Bridge**, and `Recall@K` / `MRR` Embedding Lab).
+  4. **Models & Engine Inspector** (`ModelSidecarEditorSheet` for `model.heylook.toml`, `MLXModelConverterSheet` for pure-Swift `.safetensors` quantization, Pin / Load / Unload / Re-scan + **Unload All Models** controls, `EngineDescription` provenance table, and per-tower ANE residency inspector).
   5. **Performance, Memory & Server Control** (192 GB Unified Memory & Metal wired limit gauge, ANE vs GPU residency bar, embedded server toggle, and Bonjour `_heylook._tcp` LAN scanner).
 
 ## Quick Start
 
 ```bash
-# Fast SwiftPM build & 26-suite verification run
+# Fast SwiftPM build & 27-suite verification run
 swift build
 swift test
 swift run heylook-cli eval-lab
 
-# Full native Xcode build (compiles Cmlx default.metallib + links MLX Swift & mlx-swift-lm from GitHub)
+# Full native Xcode build & test (compiles Cmlx default.metallib + links MLX Swift & mlx-swift-lm from GitHub)
 ./scripts/build_native.sh build
+./scripts/build_native.sh test
 ./scripts/build_native.sh app
 
 # Inspect hardware, 192 GB unified memory, discovered models, and ANE tower compute plans

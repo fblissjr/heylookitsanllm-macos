@@ -130,4 +130,15 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 - [x] **11.5 Model Family Onboarding, Conversion Pipelines & Porting Playbook (`docs/wiki/model_family_onboarding.md`)**:
   - Added `MLXModelConverter` (`heylook-cli convert-mlx` + `MLXModelConverterSheet` in `ModelsInspectorSurface` wrapping `LLMModelFactory.shared.convert` / `MLXLMCommon.convert` for `affine`, `mxfp4`, `mxfp8`, `nvfp4`, and `q4_zero` calibration), wired `EmbeddingRequestLimits` (`v2.0.239` canonical bounds + structured `content`/`prompt_name`/`windows` `/v1/embeddings` wire), synced full 3-tower CoreML ANE exporter in `scripts/export_ane_coreml.py`, added `scripts/export_coreai.sh` wrapping `coreai-models`, and documented the 3-tier pure-Swift model support matrix, Tier 1 / Tier 2 porting playbooks, hybrid ANE+GPU+CPU placement rules, and MLX Swift vs. Core AI trade-offs.
 - [x] **11.6 Verification Suite**:
-  - Expanded `HeylookTests` to **27/27** passing unit, lifecycle, and wire-contract suites (`0.158s`).
+  - Expanded `HeylookTests` to **27/27** passing unit, lifecycle, and wire-contract suites across both offline SwiftPM (`0.158s`) and full native `xcodebuild test` (`0.145s`).
+
+---
+
+## Next Horizons (Optional Post-Phase 11 Frontiers)
+
+- [ ] **H.1 Live Hardware Conversion & Throughput Certification (192 GB M2 Ultra Mac Studio)**:
+  - Run live `heylook-cli convert-mlx` (`4-bit affine`, `mxfp4`, `q4_zero`) and `scripts/export_coreai.sh` against resident unquantized BF16 checkpoints and compare prefill/decode throughput and memory residency across Tier 1 (`MLXSwiftProvider`) and Tier 2 (`CoreAIProvider`).
+- [ ] **H.2 Physical `iOS 27.2+` Device Deployment & Hybrid Failover**:
+  - Package and deploy `HeylookApp` to physical iPhone/iPad (`iOS 27.2+`) with on-device 4-bit ANE-palettized `.aimodel` bundles (`./scripts/export_coreai.sh --platform ios`) alongside Bonjour `_heylook._tcp` remote failover to the Mac Studio.
+- [ ] **H.3 Tier 2 Core AI Architecture Expansion**:
+  - Extend `coreai-models` export rules (ANE prefill + GPU decode) as upstream adds new multimodal and reasoning architectures.
