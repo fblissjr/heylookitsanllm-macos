@@ -50,3 +50,11 @@ Every non-obvious mechanism in `heylookitsanllm-macos` exists because a real har
 - **Portrait iPhone Video Orientation**:
   - **What bit**: `AVAssetImageGenerator` defaults `appliesPreferredTrackTransform = false`, decoding portrait iPhone videos sideways (`90°` rotated) and degrading vision embedding recall.
   - **The mechanism**: Every `AVAssetImageGenerator` in `ArtifactProcessor` sets `appliesPreferredTrackTransform = true`.
+
+---
+
+## 5. Toolchain & Build System Sharp Edges
+
+- **Homebrew `swift` (`macOS-14.0`) vs. Xcode `MacOSX27.2.sdk` (`27.0`) Manifest Linker Warning**:
+  - **What bit**: When `/opt/homebrew/opt/swift/bin/swift` precedes `/usr/bin/swift` in `$PATH`, running bare `swift build` emits `ld: warning: building for macOS-14.0, but linking with dylib '/usr/lib/swift/libswiftCore.dylib' which was built for newer version 27.0` while compiling `Package.swift` into a temporary manifest executable (`heylookitsanllm-macos-manifest`). Homebrew's open-source `swift-package` hardcodes `MinimumDeploymentTarget.default = macOS 14.0` for manifest compilation, while linking against Xcode's `MacOSX27.2.sdk` `.tbd` stubs (`27.0`).
+  - **The mechanism**: Package targets themselves compile cleanly for `arm64-apple-macosx27.2`. To silence the manifest-loader warning on the CLI, invoke Xcode's native Swift toolchain via `xcrun swift build` / `/usr/bin/swift build` (whose host target is `arm64-apple-macosx27.2.0`) or `brew unlink swift`.

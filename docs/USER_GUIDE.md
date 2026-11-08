@@ -33,16 +33,25 @@ To build and launch `heylook` with full in-process **MLX Swift** (`default.metal
 # Or open Package.swift in Xcode 26+ and run the `heylook-app` scheme on My Mac or iPhone/iPad
 ```
 
+> **Toolchain Note (`xcrun swift` vs. Homebrew `swift`)**: If Homebrew's open-source `swift` formula (`/opt/homebrew/opt/swift/bin/swift`) appears before `/usr/bin/swift` in your `$PATH`, running bare `swift build` prints a benign linker warning when compiling `Package.swift` itself (`ld: warning: building for macOS-14.0, but linking with dylib '/usr/lib/swift/libswiftCore.dylib' which was built for newer version 27.0`) because Homebrew SwiftPM hardcodes `-target arm64-apple-macosx14.0` for manifest evaluation against Xcode's `MacOSX27.2.sdk`. To avoid the warning, either prefix SwiftPM commands with `xcrun` (`xcrun swift build`, `xcrun swift test`) or run `brew unlink swift` so `swift` resolves to Xcode's native `arm64-apple-macosx27.2.0` toolchain (`/usr/bin/swift`).
+
 ### Configuring Model Discovery (`heylook.toml`)
 
-`heylook` discovers your local models from `heylook.toml` and never registers fake or synthetic models on startup. It checks the following locations in order:
+`heylook` discovers your local models from `heylook.toml` and never registers fake or synthetic models on startup. Copy `heylook.toml.example` to get started:
+
+```bash
+cp heylook.toml.example heylook.toml
+```
+
+It checks the following locations in order:
 
 1. `HEYLOOK_CONFIG` environment variable (explicit file path)
-2. `./heylook.toml` in the current working directory
-3. `~/.heylook/heylook.toml`
-4. `HEYLOOK_MODELS_DIR` environment variable (directory scan)
+2. `./heylook.toml` in the current working directory or repository root (gitignored)
+3. `~/Library/Application Support/Heylook/heylook.toml`
+4. `~/.heylook/heylook.toml`
+5. `HEYLOOK_MODELS_DIR` environment variable (directory scan)
 
-Example `~/.heylook/heylook.toml`:
+Example `heylook.toml`:
 
 ```toml
 host = "127.0.0.1"
@@ -52,18 +61,18 @@ max_queue_depth = 4
 
 [scan]
 folders = [
-  "~/Models/mlx",
-  "~/Models/gguf",
-  "~/Models/coreai"
+  "~/.heylook/models/mlx",
+  "~/.heylook/models/gguf",
+  "~/.heylook/models/coreai"
 ]
 
 # Optional explicit model entries (override scan defaults)
 [[models]]
 id = "Qwen3.5-27B-MLX-4bit"
 provider = "mlx"
-path = "~/Models/mlx/Qwen3.5-27B-MLX-4bit"
+path = "~/.heylook/models/mlx/Qwen3.5-27B-MLX-4bit"
 pinned = true
-context_size = 32768
+ctx_size = 32768
 ```
 
 What `heylook` discovers automatically inside each scan folder:

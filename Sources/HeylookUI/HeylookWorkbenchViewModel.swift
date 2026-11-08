@@ -18,7 +18,7 @@ public final class HeylookWorkbenchViewModel {
     public let registry: RequestRegistry
     public let router: HeylookRouter
     public let server: HeylookHTTPServer
-    public let config: HeylookConfig
+    public var config: HeylookConfig
 
     // Models & Engine State
     public var registeredModels: [EngineDescription] = []
@@ -1253,6 +1253,7 @@ public final class HeylookWorkbenchViewModel {
     }
 
     public func rescanConfiguredModels() async {
+        config = HeylookConfig.loadDefault()
         let discovered = config.discoverConfiguredModels()
         await scheduler.registerDiscoveredModels(discovered)
         registeredModels = await scheduler.listModels()
@@ -1260,7 +1261,7 @@ public final class HeylookWorkbenchViewModel {
             selectedModelID = first.modelID
         }
         await refreshMetrics()
-        statusBanner = "Rescanned model directories (\(registeredModels.count) models registered)."
+        statusBanner = "Rescanned heylook.toml (\(registeredModels.count) models across \(config.scanFolders.count) scan folders)."
     }
 
     public func shutdown() async {

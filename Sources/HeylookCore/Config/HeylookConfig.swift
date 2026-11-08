@@ -91,7 +91,9 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
         if let tcu = kv["text_compute_unit"]?.stringValue {
             config.textComputePlacement = ComputePlacement(rawValue: tcu)
         }
-        config.ctxSize = kv["ctx_size"]?.intValue ?? kv["cache_size"]?.intValue
+        config.ctxSize = kv["ctx_size"]?.intValue
+            ?? kv["context_size"]?.intValue
+            ?? kv["cache_size"]?.intValue
         config.flashAttn = kv["flash_attn"]?.boolValue
         config.supportsVision = kv["vision"]?.boolValue
         config.supportsThinking = kv["thinking_capable"]?.boolValue ?? kv["supports_thinking"]?.boolValue
@@ -283,20 +285,30 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         )
     }
 
-    /// Loads `heylook.toml` from `HEYLOOK_CONFIG`, `./heylook.toml`,
-    /// `~/Library/Application Support/Heylook/heylook.toml`, or `~/.heylook/heylook.toml`,
-    /// merging `HEYLOOK_MODELS_DIR` if present.
+    /// Loads `heylook.toml` from `HEYLOOK_CONFIG`, `./heylook.toml`, the package source root
+    /// (when launched from Xcode DerivedData), `~/Library/Application Support/Heylook/heylook.toml`,
+    /// or `~/.heylook/heylook.toml`, merging `HEYLOOK_MODELS_DIR` if present.
     public static func loadDefault() -> HeylookConfig {
         let env = ProcessInfo.processInfo.environment
         let fm = FileManager.default
         let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
+        #if os(macOS)
         let home = fm.homeDirectoryForCurrentUser
+        #else
+        let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        #endif
+        let sourceRepoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
 
         var candidates: [URL] = []
         if let custom = env["HEYLOOK_CONFIG"], !custom.isEmpty {
             candidates.append(URL(fileURLWithPath: (custom as NSString).expandingTildeInPath))
         }
         candidates.append(cwd.appendingPathComponent("heylook.toml"))
+        candidates.append(sourceRepoRoot.appendingPathComponent("heylook.toml"))
         candidates.append(defaultAppSupportDirectory.appendingPathComponent("heylook.toml"))
         candidates.append(home.appendingPathComponent(".heylook/heylook.toml"))
 

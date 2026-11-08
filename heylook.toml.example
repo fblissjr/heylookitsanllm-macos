@@ -1,0 +1,122 @@
+# ==============================================================================
+# heylook.toml.example — Global Server & Model Discovery Configuration
+# ==============================================================================
+#
+# Quick Start:
+#   1. Copy this file to one of the locations checked on startup (in order):
+#        - ./heylook.toml                                        (repo root / working dir; gitignored)
+#        - ~/Library/Application Support/Heylook/heylook.toml    (macOS Application Support)
+#        - ~/.heylook/heylook.toml                               (user home config)
+#      Or set HEYLOOK_CONFIG=/path/to/heylook.toml in your environment.
+#
+#   2. Point `folders` under `[scan]` below at the directory (or directories)
+#      containing your local MLX, GGUF, or Core AI (.aimodel / .mlmodelc) models.
+#
+#   3. In the running Heylook Workbench app, click "Re-scan Folders" in the top
+#      orange banner (or run `swift run heylook-cli models` in the terminal).
+# ==============================================================================
+
+# Optional default model ID selected on launch (defaults to first discovered model)
+# default_model = "Qwen3.5-27B-MLX-4bit"
+
+# Maximum number of GPU models kept resident in unified memory before LRU eviction.
+# (Pinned models and Apple Neural Engine / CoreML towers are exempt from GPU eviction.)
+max_loaded_models = 2
+
+# Maximum concurrent requests queued on the GPU GenerationGate before returning HTTP 503.
+max_queue_depth = 4
+
+# Embedded HTTP/SSE server settings (`/v1/messages`, `/v1/embeddings`, `/v1/models`, etc.)
+host = "127.0.0.1"
+port = 8000
+
+# Optional additional Host headers allowed by the DNS-rebinding guard when serving on LAN
+# allowed_hosts = ["mac-studio.local:8000", "192.168.1.50:8000"]
+
+# Optional bearer token required for `/v1/admin/*` model & template management routes
+# admin_token = "replace-with-local-admin-token"
+
+
+# ------------------------------------------------------------------------------
+# 1. Automatic Folder Scanning (Recommended)
+# ------------------------------------------------------------------------------
+# Heylook recursively scans each folder below and derives capabilities directly
+# from model files (`config.json`, `generation_config.json`, `chat_template.jinja`,
+# `.gguf` binary headers, and `.aimodel` manifests):
+#
+#   - MLX directories: folders with `config.json` + `*.safetensors`
+#     (chat, vision, audio, thinking, and `embeddinggemma-2-MLX-BF16`), plus
+#     auto-paired `-mtp` / `-assistant` speculative drafters.
+#   - GGUF checkpoints: single `.gguf` files, multi-shard `*-00001-of-*.gguf` sets,
+#     per-quant subdirectories (`UD-Q6_K_XL/`, `Q8_0/`), `mmproj*.gguf` vision/audio
+#     projectors, and sibling drafters (`MTP/`, `dspark/`, `dflash/`, `eagle3/`).
+#   - Core AI / ANE bundles: `.aimodel` and `.mlmodelc` directories.
+#
+# Note: You can also use a top-level `scan_folders = [...]` key instead of `[scan]`.
+[scan]
+folders = [
+  "~/.heylook/models",
+  # "~/.heylook/models/mlx",
+  # "~/.heylook/models/gguf",
+  # "~/.heylook/models/coreai",
+  # "~/.cache/huggingface/hub",
+]
+
+
+# ------------------------------------------------------------------------------
+# 2. Explicit Model Entries & Overrides (Optional)
+# ------------------------------------------------------------------------------
+# Anything in `[scan].folders` is discovered automatically with derived defaults.
+# Add `[[models]]` blocks below ONLY when you want to register a checkpoint outside
+# your scan folders or override a specific model's ID, residency, context window,
+# compute placement, or default sampling parameters.
+#
+# (Tip: You can also place a `model.heylook.toml` sidecar file directly inside any
+# model directory — or click "Edit Sidecar" in the Models surface — using the
+# same keys shown below.)
+
+# Example A: Pin a daily-driver MLX model in unified memory with a 32k context window
+# [[models]]
+# id = "Qwen3.5-27B-MLX-4bit"
+# provider = "mlx"                        # "mlx" | "gguf" | "coreai" | "remote"
+# path = "~/.heylook/models/mlx/Qwen3.5-27B-MLX-4bit"
+# pinned = true
+# ctx_size = 32768                        # (alias: `context_size` or `cache_size`)
+# flash_attn = true
+# compute_unit = "mlx_gpu"                # "mlx_gpu" | "hybrid_ane_gpu" | "ane" | "gguf_subprocess" | "cpu"
+# thinking = true
+# thinking_depth = "medium"               # "low" | "medium" | "high" | "max" (when supported by template)
+# thinking_budget = 4096
+# temperature = 0.7
+# top_p = 0.95
+# top_k = 40
+# min_p = 0.05
+# max_tokens = 2048
+# tags = ["daily", "coding", "thinking"]
+
+# Example B: Multimodal GGUF model via llama-server subprocess with vision token cap
+# [[models]]
+# id = "gemma-4-26b-a4b-it-Q4_K_M"
+# provider = "gguf"
+# path = "~/.heylook/models/gguf/gemma-4-26b-a4b-it-GGUF/gemma-4-26b-a4b-it-Q4_K_M.gguf"
+# ctx_size = 32768
+# flash_attn = true
+# vision = true
+# image_max_tokens = 512                  # Clamped to <= ubatch_size for non-causal vision projectors
+# # draft_model = "~/.heylook/models/gguf/gemma-4-26b-a4b-it-GGUF/MTP/mtp-draft.gguf"
+# # spec_type = "draft-mtp"
+# # chat_template_path = "chat_template.heylook.jinja"
+# # use_sidecar_chat_template = true
+# # unset = ["draft_model_path", "spec_type"]
+
+# Example C: EmbeddingGemma 2 with per-tower Apple Neural Engine (ANE) placement
+# [[models]]
+# id = "embeddinggemma-2-MLX-BF16"
+# provider = "mlx"
+# path = "~/.heylook/models/embeddinggemma-2-MLX-BF16"
+# pinned = true
+# compute_unit = "hybrid_ane_gpu"
+# vision_compute_unit = "ane"             # 100% ANE Vision Tower (.mlmodelc)
+# audio_compute_unit = "ane"              # 99% ANE Audio Conformer (.mlmodelc)
+# text_compute_unit = "mlx_gpu"           # "mlx_gpu" or "ane"
+# tags = ["embeddings", "ane", "multimodal"]

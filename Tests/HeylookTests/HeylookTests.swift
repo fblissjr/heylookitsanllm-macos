@@ -80,6 +80,23 @@ struct HeylookTests {
         let sidecarTOML = sidecar.toTOML()
         let parsedSidecar = ModelSidecarConfig.parseTOML(sidecarTOML)
         #expect(parsedSidecar == sidecar)
+
+        let aliasSidecar = ModelSidecarConfig.parseTOML("context_size = 32768\n")
+        #expect(aliasSidecar.ctxSize == 32768)
+
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let exampleURL = repoRoot.appendingPathComponent("heylook.toml.example")
+        let exampleText = try? String(contentsOf: exampleURL, encoding: .utf8)
+        #expect(exampleText != nil)
+        if let exampleText {
+            let parsedExample = HeylookConfig.parseTOML(exampleText)
+            #expect(parsedExample.serverHost == "127.0.0.1")
+            #expect(parsedExample.serverPort == 8000)
+            #expect(parsedExample.scanFolders == ["~/.heylook/models"])
+        }
     }
 
     @Test("SQLiteStore persists conversations, messages, Save & Continue truncation, and notebooks in WAL mode")

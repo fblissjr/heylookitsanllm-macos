@@ -36,9 +36,11 @@ Native Swift 6.2 personal inference workbench, multimodal media/embedding studio
 
 ```bash
 # Fast SwiftPM build & 28-test verification run
-swift build
-swift test
-swift run heylook-cli eval-lab
+# (Use `xcrun swift` if Homebrew `swift` is installed first in $PATH to avoid
+# Homebrew's macOS-14.0 Package.swift manifest linker warning against MacOSX27.2.sdk)
+xcrun swift build
+xcrun swift test
+xcrun swift run heylook-cli eval-lab
 
 # Full native Xcode build & test (compiles Cmlx default.metallib + links MLX Swift & mlx-swift-lm from GitHub)
 ./scripts/build_native.sh build
