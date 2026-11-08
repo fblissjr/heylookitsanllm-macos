@@ -5,6 +5,7 @@ Operating guide and **LLM Knowledge Wiki Index Router** for `heylookitsanllm-mac
 ## Where to Look First
 
 - **[VISION.md](./VISION.md)**: Core design principles (*Visibility*, *Derive, Don't Copy*, *Truthful Runtime*, *Heterogeneous Apple Silicon Co-Residency*). Breaks ties when a design choice is unclear.
+- **[docs/USER_GUIDE.md](./docs/USER_GUIDE.md)**: Complete operator guide to the 5-surface Workbench app, `heylook.toml` setup, `heylook-cli`, and `/v1/*` API usage.
 - **[docs/wiki/README.md](./docs/wiki/README.md)**: Master entrypoint to the **LLM Knowledge Wiki**.
 - **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** and **[docs/project/TODO.md](./docs/project/TODO.md)**: Subsystem readiness matrix and phased roadmap.
 
