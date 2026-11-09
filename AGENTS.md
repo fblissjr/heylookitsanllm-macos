@@ -58,6 +58,7 @@ Before modifying a subsystem, read the corresponding wiki page from `docs/wiki/`
   - `swift run heylook-cli eval-lab`
   - `swift run heylook-cli serve 8000`
 - Model conversion, export & agent skills sync scripts:
+  - One-command environment, Xcode, Metal, iOS Simulator, skills & `swift-lsp` plugin updater: `./scripts/update_dev_env.sh [--upgrade-xcode] [--update-packages] [--build]`
   - Sync Apple Xcode 27.x (`xcrun agent skills export`), Xcode `AdditionalDocumentation`, and `coreai-models` skills into `.agents/skills/`: `./scripts/sync_agent_skills.sh`
   - Pure-Swift MLX quantization (`MLXLMCommon.convert`): `./scripts/build_native.sh cli convert-mlx <src-dir> <dst-dir> --bits 4 --group-size 64 --mode affine`
   - Core AI `.aimodel` export (`coreai-models` + `xcrun coreai-build`): `./scripts/export_coreai.sh [list|llm|gemma4|embedding|compile] ...`
