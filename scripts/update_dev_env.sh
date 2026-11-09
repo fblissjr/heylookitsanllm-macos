@@ -227,33 +227,9 @@ echo "==> [5/6] Updating Antigravity (agy) plugins..."
 if [[ "$SKIP_PLUGINS" -eq 1 ]]; then
     echo "    [skip] Skipping Antigravity plugin update (--skip-plugins)."
 elif command -v agy >/dev/null 2>&1; then
-    PLUGIN_SOURCE="${HEYLOOK_AGY_PLUGINS_SOURCE:-}"
-    if [[ -z "$PLUGIN_SOURCE" ]]; then
-        for candidate in "$HOME"/gemini/*/skills "$REPO_ROOT"/../../gemini/*/skills; do
-            if [[ -d "$candidate" ]]; then
-                repo_dir="$(cd "$candidate/.." && pwd)"
-                if [[ -d "$repo_dir/.git" ]]; then
-                    raw_remote="$(git -C "$repo_dir" config --get remote.origin.url 2>/dev/null || true)"
-                    gh_https="$(echo "$raw_remote" | sed -E 's#^git@github\.com:#https://github.com/#; s#\.git$##')"
-                    if [[ "$gh_https" == https://github.com/* ]]; then
-                        PLUGIN_SOURCE="${gh_https}/tree/main/skills"
-                    else
-                        PLUGIN_SOURCE="$candidate"
-                    fi
-                else
-                    PLUGIN_SOURCE="$candidate"
-                fi
-                break
-            fi
-        done
-    fi
-
-    if [[ -n "$PLUGIN_SOURCE" ]]; then
-        echo "    Installing/updating plugins from $PLUGIN_SOURCE..."
-        run_cmd agy plugin install "$PLUGIN_SOURCE"
-    else
-        echo "    [info] Set HEYLOOK_AGY_PLUGINS_SOURCE=<repo-url-or-path> to auto-update agy plugins."
-    fi
+    PLUGIN_SOURCE="${HEYLOOK_AGY_PLUGINS_SOURCE:-https://github.com/fblissjr/fb-gemini-plugins/tree/main/skills}"
+    echo "    Installing/updating plugins from $PLUGIN_SOURCE..."
+    run_cmd agy plugin install "$PLUGIN_SOURCE"
 else
     echo "    [info] 'agy' CLI not found on PATH; skipping plugin update."
 fi
