@@ -1,56 +1,110 @@
 #!/usr/bin/env bash
-# Synchronizes Apple's official Xcode 27.x agent skills (xcrun agent skills export),
-# Xcode's bundled IDEIntelligenceChat AdditionalDocumentation guides, and optional
-# Apple CoreAI agent skills (working-with-coreai, model-authoring,
-# model-compression-exploration) into the workspace's .agents/skills/ directory
-# for automatic Antigravity (agy) discovery and sandbox-safe reading.
+# Synchronizes project-specific external agent skills into the workspace's
+# .agents/skills/ directory for Antigravity (agy) discovery and sandbox-safe reading.
+#
+# Architecture (2-Tier Skill Boundary):
+#   - Tier 1 (Global Plugin — 'swift-lsp'): Indexes all 170+ Xcode 27.x Agent Skills,
+#     AdditionalDocumentation guides, Swift diagnostic docs, and .swiftinterface headers
+#     directly from $(xcode-select -p) via 'swift_sdk_interface(module: "XcodeSkills" | "XcodeDocs")'.
+#   - Tier 2 (Repo-Local — '.agents/skills/'): Holds ONLY project-specific external skills
+#     not bundled in Xcode.app — specifically the 5 Apple CoreAI ('apple/coreai-models') skills.
+#
+# Usage:
+#   ./scripts/sync_agent_skills.sh [--include-xcode] [target-skills-dir]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SKILLS_DIR="${1:-$REPO_ROOT/.agents/skills}"
+
+INCLUDE_XCODE=0
+SKILLS_DIR="$REPO_ROOT/.agents/skills"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --include-xcode|--all-xcode)
+            INCLUDE_XCODE=1
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            SKILLS_DIR="$1"
+            shift
+            ;;
+    esac
+done
 
 mkdir -p "$SKILLS_DIR"
-
-DEV_DIR="$(xcode-select -p 2>/dev/null || echo "/Applications/Xcode.app/Contents/Developer")"
-XCODE_CONTENTS="$(cd "$DEV_DIR/.." && pwd)"
-IDE_CHAT_RES="$XCODE_CONTENTS/PlugIns/IDEIntelligenceChat.framework/Versions/A/Resources"
-ADD_DOCS_DIR="$IDE_CHAT_RES/AdditionalDocumentation"
-
-echo "==> 1. Exporting official Apple Xcode 27.x Agent Skills..."
 chmod -R u+w "$SKILLS_DIR" 2>/dev/null || true
-if xcrun --find agent >/dev/null 2>&1 && xcrun agent skills export --replace-existing "$SKILLS_DIR" 2>/dev/null; then
-    chmod -R u+w "$SKILLS_DIR" 2>/dev/null || true
-elif [[ -d "$IDE_CHAT_RES" ]]; then
-    for tmpl in "$IDE_CHAT_RES"/*.idechatprompttemplate; do
-        [[ -f "$tmpl" ]] || continue
-        if head -n 1 "$tmpl" | grep -q '^---$'; then
-            skill_name="$(basename "$tmpl" .idechatprompttemplate)"
-            mkdir -p "$SKILLS_DIR/$skill_name/references"
-            cp -f "$tmpl" "$SKILLS_DIR/$skill_name/SKILL.md"
-            chmod u+w "$SKILLS_DIR/$skill_name/SKILL.md"
-            for ref in "$IDE_CHAT_RES/${skill_name}-ref-"*.md.packaged; do
-                [[ -f "$ref" ]] || continue
-                ref_base="$(basename "$ref" .md.packaged)"
-                ref_name="${ref_base#${skill_name}-ref-}.md"
-                cp -f "$ref" "$SKILLS_DIR/$skill_name/references/$ref_name"
-                chmod u+w "$SKILLS_DIR/$skill_name/references/$ref_name"
-            done
-            echo "    ✓ Unpacked Xcode skill: $skill_name"
+
+XCODE_SKILL_NAMES=(
+    "adopt-c-bounds-safety"
+    "app-intents-specialist"
+    "app-intents-whats-new-27"
+    "app-resizability"
+    "audit-xcode-security-settings"
+    "building-document-based-swiftui-applications"
+    "device-interaction"
+    "macos-touch-gestures"
+    "modernize-tests"
+    "siri-app-integration"
+    "siri-evaluations"
+    "swiftui-specialist"
+    "swiftui-whats-new-27"
+    "translation"
+    "translation-coordinator"
+    "xcode-27-guides"
+    "xctrace"
+)
+
+if [[ "$INCLUDE_XCODE" -eq 0 ]]; then
+    echo "==> 1. Pruning duplicate Xcode skills from $SKILLS_DIR (served globally by 'swift-lsp')..."
+    PRUNED=0
+    for name in "${XCODE_SKILL_NAMES[@]}"; do
+        if [[ -d "$SKILLS_DIR/$name" ]]; then
+            chmod -R u+w "$SKILLS_DIR/$name" 2>/dev/null || true
+            rm -rf "$SKILLS_DIR/$name"
+            PRUNED=$((PRUNED + 1))
         fi
     done
+    echo "    ✓ Removed $PRUNED duplicate Xcode skill directories (pass --include-xcode to export them locally)."
 else
-    echo "    [warn] Neither 'xcrun agent' nor IDEIntelligenceChat resources found."
-fi
+    DEV_DIR="$(xcode-select -p 2>/dev/null || echo "/Applications/Xcode.app/Contents/Developer")"
+    XCODE_CONTENTS="$(cd "$DEV_DIR/.." && pwd)"
+    IDE_CHAT_RES="$XCODE_CONTENTS/PlugIns/IDEIntelligenceChat.framework/Versions/A/Resources"
+    ADD_DOCS_DIR="$IDE_CHAT_RES/AdditionalDocumentation"
 
-echo "==> 2. Materializing Xcode IDEIntelligenceChat AdditionalDocumentation guides..."
+    echo "==> 1. Exporting official Apple Xcode 27.x Agent Skills (--include-xcode)..."
+    if xcrun --find agent >/dev/null 2>&1 && xcrun agent skills export --replace-existing "$SKILLS_DIR" 2>/dev/null; then
+        chmod -R u+w "$SKILLS_DIR" 2>/dev/null || true
+    elif [[ -d "$IDE_CHAT_RES" ]]; then
+        for tmpl in "$IDE_CHAT_RES"/*.idechatprompttemplate; do
+            [[ -f "$tmpl" ]] || continue
+            if head -n 1 "$tmpl" | grep -q '^---$'; then
+                skill_name="$(basename "$tmpl" .idechatprompttemplate)"
+                mkdir -p "$SKILLS_DIR/$skill_name/references"
+                cp -f "$tmpl" "$SKILLS_DIR/$skill_name/SKILL.md"
+                chmod u+w "$SKILLS_DIR/$skill_name/SKILL.md"
+                for ref in "$IDE_CHAT_RES/${skill_name}-ref-"*.md.packaged; do
+                    [[ -f "$ref" ]] || continue
+                    ref_base="$(basename "$ref" .md.packaged)"
+                    ref_name="${ref_base#${skill_name}-ref-}.md"
+                    cp -f "$ref" "$SKILLS_DIR/$skill_name/references/$ref_name"
+                    chmod u+w "$SKILLS_DIR/$skill_name/references/$ref_name"
+                done
+                echo "    ✓ Unpacked Xcode skill: $skill_name"
+            fi
+        done
+    fi
 
-if [[ -d "$ADD_DOCS_DIR" ]]; then
-    GUIDES_SKILL_DIR="$SKILLS_DIR/xcode-27-guides"
-    mkdir -p "$GUIDES_SKILL_DIR/references"
-    cp -f "$ADD_DOCS_DIR"/*.md "$GUIDES_SKILL_DIR/references/"
-    cat > "$GUIDES_SKILL_DIR/SKILL.md" <<'EOF'
+    if [[ -d "$ADD_DOCS_DIR" ]]; then
+        GUIDES_SKILL_DIR="$SKILLS_DIR/xcode-27-guides"
+        mkdir -p "$GUIDES_SKILL_DIR/references"
+        cp -f "$ADD_DOCS_DIR"/*.md "$GUIDES_SKILL_DIR/references/"
+        cat > "$GUIDES_SKILL_DIR/SKILL.md" <<'EOF'
 ---
 name: xcode-27-guides
 description: "Authoritative Apple Xcode 27 AdditionalDocumentation guides covering Liquid Glass in SwiftUI/AppKit/UIKit/WidgetKit, SwiftUI New Toolbar Features, Styled Text Editing (AttributedString/AttributedTextSelection), Swift 6.2/6.4 Concurrency Updates, InlineArray & Span, FoundationModels on-device LLM, AppIntents Updates, SwiftData Class Inheritance, StoreKit, WebKit, and 3D Swift Charts."
@@ -58,39 +112,14 @@ description: "Authoritative Apple Xcode 27 AdditionalDocumentation guides coveri
 
 # Xcode 27 Additional Documentation Guides (`xcode-27-guides`)
 
-These guides are bundled directly inside Xcode 27 (`IDEIntelligenceChat.framework/Versions/A/Resources/AdditionalDocumentation/`) and provide Apple's canonical implementation patterns and code examples. Read the matching reference file before implementing or reviewing code in these areas:
-
-## Liquid Glass & Design System
-- [`references/SwiftUI-Implementing-Liquid-Glass-Design.md`](references/SwiftUI-Implementing-Liquid-Glass-Design.md): `.glassEffect`, `GlassEffectContainer`, `.buttonStyle(.glass)`, `.buttonStyle(.glassProminent)`, `.glassEffectID`, `.backgroundExtensionEffect()`.
-- [`references/AppKit-Implementing-Liquid-Glass-Design.md`](references/AppKit-Implementing-Liquid-Glass-Design.md): `NSGlassEffectView`, `NSGlassEffectContainerView`.
-- [`references/UIKit-Implementing-Liquid-Glass-Design.md`](references/UIKit-Implementing-Liquid-Glass-Design.md): UIKit Liquid Glass materials and containers.
-- [`references/WidgetKit-Implementing-Liquid-Glass-Design.md`](references/WidgetKit-Implementing-Liquid-Glass-Design.md): Accented and glass widget rendering.
-
-## SwiftUI Controls, Toolbars & Text Editing
-- [`references/SwiftUI-New-Toolbar-Features.md`](references/SwiftUI-New-Toolbar-Features.md): `ToolbarSpacer(.fixed | .flexible)`, `.toolbar(id:)`, `DefaultToolbarItem`, `.searchToolbarBehavior(.minimize)`, `.sharedBackgroundVisibility`.
-- [`references/SwiftUI-Styled-Text-Editing.md`](references/SwiftUI-Styled-Text-Editing.md): `TextEditor(text:selection:)` with `AttributedString` and `AttributedTextSelection`.
-- [`references/SwiftUI-WebKit-Integration.md`](references/SwiftUI-WebKit-Integration.md): Native `WebView` and `WebPage` in SwiftUI.
-- [`references/SwiftUI-AlarmKit-Integration.md`](references/SwiftUI-AlarmKit-Integration.md): AlarmKit scheduling and presentation.
-- [`references/Swift-Charts-3D-Visualization.md`](references/Swift-Charts-3D-Visualization.md): `Chart3D` and 3D mark types.
-
-## Swift 6.2 / 6.4 Concurrency & Low-Level Primitives
-- [`references/Swift-Concurrency-Updates.md`](references/Swift-Concurrency-Updates.md): `@MainActor` isolation, isolated conformances, `@concurrent` background offloading, task execution semantics.
-- [`references/Swift-InlineArray-Span.md`](references/Swift-InlineArray-Span.md): Fixed-size stack `InlineArray<N, Element>` and non-escaping `Span<Element>` / `RawSpan`.
-- [`references/Foundation-AttributedString-Updates.md`](references/Foundation-AttributedString-Updates.md): Paragraph and text selection attributes in `Foundation`.
-
-## On-Device AI, App Intents & Persistence
-- [`references/FoundationModels-Using-on-device-LLM-in-your-app.md`](references/FoundationModels-Using-on-device-LLM-in-your-app.md): `SystemLanguageModel`, `LanguageModelSession`, `@Generable`, `@Guide`, tool calling, and snapshot streaming.
-- [`references/AppIntents-Updates.md`](references/AppIntents-Updates.md): App Intents, visual intelligence, and interactive snippets.
-- [`references/Implementing-Visual-Intelligence-in-iOS.md`](references/Implementing-Visual-Intelligence-in-iOS.md): Visual Intelligence integration.
-- [`references/SwiftData-Class-Inheritance.md`](references/SwiftData-Class-Inheritance.md): `@Model` inheritance and polymorphic queries.
+Read the matching reference file in `references/` before implementing or reviewing code in these areas.
 EOF
-    GUIDE_COUNT="$(find "$GUIDES_SKILL_DIR/references" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
-    echo "    ✓ Materialized xcode-27-guides ($GUIDE_COUNT Apple markdown guides)"
-else
-    echo "    [warn] AdditionalDocumentation not found at $ADD_DOCS_DIR"
+        GUIDE_COUNT="$(find "$GUIDES_SKILL_DIR/references" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
+        echo "    ✓ Materialized xcode-27-guides ($GUIDE_COUNT Apple markdown guides)"
+    fi
 fi
 
-echo "==> 3. Syncing Apple CoreAI skills (if local checkout is available)..."
+echo "==> 2. Syncing project-specific Apple CoreAI skills..."
 COREAI_CANDIDATES=(
     "${HEYLOOK_COREAI_DIR:-}"
     "$REPO_ROOT/coderef/apple-coreai"
@@ -107,6 +136,7 @@ for candidate in "${COREAI_CANDIDATES[@]}"; do
             skill_name="$(basename "$skill_src")"
             rm -rf "$SKILLS_DIR/$skill_name"
             cp -R "$skill_src" "$SKILLS_DIR/$skill_name"
+            chmod -R u+w "$SKILLS_DIR/$skill_name" 2>/dev/null || true
             echo "    ✓ Synced CoreAI skill: $skill_name"
             SYNCED_COREAI=$((SYNCED_COREAI + 1))
         fi
@@ -121,4 +151,4 @@ if [[ "$SYNCED_COREAI" -eq 0 ]]; then
 fi
 
 TOTAL_SKILLS="$(find "$SKILLS_DIR" -mindepth 2 -maxdepth 2 -name 'SKILL.md' | wc -l | tr -d ' ')"
-echo "==> Done! $TOTAL_SKILLS total skills ready in $SKILLS_DIR"
+echo "==> Done! $TOTAL_SKILLS project-local skills ready in $SKILLS_DIR"

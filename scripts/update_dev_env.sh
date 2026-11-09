@@ -12,6 +12,9 @@
 #   --update-xcodes     Update the 'xcodes' CLI binary to the latest GitHub release
 #   --update-packages   Run 'swift package update' across all optional remote packages
 #   --build             Run './scripts/build_native.sh build' after updating
+#   --audit-xcode       Run 'sourcekit_mcp.py audit-xcode' against the active Xcode
+#   --force-downloads   Force re-downloading Metal toolchain and iOS Simulator even if installed
+#   --prune-old-sims    Delete older iOS Simulator disk images that do not match the active SDK
 #   --skip-sim          Skip 'xcodebuild -downloadPlatform iOS -architectureVariant arm64'
 #   --skip-plugins      Skip updating Antigravity (agy) plugins
 #   --dry-run           Print actions without executing downloads or mutations
@@ -26,6 +29,9 @@ UPGRADE_XCODE=0
 UPDATE_XCODES=0
 UPDATE_PACKAGES=0
 RUN_BUILD=0
+AUDIT_XCODE=0
+FORCE_DOWNLOADS=0
+PRUNE_OLD_SIMS=0
 SKIP_SIM=0
 SKIP_PLUGINS=0
 DRY_RUN=0
@@ -34,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade-xcode)
             UPGRADE_XCODE=1
+            AUDIT_XCODE=1
             shift
             ;;
         --update-xcodes)
@@ -46,6 +53,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --build)
             RUN_BUILD=1
+            shift
+            ;;
+        --audit-xcode)
+            AUDIT_XCODE=1
+            shift
+            ;;
+        --force-downloads)
+            FORCE_DOWNLOADS=1
+            shift
+            ;;
+        --prune-old-sims)
+            PRUNE_OLD_SIMS=1
             shift
             ;;
         --skip-sim)
@@ -61,7 +80,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -121,12 +140,36 @@ fi
 # ------------------------------------------------------------------------------
 echo ""
 echo "==> [2/6] Ensuring Metal Toolchain & iOS (arm64) Simulator Runtime..."
-run_cmd xcodebuild -downloadComponent metaltoolchain
+ACTIVE_SDK_VER="$(xcodebuild -version -sdk macosx SDKVersion 2>/dev/null || echo "27.2")"
+
+if [[ "$FORCE_DOWNLOADS" -eq 0 ]] && xcodebuild -showComponent metaltoolchain 2>/dev/null | grep -q '^Status: installed'; then
+    echo "    ✓ Metal Toolchain already installed for Xcode $ACTIVE_SDK_VER (pass --force-downloads to re-download)."
+else
+    run_cmd xcodebuild -downloadComponent metaltoolchain
+fi
 
 if [[ "$SKIP_SIM" -eq 0 ]]; then
-    run_cmd xcodebuild -downloadPlatform iOS -architectureVariant arm64
+    if [[ "$FORCE_DOWNLOADS" -eq 0 ]] && xcrun simctl runtime list 2>/dev/null | grep -q "iOS ${ACTIVE_SDK_VER}.*(Ready)"; then
+        echo "    ✓ iOS ${ACTIVE_SDK_VER} Simulator runtime already Ready (pass --force-downloads to re-download)."
+    else
+        run_cmd xcodebuild -downloadPlatform iOS -architectureVariant arm64
+    fi
 else
     echo "    [skip] Skipping iOS Simulator runtime check (--skip-sim)."
+fi
+
+if [[ "$PRUNE_OLD_SIMS" -eq 1 ]]; then
+    echo "    Pruning superseded iOS Simulator disk images (keeping iOS ${ACTIVE_SDK_VER})..."
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ "$line" != *"iOS ${ACTIVE_SDK_VER}"* ]]; then
+            sim_uuid="$(echo "$line" | grep -oE '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}' || true)"
+            if [[ -n "$sim_uuid" ]]; then
+                echo "    Deleting old simulator runtime: $line"
+                run_cmd xcrun simctl runtime delete "$sim_uuid"
+            fi
+        fi
+    done < <(xcrun simctl runtime list 2>/dev/null | grep '^iOS ' || true)
 fi
 
 # ------------------------------------------------------------------------------
@@ -218,7 +261,12 @@ echo ""
 echo "==> [6/6] Verifying Swift LSP Toolchain & SDKs..."
 SWIFT_LSP_SCRIPT="$HOME/.gemini/config/plugins/swift-lsp/skills/swift-lsp/scripts/sourcekit_mcp.py"
 if [[ -f "$SWIFT_LSP_SCRIPT" ]]; then
-    run_cmd python3 "$SWIFT_LSP_SCRIPT" probe --workspace "$REPO_ROOT"
+    run_cmd python3 "$SWIFT_LSP_SCRIPT" probe --workspace "$REPO_ROOT" --min-version "$ACTIVE_SDK_VER"
+    if [[ "$AUDIT_XCODE" -eq 1 ]]; then
+        echo ""
+        echo "==> Auditing active Xcode $ACTIVE_SDK_VER SDK & bundled skills via swift-lsp..."
+        run_cmd python3 "$SWIFT_LSP_SCRIPT" audit-xcode --available "$ACTIVE_SDK_VER"
+    fi
 else
     xcodebuild -showsdks | grep -E "macOS|iOS" || true
 fi
