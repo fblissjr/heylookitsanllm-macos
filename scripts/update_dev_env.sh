@@ -233,12 +233,16 @@ elif command -v agy >/dev/null 2>&1; then
             if [[ -d "$candidate" ]]; then
                 repo_dir="$(cd "$candidate/.." && pwd)"
                 if [[ -d "$repo_dir/.git" ]]; then
-                    echo "    Pulling latest in local plugin repo ($(basename "$repo_dir"))..."
-                    if [[ "$DRY_RUN" -eq 0 ]]; then
-                        git -C "$repo_dir" pull --ff-only || true
+                    raw_remote="$(git -C "$repo_dir" config --get remote.origin.url 2>/dev/null || true)"
+                    gh_https="$(echo "$raw_remote" | sed -E 's#^git@github\.com:#https://github.com/#; s#\.git$##')"
+                    if [[ "$gh_https" == https://github.com/* ]]; then
+                        PLUGIN_SOURCE="${gh_https}/tree/main/skills"
+                    else
+                        PLUGIN_SOURCE="$candidate"
                     fi
+                else
+                    PLUGIN_SOURCE="$candidate"
                 fi
-                PLUGIN_SOURCE="$candidate"
                 break
             fi
         done
