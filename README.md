@@ -23,24 +23,28 @@ Native Swift 6.2 personal inference workbench, multimodal media/embedding studio
   - Integrates `mbed` at full fidelity: indexes `.video` (`16s`-stride overlapping `32s` windows with fixed `1 fps` or content-aware novelty selection + optional 16 kHz soundtrack), `.audio` (`30s` windows), `.image`, `.document` (`PDFKit` pages), `.code`, and `.text` into a SQLite (`WAL`) + `Accelerate` (`vDSP`) Matryoshka (`768d`/`512d`/`256d`/`128d`) vector store with per-tower ANE/GPU compute placement (`ANECoreMLRuntime`).
 - **Embedded `/v1/*` Server (`HeylookServer`)**:
   - Serves unified incremental SSE (`consumeStreamAndFormatSSE` + `SSEConnectionStreamer`) and non-streaming `POST /v1/messages` (with HTTP `400` `thinking_depth` validation and HTTP `422` multimodal capability gating), disconnect-resilient `POST /v1/conversations/{id}/generate` & `POST /v1/conversations/{id}/voice-generate` (`event: heylook_saved` & `event: heylook_voice_transcribed`), model-derived `POST /v1/conversations/{id}/prompt` and `POST /v1/models/{id}/image-plan`, `POST /v1/embeddings` (structured `content`/`prompt_name`/`windows` wire + `EmbeddingRequestLimits` HTTP `422` validation), `GET /v1/capabilities`, `GET /v1/models`, `/v1/admin/models/*`, `/v1/conversations/*`, `/v1/notebooks/*`, `/v1/presets/*`, `/v1/requests/{id}/reasoning-end`, and `/v1/system/metrics`.
-- **5-Surface Multiplatform SwiftUI Workbench (`HeylookUI`)**:
-  1. **Chat Workbench** (`Surfaces/ChatWorkbenchSurface.swift`): Load Panel with per-slider provenance pills, model-derived `ThinkingControls` & `Depth` picker (`low`/`medium`/`high`/`max`), Preset Bar, model-derived Prompt Preview, multimodal drag-and-drop image/audio pills with `~tok` token budget badges, hands-free ANE voice turn handoff, collapsible Thinking Block with live **End thinking**, inline message edit + **Save & Continue**, and `Cmd+Return` / `Esc` / `Cmd+N` / `Cmd+Shift+P` shortcuts.
-  2. **Notebook** (`Surfaces/NotebookAndEmbeddingsSurfaces.swift`): Continuous scratchpad buffer + **Save to Conversations**.
-  3. **Embeddings & Media Finder Studio** (`Surfaces/NotebookAndEmbeddingsSurfaces.swift`): 3-column Media Finder with `AVPlayerView` & `frameTimes` jump pills, `ScoredFeatureBreakdownCard`, Pairwise Cosine Matrix Compare, **Compare-to-Lab Bridge**, and `Recall@K` / `MRR` Embedding Lab.
-  4. **Models & Engine Inspector** (`Surfaces/ModelsAndSystemSurfaces.swift`): `ModelSidecarEditorSheet` for `model.heylook.toml`, `MLXModelConverterSheet` for pure-Swift `.safetensors` quantization, Pin / Load / Unload / Re-scan + **Unload All Models** controls, `EngineDescription` provenance table, and per-tower ANE residency inspector.
-  5. **Performance, Memory & Server Control** (`Surfaces/ModelsAndSystemSurfaces.swift`): 192 GB Unified Memory & Metal wired limit gauge, ANE vs GPU residency bar, embedded server toggle, and Bonjour `_heylook._tcp` LAN scanner.
+- **5-Surface Multiplatform SwiftUI Workbench (`HeylookUI` & `HeylookApp`)**:
+  - **Unified 3-Region `NavigationSplitView` + Native `.inspector`**: Single `NavigationSplitView` with contextual sidebar sections (`HeylookSidebarView`), a full-bleed center stage (`HeylookDetailColumnView`), and a native trailing `.inspector(isPresented:)` drawer—with cached `@Observable` projections (`activeModelDescription`, `sortedActiveGGUFPorts`), `28x28` minimum hit targets, item-driven destructive confirmation dialogs (`DestructiveActionPrompt`), and `#available(macOS 27.3, iOS 27.3, *)` Golden Gate toolbar container behavior.
+  1. **Chat Workbench** (`Surfaces/ChatWorkbenchSurface.swift`): `ChatTopControlBar` (`Preset` menu, `Thinking` toggle, model-derived `Depth` picker `low`/`medium`/`high`/`max`, `Prompt Preview` toggle), `ChatPromptPreviewDrawer`, `LoadAndSamplerInspectorView` with per-slider provenance pills, `ChatComposerBar` (Liquid Glass container with `NSOpenPanel`/`.fileImporter` attachments, `ChatAttachmentPillView` `~tok` badges, and hands-free ANE voice turn handoff), collapsible Thinking Block with live **End Thinking Early**, inline message edit + **Save & Continue**, and `Cmd+Return` / `Esc` / `Cmd+N` / `Cmd+Shift+P` shortcuts.
+  2. **Notebook** (`Surfaces/NotebookAndEmbeddingsSurfaces.swift`): Continuous scratchpad buffer with contextual sidebar notebook switcher, **Insert Summary**, **Analyze Selection**, and **Continue Writing** (`Cmd+Return`).
+  3. **Embeddings & Media Finder Studio** (`Surfaces/NotebookAndEmbeddingsSurfaces.swift`): Unified 3-region Media Finder with `EmbeddingsSidebarSections` (modality filter, watched folders, Matryoshka dimension & task pickers, per-tower ANE/GPU compute placement & `ComputeMemorySplitBar`), `EmbeddingsSearchHeaderBar` (`ScoringPipelineBanner` glass pills + multimodal query attachment), `HitRowView` results with non-blocking `AsyncImage` thumbnails, `EmbeddingsInspectorView` (`ScoredFeatureBreakdownCard`, `AVPlayerView`/`VideoPlayer` with `KeyframeStamp` seek pills, code/text preview, **Compare-to-Lab Bridge**), and a collapsible bottom `EmbeddingsEvalLabDrawer` (`EvalLabSuite` `Recall@K` / `MRR` & pairwise cosine compare).
+  4. **Models & Engine Inspector** (`Surfaces/ModelsAndSystemSurfaces.swift`): `ModelsTopActionBar` (`Quantize / Convert MLX…`, `Re-scan`, `Unload All Models…` confirmation), `ModelSidecarEditorSheet` for `model.heylook.toml` + interactive 4-rung `chat_template.heylook.jinja` override editor, `MLXModelConverterSheet` for pure-Swift `.safetensors` quantization, Pin / Load / Unload controls, `EngineDescription` provenance table, and per-tower ANE residency inspector.
+  5. **Performance, Memory & Server Control** (`Surfaces/ModelsAndSystemSurfaces.swift`): 192 GB Unified Memory & Metal wired limit gauge, ANE vs GPU residency bar, active `llama-server` subprocesses (`sortedActiveGGUFPorts`), embedded server toggle, and Bonjour `_heylook._tcp` LAN scanner.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Fast SwiftPM build & 28-test verification run
+# Fast SwiftPM build & 29-test verification run
 # (Use `xcrun swift` if Homebrew `swift` is installed first in $PATH to avoid
 # Homebrew's macOS-14.0 Package.swift manifest linker warning against MacOSX27.2.sdk)
 xcrun swift build
 xcrun swift test
 xcrun swift run heylook-cli eval-lab
+
+# (Optional) One-command environment, Xcode, Metal, iOS Simulator, skills & swift-lsp updater
+./scripts/update_dev_env.sh
 
 # Full native Xcode build & test (compiles Cmlx default.metallib + links MLX Swift & mlx-swift-lm from GitHub)
 ./scripts/build_native.sh build
@@ -81,5 +85,5 @@ xcrun swift run heylook-cli eval-lab
 | **[docs/USER_GUIDE.md](./docs/USER_GUIDE.md)** | Complete guide to the 5-surface Workbench app, `heylook.toml` setup, `heylook-cli`, and `/v1/*` API usage. |
 | **[VISION.md](./VISION.md)** | Core principles (*Visibility*, *Derive, Don't Copy*, *Truthful Runtime*, *Heterogeneous Compute*) and project boundaries. |
 | **[AGENTS.md](./AGENTS.md)** | Operating guide, module table, and **LLM Knowledge Wiki Index Router**. |
-| **[docs/wiki/README.md](./docs/wiki/README.md)** | Master hub for the 8-page **LLM Knowledge Wiki**:<br>• [architecture_overview.md](./docs/wiki/architecture_overview.md)<br>• [engine_contract_and_provenance.md](./docs/wiki/engine_contract_and_provenance.md)<br>• [providers_and_heterogeneous_compute.md](./docs/wiki/providers_and_heterogeneous_compute.md)<br>• [multimodal_embeddings_and_ane.md](./docs/wiki/multimodal_embeddings_and_ane.md)<br>• [wire_api_and_sqlite_store.md](./docs/wiki/wire_api_and_sqlite_store.md)<br>• [model_family_onboarding.md](./docs/wiki/model_family_onboarding.md)<br>• [sharp_edges.md](./docs/wiki/sharp_edges.md) |
-| **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** & **[TODO.md](./docs/project/TODO.md)** | Subsystem readiness matrix (`SOLID`) and completed Phases 0–12 roadmap. |
+| **[docs/wiki/README.md](./docs/wiki/README.md)** | Master hub for the 8-page **LLM Knowledge Wiki**:<br>• [architecture_overview.md](./docs/wiki/architecture_overview.md)<br>• [engine_contract_and_provenance.md](./docs/wiki/engine_contract_and_provenance.md)<br>• [providers_and_heterogeneous_compute.md](./docs/wiki/providers_and_heterogeneous_compute.md)<br>• [multimodal_embeddings_and_ane.md](./docs/wiki/multimodal_embeddings_and_ane.md)<br>• [wire_api_and_sqlite_store.md](./docs/wiki/wire_api_and_sqlite_store.md)<br>• [model_family_onboarding.md](./docs/wiki/model_family_onboarding.md)<br>• [ui_architecture_and_macos27.md](./docs/wiki/ui_architecture_and_macos27.md)<br>• [sharp_edges.md](./docs/wiki/sharp_edges.md) |
+| **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** & **[TODO.md](./docs/project/TODO.md)** | Subsystem readiness matrix (`SOLID`) and completed Phases 0–13 roadmap. |

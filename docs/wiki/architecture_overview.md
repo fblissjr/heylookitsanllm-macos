@@ -8,6 +8,7 @@ For deep-dive subsystem documentation, see the [LLM Knowledge Wiki Index](./READ
 - [Multimodal Embeddings, ANE Towers & Matryoshka Store](./multimodal_embeddings_and_ane.md)
 - [HTTP/SSE Wire API & SQLite Store](./wire_api_and_sqlite_store.md)
 - [Model Family Onboarding & Porting Playbooks](./model_family_onboarding.md)
+- [SwiftUI Architecture & macOS 27.2+ Design System](./ui_architecture_and_macos27.md)
 - [Sharp Edges & Incident Rationales](./sharp_edges.md)
 
 ---
@@ -25,11 +26,11 @@ flowchart TB
         CLI["heylook-cli (Command Line)"]
     end
 
-    subgraph SharedUI["HeylookUI (SwiftUI Multiplatform)"]
-        VM["HeylookWorkbenchViewModel"]
-        ChatSurface["ChatWorkbenchSurface"]
-        NotebookSurface["NotebookSurface & EmbeddingsStudioSurface"]
-        ModelsSurface["ModelsInspectorSurface & PerfServerSurface"]
+    subgraph SharedUI["HeylookUI (@MainActor @Observable SwiftUI)"]
+        VM["HeylookWorkbenchViewModel\n(Cached ActiveModel & GGUFPorts + DestructiveActionPrompt)"]
+        ChatSurface["ChatWorkbenchSurface\n(TopControlBar + PromptDrawer + ComposerBar + SamplerInspector)"]
+        NotebookSurface["NotebookScratchpadSurface & EmbeddingsStudioSurface\n(SearchHeader + EvalLabDrawer + EmbeddingsInspector)"]
+        ModelsSurface["ModelsInspectorSurface & PerfServerSurface\n(TopActionBar + Sidecar & Template Override)"]
     end
 
     subgraph ServerLayer["HeylookServer (Optional Embedded Listener)"]

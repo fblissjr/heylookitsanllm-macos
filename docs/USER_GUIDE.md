@@ -30,9 +30,14 @@ To build and launch `heylook` with full in-process **MLX Swift** (`default.metal
 # Launch the native macOS desktop app
 ./scripts/build_native.sh app
 
-# Or open Package.swift in Xcode 26+ and run the `heylook-app` scheme on My Mac or iPhone/iPad
+# (Optional) One-command environment, Xcode 27.2/27.3+, Metal, iOS Simulator, skills & swift-lsp updater
+./scripts/update_dev_env.sh
+
+# Or open Package.swift in Xcode 27.2 / 27.3+ and run the `heylook-app` scheme on My Mac or iPhone/iPad
 ```
 
+> **Deployment Baseline (`27.2+`) & Xcode 27.3 ("Golden Gate") SDK Support**: `Package.swift` and `HeylookWorkbench.app` (`LSMinimumSystemVersion = 27.2`) target **`macOS 27.2+`** and **`iOS 27.2+`** so binaries compiled with the **`Xcode 27.3` SDK** (`MacOSX27.3.sdk` / `iPhoneSimulator27.3.sdk`) launch and run natively on `macOS 27.2` hosts while adopting `27.3` enhancements (such as `.toolbarContainerBehavior(.automatic)`) via runtime `#available(macOS 27.3, iOS 27.3, *)` checks.
+>
 > **Toolchain Note (`xcrun swift` vs. Homebrew `swift`)**: If Homebrew's open-source `swift` formula (`/opt/homebrew/opt/swift/bin/swift`) appears before `/usr/bin/swift` in your `$PATH`, running bare `swift build` prints a benign linker warning when compiling `Package.swift` itself (`ld: warning: building for macOS-14.0, but linking with dylib '/usr/lib/swift/libswiftCore.dylib' which was built for newer version 27.0`) because Homebrew SwiftPM hardcodes `-target arm64-apple-macosx14.0` for manifest evaluation against Xcode's `MacOSX27.2.sdk`. To avoid the warning, either prefix SwiftPM commands with `xcrun` (`xcrun swift build`, `xcrun swift test`) or run `brew unlink swift` so `swift` resolves to Xcode's native `arm64-apple-macosx27.2.0` toolchain (`/usr/bin/swift`).
 
 ### Configuring Model Discovery (`heylook.toml`)
@@ -86,123 +91,148 @@ What `heylook` discovers automatically inside each scan folder:
 
 ## 2. Surface 1: Chat Workbench
 
-The **Chat Workbench** is your primary interface for multi-turn conversations, multimodal vision/audio prompting, reasoning control, and sampler tuning.
+The **Chat Workbench** (`ChatWorkbenchSurface`) uses a unified 3-region `NavigationSplitView` + trailing `.inspector` layout for multi-turn conversations, multimodal vision/audio prompting, reasoning control, and 5-layer sampler tuning.
 
-### Selecting & Loading Models
-- Use the **Model Picker** in the top toolbar to select any discovered model (`MLX`, `CoreAI`, `GGUF`, or `Remote`).
-- Click **Load & Samplers** (slider icon) to open the **Load & Sampler Panel**:
-  - **Provenance Badges**: Every setting displays where its current value came from:
-    - `derived` — read from the model's `config.json`, GGUF header, or `generation_config.json`.
-    - `configured` — set in the model's `model.heylook.toml` sidecar or active Preset.
-    - `observed` — reported by the live engine (e.g., `llama-server` `/props` or `.aimodel` `metadata.json`).
-    - `request` — overridden by you in the current session.
-  - **Effect Classes**: Badges indicate whether changing a field takes effect immediately (`per_request`), reloads the model (`reload`), or restarts the server (`restart`).
+### Layout & Top Controls (`ChatTopControlBar` & Toolbar)
+- **Left Sidebar (`ChatConversationsSidebarSection`)**: Switch between saved conversations, start a **New Conversation (`⌘N`)**, or swipe to delete a thread.
+- **Window Toolbar**:
+  - **Model Picker**: Select any discovered model (`MLX`, `CoreAI`, `GGUF`, or `Remote`) with live `[LOADED]` and `[PIN]` indicators.
+  - **Inspector Toggle (`sidebar.trailing`)**: Show or hide the trailing **Load & Samplers Inspector** (`LoadAndSamplerInspectorView`).
+  - **Quick Actions**: **New Conversation (`⌘N`)** and **New Notebook (`⇧⌘N`)** (plus an overflow menu on iOS).
+- **Top Control Bar (`ChatTopControlBar`)**:
+  - **Preset Menu**: Switch between seeded or custom sampler presets (*Balanced*, *Deterministic Code*, *Deep Thinking*, *Creative*) with an active checkmark indicator.
+  - **Thinking Toggle**: Enables or disables model reasoning (`enable_thinking`). Automatically disabled when the active model's template does not support thinking or locked on when the template thinks unconditionally (such as Harmony `gpt-oss`).
+  - **Depth Picker (`low` | `medium` | `high` | `max`)**: Appears automatically when the active model's template declares `reasoning_effort` or `reasoning_strength` values.
+  - **Prompt Preview Toggle (`⇧⌘P`)**: Opens or closes the collapsible **`ChatPromptPreviewDrawer`** directly below the control bar, showing the exact rendered Jinja prompt, active `template_source` (e.g., `chat_template.heylook.jinja` or `chat_template.jinja`), and a **Copy Prompt** button.
 
-### Thinking & Reasoning Depth Controls
-`heylook` inspects each model's `chat_template.jinja` and tokenizer files to configure its reasoning controls automatically:
-- **Think Toggle**: Enables or disables model reasoning (`enable_thinking`). If a model's template thinks unconditionally (such as Harmony `gpt-oss`), the toggle is locked on and explains why in its tooltip.
-- **Depth Picker (`low` | `medium` | `high` | `max`)**: Appears automatically when the active model's template supports `reasoning_effort` or `reasoning_strength`.
-- **Collapsible Thinking Block & Live `End thinking`**: While a model is streaming its chain of thought (`<think>`, `<|channel>thought`, Harmony `analysis`, or `to=self`), you can expand/collapse the thinking block or click **End thinking** mid-stream to immediately transition the model into its final answer without aborting the request.
+### Trailing Load & Samplers Inspector (`LoadAndSamplerInspectorView`)
+The right-hand `.inspector` column has two tabs:
+1. **`Samplers` Tab**:
+   - Displays the active model's **Context Window**, **Compute Placement**, **Template Source**, and **Speculative Drafter** status.
+   - Interactive sliders for **Temperature**, **Top P**, **Top K**, **Min P**, **Max Tokens**, and **Thinking Budget**, plus a **Reset** button to clear session overrides.
+   - **Provenance Pills (`SamplerProvenancePill`)**: Every slider displays where its current value came from:
+     - `derived` — read from the model's `config.json`, GGUF header, or `generation_config.json`.
+     - `configured` — set in `model.heylook.toml` or the active Preset.
+     - `observed` — reported by the live engine (`llama-server` `/props` or `.aimodel` `metadata.json`).
+     - `request` — overridden by you in the current session (`userOverriddenSamplerKeys`).
+2. **`Prompt` Tab**:
+   - Edit the per-session **System Prompt Override** with a one-click **Reset to Default** button.
 
-### Presets, Sampler Cascade & Prompt Preview
-- **Preset Bar**: Quickly switch between seeded or custom sampler presets (*Balanced*, *Deterministic Code*, *Deep Thinking*, *Creative*) or click **Reset Overrides** to return to the model's file-derived defaults.
-- **Prompt Preview (`Cmd+Shift+P`)**: Opens the exact rendered Jinja chat template prompt (including system instructions, thinking kwargs, and special tokens) before or after sending a message.
+### Transcript, Thinking Trace & Conversation Branching (`MessageRowView`)
+- **Collapsible Reasoning Trace & Live `End Thinking Early`**: While a model is streaming its chain of thought (`<think>`, `<|channel>thought`, Harmony `analysis`, or `to=self`), expand or collapse the **Reasoning Trace** disclosure group or click **End Thinking Early** mid-stream to transition immediately into the final answer without aborting the request.
+- **Inline Message Editing & `Save & Continue` Branching**:
+  - Click the **Edit (pencil)** button (`28×28` touch-safe target) on any user or assistant message.
+  - Click **Save & Continue** to update that message at its position, truncate all subsequent turns in SQLite (`WAL`), slice the in-process MLX `[KVCache]` back to the shared token prefix, and regenerate from that point.
+- **Per-Turn Telemetry Badges**: Every assistant turn reports `generationTPS` (`tok/s`), KV cache prefix reuse (`cache X/Y`, `reused`/`cold`/`history_diverged`), speculative acceptance rate (`spec X/Y`), and active compute placement (`mlx_gpu`, `ane`, `gguf_subprocess`).
 
-### Multimodal Attachments & Hands-Free Voice Turns
-- **Images & Audio**: Click **Attach Media** or drag and drop `.png`, `.jpg`, `.webp`, or `.wav` files into the composer.
-  - Each staged image pill displays its estimated vision soft-token budget (`~280 tok`, derived from the model's vision config).
-  - If the active model does not support vision or audio, `heylook` warns you immediately in the composer before you send.
-- **Hands-Free Voice Turn**: Click the **Mic / Voice Turn** button to transcribe speech on the Apple Neural Engine (`16 kHz` log-mel frontend) and hand off directly into disconnect-resilient server generation (`POST /v1/conversations/{id}/voice-generate`).
-
-### Inline Message Editing & Conversation Branching
-- Hover over any prior user or assistant message and click **Edit**.
-- Click **Save & Continue** to truncate subsequent turns in SQLite (`WAL`), slice the in-process MLX `[KVCache]` back to the shared token prefix, and regenerate from that point—reporting exact cache reuse (`cache X/Y tokens`) in the message footer.
+### Liquid Glass Composer, Multimodal Attachments & ANE Voice Turns (`ChatComposerBar`)
+- **Images, Audio & Video Attachments**: Click the **Paperclip (`Attach Media`)** button (`NSOpenPanel` on macOS, `.fileImporter` on iOS) to stage `.png`, `.jpg`, `.webp`, `.wav`, or `.mp4` files.
+  - Each staged **`ChatAttachmentPillView`** shows its modality icon, filename, estimated vision soft-token budget (`~280 tok`, derived from the model's vision config), and a `28×28` remove button.
+  - If the active model does not support vision or audio, `ChatComposerBar` displays an inline capability warning before you send.
+- **Hands-Free ANE Voice Turn (`Mic`)**: Click the **Microphone** button to record `16 kHz` mono PCM audio and click **Stop (waveform)** to transcribe speech on the Apple Neural Engine (`CoreAIProvider.transcribeAudio`) and hand off into disconnect-resilient generation (`POST /v1/conversations/{id}/voice-generate`).
 
 ### Keyboard Shortcuts
 
 | Shortcut | Action |
 | :--- | :--- |
-| `Cmd + Return` | Send message |
+| `Cmd + Return` | Send message (or continue writing in Notebook) |
 | `Escape` | Stop active generation stream |
 | `Cmd + N` | Start a new conversation |
-| `Cmd + Shift + P` | Toggle live Prompt Preview |
+| `Cmd + Shift + N` | Create a new notebook |
+| `Cmd + Shift + P` | Toggle live Prompt Preview drawer |
+| `Cmd + 1` … `Cmd + 5` | Switch between the 5 Workbench surfaces |
 
 ---
 
-## 3. Surface 2: Notebook
+## 3. Surface 2: Notebook Scratchpad
 
-The **Notebook** surface provides a continuous, distraction-free document buffer for long-form drafting, code sketching, and prompt iteration:
-- Select a notebook from the left sidebar or click **New Notebook**.
-- Type or paste content into the main editor and click **Continue Writing** to stream model completions directly into the document buffer.
-- Click **Save to Conversations** at any time to promote a notebook buffer into a structured multi-turn conversation in the Chat Workbench.
+The **Notebook** surface (`NotebookScratchpadSurface`) provides a continuous, distraction-free markdown and code synthesis buffer:
+- **Contextual Left Sidebar (`NotebooksSidebarSection`)**: Switch between saved notebooks or click **`+` (`⇧⌘N`)** to create a new notebook.
+- **Top Bar**: Edit the notebook title directly, inspect live **word** and **character** counts, or trigger AI synthesis actions:
+  - **Insert Summary**: Appends a concise bulleted summary of the current document buffer.
+  - **Analyze Selection**: Critiques assumptions, trade-offs, and action items in the current notebook text.
+  - **Continue Writing (`⌘↩`)**: Streams model completions directly onto the end of the document buffer using the active model and sampler cascade.
 
 ---
 
 ## 4. Surface 3: Embeddings & Media Finder Studio
 
-The **Embeddings & Media Finder Studio** folds the standalone `mbed` desktop application into `heylook`, powered by **`EmbeddingGemma 2`** (`embeddinggemma-2-MLX-BF16`, `768d` -> `128d` Matryoshka representations).
+The **Embeddings & Media Finder Studio** (`EmbeddingsStudioSurface`) folds the standalone `mbed` desktop application into `heylook`, powered by **`EmbeddingGemma 2`** (`embeddinggemma-2-MLX-BF16`, `768d` -> `128d` Matryoshka representations) inside the unified 3-region `NavigationSplitView` + `.inspector` + collapsible bottom **Eval Lab Drawer** architecture:
 
-Use the segmented switcher at the top of the surface to choose between three modes:
+### Region 1: Contextual Left Sidebar (`EmbeddingsSidebarSections`)
+1. **Modality Filter (`ModalityFilterRow`)**: Filter indexed artifacts across **All Modalities**, **Video**, **Image**, **Audio**, **Code**, **Docs**, or **Text** with live per-modality item badges.
+2. **Index & Watched Folders**:
+   - **Add Files or Folders…**: Opens `NSOpenPanel` on macOS or `.fileImporter` on iOS to index files and register watched directories (`FolderWatcher` via `FSEvents`).
+   - **Re-scan Watched Folders**: Re-indexes modified files and prunes deleted files.
+   - **Clear Index…**: Protected by a confirmation dialog (`DestructiveActionPrompt.clearEmbeddingIndex`) before wiping the SQLite vector store.
+   - **Watched Folders List**: Displays each monitored folder with a `28×28` remove button and swipe-to-delete support.
+3. **`MLX EmbeddingGemma 2` Settings**:
+   - **Engine**: Switch between `Hybrid ANE + MLX (EmbeddingGemma 2)` (`HybridLocalEmbeddingEngine` + `ANECoreMLRuntime`), `MLX Swift LM (EmbeddingGemma 2)`, or `Deterministic 768d (Offline Test)`.
+   - **Matryoshka Dim**: Slice and L2-normalize vectors at query time to **`768d`**, **`512d`**, **`256d`**, or **`128d`** via Apple `Accelerate` (`vDSP`) without re-indexing.
+   - **Query Task**: Choose `Retrieval Query`, `Semantic Similarity`, `Code Retrieval`, `Question Answering`, or `Fact Verification`.
+   - **Video Sampling & Soundtrack**: Choose **`1 fps`**, **`Content Keyframes`** (novelty-based anchor selection over `32×32` RGB thumbnails within `16s`-stride overlapping `32s` windows), or **`Off`**, and toggle **Include Video Soundtrack** (`16 kHz` `30s` audio windows).
+4. **Compute Placement (ANE / GPU)**:
+   - Choose a placement preset (**`Hybrid (ANE Vision/Audio + GPU Text)`**, **`All ANE (Zero GPU Eviction)`**, or **`All GPU (Max Throughput)`**) or independently route the **Vision Encoder** (`100% ANE`), **Audio Conformer** (`99% ANE`), and **Text Backbone + Projection** (`100% ANE`) across `CPU + Neural Engine (ANE)`, `MLX Metal GPU`, `CPU + GPU (CoreML)`, or `CPU Only`.
+   - Inspect the live **CoreML ANE Towers** status badge and **`ComputeMemorySplitBar`** showing ANE vs. GPU MB residency.
 
-### Mode A: Media Finder (3-Column Workspace)
-1. **Left Column — Compute Placement, Indexing & Watched Folders**:
-   - **Per-Tower Compute Placement**: Independently route the **Vision Encoder** (`100% ANE`), **Audio Encoder** (`99% ANE`), and **Text Backbone** (`100% ANE`) across **Neural Engine (ANE)**, **MLX GPU**, **CoreML GPU**, or **CPU Only**, with a live **Compute Memory Split Bar** showing ANE vs. GPU MB residency.
-   - **Indexing Options**:
-     - **Video Sampling**: Choose **`1 fps`** (fast metadata path) or **`Content`** (novelty-based anchor selection over `32x32` RGB frame thumbnails within `16s`-stride overlapping `32s` windows).
-     - **Index Audio from Video**: Toggle on to extract and embed the `16 kHz` audio soundtrack (`30s` windows with `15s` stride) alongside visual video windows.
-   - **Watched Folders**: Add directories to monitor via macOS `FSEvents`; new or modified files are re-indexed automatically and deleted files are pruned.
-2. **Center Column — Hybrid Search & Deduped Artifact Grid**:
-   - **Matryoshka Dimension Picker**: Slice and L2-normalize vectors at query time to **`768d`**, **`512d`**, **`256d`**, or **`128d`** using Apple `Accelerate` (`vDSP`) without re-indexing.
-   - **Task Prompt Picker**: Select any of the 10 `EmbeddingGemma 2` task prompts (`Search Query`, `Semantic Similarity`, `Code Retrieval`, `Question Answering`, `Fact Verification`, `Clustering`, `Classification`, etc.).
-   - **Hybrid Example Attachment**: Attach a reference image, audio clip, or text snippet to blend example embeddings with your text query.
-   - **Parent-Artifact Deduplication**: A 5-minute video with 19 temporal windows or a multi-page PDF appears **once** in results, ranked by its top-scoring `bestSpan`.
-3. **Right Column — Span Inspector & Media Player**:
-   - Displays inline **`AVPlayerView`** playback for video and audio artifacts.
-   - Click any **`frameTimes` jump pill** (e.g., `00:16–00:48 @ 22.5s`) to seek the video player directly to the matching visual moment.
-   - Inspect the **`ScoredFeatureBreakdownCard`** comparing cosine similarity across all four Matryoshka dimensions (`768d` / `512d` / `256d` / `128d`).
+### Region 2: Center Studio (`EmbeddingsStudioSurface` & `EmbeddingsEvalLabDrawer`)
+- **Search Header (`EmbeddingsSearchHeaderBar`)**:
+  - Live search bar with `28×28` clear button, **`Attach Media`** button for multimodal query-by-example (blending an image, audio, or video attachment with your text query), and **`Search`**.
+  - **`ScoringPipelineBanner`**: Interactive Liquid Glass feature pills summarizing the active Engine, Matryoshka slice (`768d MRL`), Query Task, Video Windowing mode, and Compute Placement.
+- **Status Toolbar (`EmbeddingsStatusToolbar`)**:
+  - Shows active indexing progress with a **`Stop Indexing`** button, **`Add Files/Folders…`**, **`Eval Lab`** drawer toggle, and result/corpus counters.
+- **Deduplicated Results List (`HitRowView`)**:
+  - Parent-artifact deduplication ensures a multi-window video or multi-page PDF appears **once**, ranked by its top-scoring `bestSpan`.
+  - Each row renders a non-blocking off-main-thread **`AsyncImage` `ThumbnailBadge`**, modality badge, best span label (e.g., `0:16–0:48` or `lines 10–45`), primary cosine similarity pill, and inline `768d`/`512d`/`256d`/`128d` Matryoshka sub-score pills.
+- **Collapsible Bottom `EmbeddingsEvalLabDrawer` (`EvalLabSuite` & Pairwise Compare)**:
+  - Toggle the **Eval Lab** button in the status toolbar to open the bottom evaluation drawer:
+    - **Run Full Eval Suite**: Executes `EvalLabSuite.runAll()` (`chain_probe` KV prefix reuse, `vlm_parity_probe` vision token budgeting & HTTP 422 gating, and `matryoshka_recall_probe` `Recall@1` / `MRR` across `768d`/`512d`/`256d`/`128d`).
+    - **Left vs. Right Pairwise Cosine Compare**: Compare any two passages or artifact spans across all four Matryoshka dimensions (`768d`, `512d`, `256d`, `128d`) and click **`Add to Lab`** (**Compare-to-Lab Bridge**) to promote the pair into the benchmark suite.
 
-### Mode B: Pairwise Cosine Matrix Compare
-- Enter or paste multiple text passages or artifact labels to compute an interactive **N×N pairwise cosine similarity heatmap** at the selected Matryoshka dimension.
-- Click **Promote to Embedding Lab** (**Compare-to-Lab Bridge**) to convert your comparison items into a repeatable benchmark dataset.
-
-### Mode C: Embedding Lab (`Recall@K` & `MRR`)
-- Run automated retrieval evaluations across your corpus and compare **`Recall@1`**, **`Recall@3`**, **`MRR`**, and query latency across **`768d`**, **`512d`**, **`256d`**, and **`128d`** slices side by side.
+### Region 3: Trailing Inspector (`EmbeddingsInspectorView`)
+- **Header & Quick Actions**: Shows modality icon, title, file size, path, **`Reveal in Finder`**, **`Compare in Lab`** (loads into the Left slot of the Eval Lab comparator), and **`Pin to Lab`** (loads into the Right slot and opens the Eval Lab drawer).
+- **`ScoredFeatureBreakdownCard`**: Interactive bar chart comparing cosine similarity across `128d`, `256d`, `512d`, and `768d` with the active Matryoshka dimension highlighted.
+- **Modality-Aware Preview & Click-to-Seek Keyframes (`KeyframeStamp`)**:
+  - **Video & Audio**: Inline `AVPlayerView` (macOS) / `VideoPlayer` (iOS) with clickable **`KeyframeStamp`** seek pills (`0:16`, `0:24`, etc.) and clickable **`Matching Spans`** rows that seek the player directly to the matching timestamp.
+  - **Images**: Non-blocking `AsyncImage` preview.
+  - **Code, Text & Docs**: Monospaced preview with line/page span badges and metadata key-value table.
 
 ---
 
 ## 5. Surface 4: Models & Engine Inspector
 
-The **Models & Engine Inspector** gives you complete visibility and control over every discovered checkpoint:
+The **Models & Engine Inspector** (`ModelsInspectorSurface`) gives you complete visibility and control over every discovered checkpoint:
 
-- **Residency Controls**:
+- **Top Action Bar (`ModelsTopActionBar`) & Residency Controls**:
+  - **Quantize / Convert MLX…**: Opens **`MLXModelConverterSheet`** to quantize an unquantized `.safetensors` directory in 100% pure Swift (`MLXLMCommon.convert`) with configurable **Bits** (`4-bit` / `8-bit`), **Group Size** (`32` / `64` / `128`), **Mode** (`affine`, `mxfp4`, `mxfp8`, `nvfp4`), **Calibration** (`standard` or `q4_zero`), **Dry Run**, and **Overwrite**.
+  - **Re-scan**: Reloads `heylook.toml` and refreshes all discovered MLX, CoreAI, and GGUF checkpoints.
+  - **Unload All Models…**: Protected by a confirmation dialog (`DestructiveActionPrompt.unloadAllModels`); reclaims all GPU/ANE memory, clears Metal caches, and terminates all `llama-server` subprocesses.
+- **Model Registry Cards (`ModelRegistryRowView`)**:
   - **Pin / Unpin**: Pinned GPU models remain resident in unified memory and are protected from automatic LRU eviction when another GPU model is loaded.
-  - **Load / Unload**: Explicitly pre-warm a model into memory or unload it immediately (releasing `ModelContainer`, CoreML `MLModel` instances, or terminating its `llama-server` subprocess and calling `MLX.Memory.clearCache()`).
-  - **Unload All Models**: One-click button in the top bar to reclaim all GPU/ANE memory and stop all `llama-server` subprocesses.
-- **Edit Sidecar (`model.heylook.toml`)**:
-  - Click **Edit Sidecar** on any model to configure `context_size`, `flash_attention`, `supports_thinking`, `thinking_budget`, `image_max_tokens` (clamped automatically against `ubatch_size` for non-causal GGUF vision projectors), default sampler overrides, and speculative drafter paths.
-- **Convert MLX Model (Pure-Swift Quantization)**:
-  - Click **Convert MLX** to quantize an unquantized `.safetensors` directory in 100% pure Swift (`MLXLMCommon.convert`):
-    - **Bits**: `4-bit` or `8-bit`
-    - **Group Size**: `32` or `64`
-    - **Mode**: `affine`, `mxfp4`, `mxfp8`, or `nvfp4`
-    - **Calibration**: `standard` or `q4_zero`
-- **Engine Provenance & ANE Tower Inspector**:
-  - Inspect every field of the selected model's `EngineDescription` alongside its provenance (`derived`, `configured`, `observed`) and `EffectClass`.
-  - Inspect compiled `EmbeddingGemma2*ANE.mlmodelc` towers via Apple's `MLComputePlan` to verify exact Neural Engine operator residency (`100%` Vision, `99%` Audio, `100%` Text).
+  - **Load / Unload**: Explicitly pre-warm a model into memory or unload it immediately.
+  - **Quantize…**: Opens `MLXModelConverterSheet` pre-populated with that MLX model's source path.
+  - **Sidecar (`ModelSidecarEditorSheet`)**:
+    - Edit `model.heylook.toml` settings (`ctx_size`, `flash_attn`, `supports_thinking`, `thinking_budget`, `image_max_tokens`, `compute_unit`, default samplers, and speculative `drafter_path`).
+    - **4-Rung Chat Template Override (`chat_template.heylook.jinja`)**: Inspect the active template rung and edit, **Save Template Override**, or **Revert Override** (`chat_template.heylook.jinja`) directly in the sheet without mutating vendor `chat_template.jinja`.
+- **Provenance & ANE Tower Inspector**:
+  - Expand any model card to inspect every `ProvenanceField` (`value`, `provenance`, `effect`) alongside its `reasoningFormat` and `thinkingControls`.
 
 ---
 
 ## 6. Surface 5: Performance, Memory & Server Control (and iOS Sync)
 
-- **Unified Memory & Metal Wired Budget Gauge**:
-  - Displays total Apple Silicon unified memory (e.g., `192 GB`), baseline resident footprint, estimated active model footprint, and remaining safe headroom under the 88% Metal wired limit.
-- **Dual-Lane Scheduler Telemetry**:
-  - Monitors the **GPU `GenerationGate`** (active model, queue depth, max loaded GPU models) alongside the **Co-Resident ANE Lane** (concurrent embedding and speech tasks that never evict GPU LLMs).
-- **Embedded `/v1/*` Server Toggle**:
-  - Start or stop the embedded HTTP/SSE server (default `127.0.0.1:8000`) and advertise it on the local network via Bonjour (`_heylook._tcp`).
-- **Bonjour LAN Scanner (`iOS 27.2+` & Secondary Macs)**:
-  - On an iPhone, iPad, or secondary Mac running `HeylookApp`, open **Perf & Server** and click **Scan LAN (`_heylook._tcp`)**.
-  - Click **Connect** next to your Mac Studio to register its models via `RemoteHeylookProvider` and stream chats, thinking blocks, and embeddings from your phone with disconnect-resilient server handoff.
+The **Performance, Queue & Server** surface (`PerfServerSurface`) provides live hardware, subprocess, and network control:
+
+- **Embedded HTTP & SSE Server Card**:
+  - Start or stop `HeylookHTTPServer` (configurable port `1024...65535`, default `127.0.0.1:8000`) and inspect all live `/v1/*` routes.
+- **Heterogeneous Compute Scheduler Card**:
+  - Displays live **GPU Queue Depth**, **Loaded GPU Models** (with **`Unload All Models…`** confirmation action), and **Co-Resident ANE Models** alongside Unified Memory & Metal 88% wired limit gauges.
+- **Active `llama-server` Subprocesses (`GGUFPortPool`)**:
+  - Lists every running `llama-server` subprocess bound to its loopback port (`viewModel.sortedActiveGGUFPorts`, `127.0.0.1:18080+`) with per-model **Kill & Unload** buttons.
+- **Remote Mac Studio / Tailscale Discovery (`_heylook._tcp`)**:
+  - Enter a Mac Studio URL (`http://mac-studio.local:8000`) or click **Scan Local Network (Bonjour `_heylook._tcp`)** on `iOS 27.2+` or a secondary Mac to connect via `RemoteHeylookProvider` with one click.
+- **Request Latency & Speculative Acceptance Chart**:
+  - Plots per-turn token throughput (`tok/s`) and speculative decoding acceptance rates across recent assistant turns.
 
 ---
 

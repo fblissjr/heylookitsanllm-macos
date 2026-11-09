@@ -132,13 +132,17 @@ Per Apple's exported `swiftui-specialist` and `swiftui-whats-new-27` skills:
 2. **Cached `@Observable` Stored Projections & `@Bindable` KeyPaths (`dataflow.md` & `foreach.md`)**:
    - Pass `@Observable` models into child views via `@Bindable var viewModel: HeylookWorkbenchViewModel` (never `@Binding var viewModel: HeylookWorkbenchViewModel`).
    - Cache derived collections and lookups (`activeModelDescription`, `filteredModels`, `modelCountsByProvider`, `sortedActiveGGUFPorts`) in `didSet` hooks on `HeylookWorkbenchViewModel` instead of recomputing `.first(where:)`, `.filter`, or `.sorted` inside `View.body` or `ForEach` arguments.
-   - Pass `Sequence.enumerated()` directly to `ForEach(span.frameTimes.enumerated(), id: \.offset)` or `ForEach(HeylookSurface.allCases.enumerated(), id: \.element.id)` (Swift 6.1+ `EnumeratedSequence: RandomAccessCollection`) without wrapping in `Array(...)`.
+   - Pass `Sequence.enumerated()` directly to `ForEach(HeylookSurface.allCases.enumerated(), id: \.element.id)` (Swift 6.1+ `EnumeratedSequence: RandomAccessCollection`) without wrapping in `Array(...)`, or wrap indexed domain elements in a dedicated `Identifiable` value type (such as `KeyframeStamp: Identifiable` and precomputed `sortedAttributes` in `EmbeddingsInspectorView`).
    - Never construct `Binding(get: { ... }, set: { ... })` closures inside `body`. Expose computed getter/setter properties or subscripts on `@Observable` (`$viewModel.boundTemperature`, `$viewModel.boundEffectiveQueryTask`, `$viewModel[computeUnitFor: component]`) and bind via `@Bindable` KeyPaths.
 3. **`@State` Macro Rules in SDK 27 (`state-macro.md`)**:
    - Always mark `@State` properties `private` so `@Observable` reference types initialize lazily once per view lifetime.
    - Never provide both a declaration-site default value (`@State private var x = 0`) and an `init` assignment (`self.x = y`); drop the declaration default when initializing in `init`.
 4. **`@ContentBuilder` Trailing-Closure Modifiers (`content-builder.md`)**:
    - Always use the trailing-closure form for `.overlay { ... }` and `.background { ... }` when passing modified `ShapeStyle` or view expressions so `@ContentBuilder` resolves overloads unambiguously.
+5. **Non-Blocking Off-Main-Thread Image Loading (`AsyncImage(url:)` over `NSImage(contentsOf:)` — `async-image.md`)**:
+   - Never call synchronous `NSImage(contentsOf: url)` inside `List` rows (`ThumbnailBadge`) or inspector views (`EmbeddingsInspectorView`). Use cross-platform `AsyncImage(url:)` so disk I/O and image decoding happen off `@MainActor` across both `macOS 27.2+` and `iOS 27.2+`.
+6. **Dual-Platform `swift_diagnostics` Verification (`macos` & `ios` `27.3`)**:
+   - Every UI change across `Sources/HeylookUI/`, `Sources/HeylookApp/`, and `Tests/HeylookTests/` is typechecked against both `arm64-apple-macosx27.3` and `arm64-apple-ios27.3-simulator` via `swift_diagnostics(platform: "both", min_version: "27.3")` (which automatically compiles/caches intra-package SwiftPM target `.swiftmodule` dependencies and passes `-parse-as-library` for `@main` entrypoints).
 
 ---
 

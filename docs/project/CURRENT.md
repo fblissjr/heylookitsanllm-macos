@@ -23,6 +23,6 @@ Tracks the live readiness of each subsystem in `heylookitsanllm-macos` (`SOLID`,
 
 ---
 
-## Completed Roadmap Summary (Phases 0–12) & Next Horizons
+## Completed Roadmap Summary (Phases 0–13) & Next Horizons
 
-All 13 roadmap phases (**Phases 0 through 12**) in [TODO.md](./TODO.md) are complete and verified (`29/29` tests in `HeylookTests`, `16/16` tests in standalone `mbed`).
+All 14 roadmap phases (**Phases 0 through 13**) in [TODO.md](./TODO.md) are complete and verified (`29/29` tests in `HeylookTests`, `16/16` tests in standalone `mbed`).

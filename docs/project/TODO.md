@@ -150,7 +150,23 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 ---
 
-## Next Horizons (Optional Post-Phase 12 Frontiers)
+## Phase 13: SwiftUI 27.3 ("Golden Gate") & iOS 27.3 Specialist Audit, Subview Factoring & Observation Caching (Done)
+
+- [x] **13.1 Granular `@Observable` View-Model Projections (`HeylookWorkbenchViewModel.swift`)**:
+  - Cached `activeModelDescription: EngineDescription?` and `sortedActiveGGUFPorts: [(modelID: String, port: Int)]` in `didSet` observers on `registeredModels`, `selectedModelID`, and `activeGGUFPorts` so SwiftUI views do not subscribe transitively to the entire `registeredModels` array or sort dictionaries on every `body` evaluation.
+  - Added `DestructiveActionPrompt` (`clearEmbeddingIndex`, `unloadAllModels`) and `pendingConfirmation: DestructiveActionPrompt?` for item-driven `.confirmationDialog("Confirm Action", item: $viewModel.pendingConfirmation)` prompts (`VISION.md` Principle 8).
+- [x] **13.2 Focused `@Observable` Subview Factoring Across All 5 Surfaces**:
+  - Extracted `StatusBannerBar`, `EmptyModelsDiscoveryBanner`, and `ToolbarContainerBehavior27_3Modifier` (`if #available(macOS 27.3, iOS 27.3, *)`) in `HeylookWorkbenchView.swift`, plus `#if os(iOS)` `ToolbarOverflowMenu`.
+  - Extracted `ChatTopControlBar`, `ChatPromptPreviewDrawer`, `ChatComposerBar`, and `ChatAttachmentPillView` in `ChatWorkbenchSurface.swift`, added multiplatform `.fileImporter` on `#if !os(macOS)`, and enforced `28x28` minimum hit targets on compact icon controls.
+  - Extracted `EmbeddingsSearchHeaderBar`, `EmbeddingsStatusToolbar`, `EmbeddingsEvalLabDrawer`, and `ModalityFilterRow` in `NotebookAndEmbeddingsSurfaces.swift`; replaced `ForEach(Array(frames.enumerated()), id: \.offset)` with `KeyframeStamp: Identifiable`; replaced synchronous main-thread `NSImage(contentsOf:)` with cross-platform `AsyncImage(url:)`; and converted `ScoredFeatureBreakdownCard` `.overlay(...)` to trailing-closure `.overlay { ... }`.
+  - Extracted `ModelsTopActionBar` in `ModelsAndSystemSurfaces.swift` and bound `PerfServerSurface` to `viewModel.sortedActiveGGUFPorts`.
+- [x] **13.3 Multi-Target `swift-lsp` Diagnostics & Unit Test Coverage**:
+  - Enhanced `sourcekit_mcp.py` (`ensure_local_swiftpm_dependency_modules` + `@main` `-parse-as-library` handling) so `swift_diagnostics(platform: "both", min_version: "27.3")` verifies `HeylookUI`, `HeylookApp`, and `HeylookTests` with `0` errors across `arm64-apple-macosx27.3` and `arm64-apple-ios27.3-simulator`.
+  - Added `@MainActor @Test` `testWorkbenchViewModelCachedObservableProjectionsAndDestructivePrompt` to `HeylookTests` (**29/29** tests passing).
+
+---
+
+## Next Horizons (Optional Post-Phase 13 Frontiers)
 
 - [ ] **H.1 Live Hardware Conversion & Throughput Certification (192 GB M2 Ultra Mac Studio)**:
   - Run live `heylook-cli convert-mlx` (`4-bit affine`, `mxfp4`, `q4_zero`) and `scripts/export_coreai.sh` against resident unquantized BF16 checkpoints and compare prefill/decode throughput and memory residency across Tier 1 (`MLXSwiftProvider`) and Tier 2 (`CoreAIProvider`).

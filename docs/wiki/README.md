@@ -26,4 +26,4 @@ Welcome to the **LLM Knowledge Wiki** for `heylookitsanllm-macos` (`heylook`) �
 - **[VISION.md](../../VISION.md)**: Core design principles (*Visibility*, *Derive, Don't Copy*, *Truthful Runtime*, *Heterogeneous Apple Silicon Co-Residency*). Breaks ties when a design choice is unclear.
 - **[docs/USER_GUIDE.md](../USER_GUIDE.md)**: Complete operator guide for the 5-surface SwiftUI Workbench, `heylook.toml` configuration, `heylook-cli`, and `/v1/*` HTTP/SSE endpoints.
 - **[docs/project/CURRENT.md](../project/CURRENT.md)**: Live readiness matrix of every target and subsystem.
-- **[docs/project/TODO.md](../project/TODO.md)**: Completed roadmap phases (Phases 0–12) and next hardware/mobile frontiers.
+- **[docs/project/TODO.md](../project/TODO.md)**: Completed roadmap phases (Phases 0–13) and next hardware/mobile frontiers.
