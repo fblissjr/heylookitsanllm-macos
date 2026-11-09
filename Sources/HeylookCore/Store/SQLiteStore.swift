@@ -460,6 +460,17 @@ public final class SQLiteStore: @unchecked Sendable {
         return out
     }
 
+    public func deleteNotebook(id: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let sql = "DELETE FROM notebooks WHERE id = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw lastError() }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT_CORE)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw lastError() }
+    }
+
     // MARK: - Presets
 
     public func upsertPreset(_ preset: PresetRecord) throws {

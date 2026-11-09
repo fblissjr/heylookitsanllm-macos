@@ -1331,7 +1331,8 @@ public final class BonjourServiceBrowser: @unchecked Sendable {
 /// (`vlm_parity_probe`), and Matryoshka `768d`/`512d`/`256d`/`128d` `Recall@K` & `MRR` benchmark
 /// (`matryoshka_recall_probe`) executed by `heylook-cli eval-lab` and the contract test suite.
 public enum EvalLabSuite {
-    public struct ProbeSummary: Codable, Sendable, Equatable {
+    public struct ProbeSummary: Codable, Sendable, Equatable, Identifiable {
+        public var id: String { name }
         public let name: String
         public let passed: Bool
         public let detail: String

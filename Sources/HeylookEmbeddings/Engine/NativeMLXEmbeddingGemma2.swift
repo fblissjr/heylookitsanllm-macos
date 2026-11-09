@@ -17,8 +17,13 @@ public enum NativeMLXEmbeddingGemma2 {
         if let envPath = ProcessInfo.processInfo.environment["HEYLOOK_EMBEDDING_CHECKPOINT"], !envPath.isEmpty {
             return URL(fileURLWithPath: envPath)
         }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".heylook/models/embeddinggemma-2-MLX-BF16")
+        #if os(macOS)
+        let baseDir = FileManager.default.homeDirectoryForCurrentUser
+        #else
+        let baseDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        #endif
+        return baseDir.appendingPathComponent(".heylook/models/embeddinggemma-2-MLX-BF16")
     }
 
     public struct CheckpointDescriptor: Codable, Sendable, Equatable {
