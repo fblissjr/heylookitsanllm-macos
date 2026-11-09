@@ -10,7 +10,7 @@
 #     not bundled in Xcode.app — specifically the 5 Apple CoreAI ('apple/coreai-models') skills.
 #
 # Usage:
-#   ./scripts/sync_agent_skills.sh [--include-xcode] [target-skills-dir]
+#   ./scripts/sync_agent_skills.sh [--include-xcode | --prune-only] [target-skills-dir]
 
 set -euo pipefail
 
@@ -18,12 +18,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 INCLUDE_XCODE=0
+PRUNE_ONLY=0
 SKILLS_DIR="$REPO_ROOT/.agents/skills"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --include-xcode|--all-xcode)
             INCLUDE_XCODE=1
+            shift
+            ;;
+        --prune-only)
+            PRUNE_ONLY=1
             shift
             ;;
         -h|--help)
@@ -120,6 +125,29 @@ EOF
 fi
 
 echo "==> 2. Syncing project-specific Apple CoreAI skills..."
+COREAI_SKILL_NAMES=(
+    "model-authoring"
+    "model-compression-exploration"
+    "port-a-model-to-the-zoo"
+    "reproduce-a-zoo-model"
+    "working-with-coreai"
+)
+
+if [[ "$PRUNE_ONLY" -eq 1 ]]; then
+    PRUNED_COREAI=0
+    for name in "${COREAI_SKILL_NAMES[@]}"; do
+        if [[ -d "$SKILLS_DIR/$name" ]]; then
+            chmod -R u+w "$SKILLS_DIR/$name" 2>/dev/null || true
+            rm -rf "$SKILLS_DIR/$name"
+            PRUNED_COREAI=$((PRUNED_COREAI + 1))
+        fi
+    done
+    echo "    ✓ Removed $PRUNED_COREAI project-specific CoreAI skill directories from $SKILLS_DIR (--prune-only)."
+    TOTAL_SKILLS="$(find "$SKILLS_DIR" -mindepth 2 -maxdepth 2 -name 'SKILL.md' | wc -l | tr -d ' ')"
+    echo "==> Done! $TOTAL_SKILLS global skills remaining in $SKILLS_DIR"
+    exit 0
+fi
+
 COREAI_CANDIDATES=(
     "${HEYLOOK_COREAI_DIR:-}"
     "$REPO_ROOT/coderef/apple-coreai"

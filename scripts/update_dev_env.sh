@@ -208,14 +208,14 @@ fi
 # 4. Sync Xcode 27.x Agent Skills, AdditionalDocumentation Guides & Core AI Skills
 # ------------------------------------------------------------------------------
 echo ""
-echo "==> [4/6] Syncing Agent Skills into workspace (.agents/skills) and global (~/.agents/skills)..."
+echo "==> [4/6] Syncing project-local Agent Skills (.agents/skills) & pruning duplicates in global (~/.agents/skills)..."
 run_cmd "$SCRIPT_DIR/sync_agent_skills.sh" "$REPO_ROOT/.agents/skills"
 
-if [[ -d "$HOME/.agents/skills" ]] || [[ "${SYNC_GLOBAL_SKILLS:-1}" == "1" ]]; then
+if [[ -d "$HOME/.agents/skills" ]]; then
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "    [dry-run] $SCRIPT_DIR/sync_agent_skills.sh $HOME/.agents/skills"
+        echo "    [dry-run] $SCRIPT_DIR/sync_agent_skills.sh --prune-only $HOME/.agents/skills"
     else
-        "$SCRIPT_DIR/sync_agent_skills.sh" "$HOME/.agents/skills" || echo "    [warn] Global ~/.agents/skills sync skipped (run outside sandbox if needed)."
+        "$SCRIPT_DIR/sync_agent_skills.sh" --prune-only "$HOME/.agents/skills" || echo "    [warn] Global ~/.agents/skills prune skipped (run outside sandbox if needed)."
     fi
 fi
 
