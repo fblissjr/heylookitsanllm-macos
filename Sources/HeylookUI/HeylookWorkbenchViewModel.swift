@@ -6,6 +6,40 @@ import HeylookEmbeddings
 import HeylookEngines
 import HeylookServer
 
+public enum DestructiveActionPrompt: String, Identifiable, Equatable, Sendable {
+    case clearEmbeddingIndex
+    case unloadAllModels
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .clearEmbeddingIndex:
+            return "Clear Embedding Index?"
+        case .unloadAllModels:
+            return "Unload All Resident Models?"
+        }
+    }
+
+    public var confirmLabel: String {
+        switch self {
+        case .clearEmbeddingIndex:
+            return "Clear Index"
+        case .unloadAllModels:
+            return "Unload All Models"
+        }
+    }
+
+    public var message: String {
+        switch self {
+        case .clearEmbeddingIndex:
+            return "This removes all indexed artifacts and Matryoshka vectors from VectorStore SQLite."
+        case .unloadAllModels:
+            return "This unloads all GPU and ANE models, clears Metal/ANE caches, and terminates llama-server subprocesses."
+        }
+    }
+}
+
 @MainActor
 @Observable
 public final class HeylookWorkbenchViewModel {
@@ -22,14 +56,21 @@ public final class HeylookWorkbenchViewModel {
 
     // Models & Engine State
     public var registeredModels: [EngineDescription] = [] {
-        didSet { recomputeFilteredModels() }
+        didSet {
+            recomputeFilteredModels()
+            recomputeActiveModelDescription()
+        }
     }
     public private(set) var filteredModels: [EngineDescription] = []
     public private(set) var modelCountsByProvider: [EngineProviderKind: Int] = [:]
-    public var selectedModelID: String = ""
+    public var selectedModelID: String = "" {
+        didSet { recomputeActiveModelDescription() }
+    }
+    public private(set) var activeModelDescription: EngineDescription?
     public var editingSidecarModel: EngineDescription?
     public var showMLXConverterSheet: Bool = false
     public var convertingSourceModel: EngineDescription?
+    public var pendingConfirmation: DestructiveActionPrompt?
     public var memorySnapshot: HardwareMemoryMonitor.MemorySnapshot = HardwareMemoryMonitor.snapshot()
     public var schedulerMetrics: ComputeScheduler.SchedulerMetrics = ComputeScheduler.SchedulerMetrics(
         gpuGateBusy: false,
@@ -125,7 +166,14 @@ public final class HeylookWorkbenchViewModel {
     public var labMetrics: [EmbeddingLabRunner.DimensionMetrics] = []
     public var evalLabSuiteReport: EvalLabSuite.SuiteReport?
     public var isRunningEvalLab: Bool = false
-    public var activeGGUFPorts: [String: Int] = [:]
+    public var activeGGUFPorts: [String: Int] = [:] {
+        didSet {
+            sortedActiveGGUFPorts = activeGGUFPorts
+                .sorted { $0.value < $1.value }
+                .map { "\($0.key)::\($0.value)" }
+        }
+    }
+    public private(set) var sortedActiveGGUFPorts: [String] = []
     public var activeSubprocessCount: Int = 0
 
     public var hasActiveQuery: Bool {
@@ -199,7 +247,7 @@ public final class HeylookWorkbenchViewModel {
     private var folderWatcher: FolderWatcher?
     #endif
 
-    public init() {
+    public init(autoBootstrap: Bool = true) {
         let dbURL = HeylookConfig.defaultStoreURL
         let vecDbURL = HeylookConfig.defaultVectorStoreURL
         let cfg = HeylookConfig.loadDefault()
@@ -228,8 +276,10 @@ public final class HeylookWorkbenchViewModel {
         )
         self.serverPort = UInt16(cfg.serverPort)
 
-        Task {
-            await bootstrap()
+        if autoBootstrap {
+            Task {
+                await bootstrap()
+            }
         }
     }
 
@@ -500,8 +550,8 @@ public final class HeylookWorkbenchViewModel {
         }
     }
 
-    public var activeModelDescription: EngineDescription? {
-        registeredModels.first(where: { $0.modelID == selectedModelID }) ?? registeredModels.first
+    private func recomputeActiveModelDescription() {
+        activeModelDescription = registeredModels.first(where: { $0.modelID == selectedModelID }) ?? registeredModels.first
     }
 
     private func recomputeFilteredModels() {

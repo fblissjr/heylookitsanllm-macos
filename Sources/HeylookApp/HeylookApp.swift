@@ -82,7 +82,7 @@ struct HeylookApp: App {
 
                 Divider()
 
-                ForEach(Array(HeylookSurface.allCases.enumerated()), id: \.element.id) { idx, surface in
+                ForEach(HeylookSurface.allCases.enumerated(), id: \.element.id) { idx, surface in
                     Button {
                         viewModel.activeSurface = surface
                     } label: {
@@ -97,7 +97,7 @@ struct HeylookApp: App {
 
         #if os(macOS)
         Settings {
-            HeylookSettingsView(viewModel: $viewModel)
+            HeylookSettingsView(viewModel: viewModel)
         }
 
         MenuBarExtra(
@@ -153,7 +153,7 @@ struct HeylookApp: App {
 
 #if os(macOS)
 struct HeylookSettingsView: View {
-    @Binding var viewModel: HeylookWorkbenchViewModel
+    @Bindable var viewModel: HeylookWorkbenchViewModel
 
     var body: some View {
         TabView {

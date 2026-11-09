@@ -8,11 +8,12 @@ This document defines the authoritative UI architecture, layout hierarchy, focus
 
 All UI code in `heylookitsanllm-macos` is grounded in five canonical sources:
 
-1. **Installed Xcode `MacOSX27.2.sdk` & `iPhoneSimulator27.2.sdk` `.swiftinterface` Headers**:
+1. **Installed Xcode `MacOSX27.3.sdk` & `iPhoneSimulator27.3.sdk` `.swiftinterface` Headers (Targeting `27.2+` Deployment Floor)**:
    - Verified via `swift-lsp` (`swift_sdk_interface` and `swift_diagnostics`) against:
      - `SwiftUI.framework/Modules/SwiftUI.swiftmodule/arm64e-apple-macos.swiftinterface`
      - `SwiftUICore.framework/Modules/SwiftUICore.swiftmodule/arm64e-apple-macos.swiftinterface`
      - `AppKit.framework/Modules/AppKit.swiftmodule/arm64e-apple-macos.swiftinterface`
+   - `Package.swift` `platforms:` and `scripts/build_native.sh` `LSMinimumSystemVersion` remain at `27.2` so binaries built with the `Xcode 27.3` SDK execute natively on `macOS 27.2` and `iOS 27.2` hosts without unguarded symbol crashes. APIs introduced in `27.3` (such as `.toolbarContainerBehavior(.automatic)`) are guarded with `if #available(macOS 27.3, iOS 27.3, *)`.
 2. **Apple First-Party Xcode 27.x Agent Skills (`./scripts/sync_agent_skills.sh` -> `.agents/skills/`)**:
    - Exported via `xcrun agent skills export --replace-existing .agents/skills`:
      - `swiftui-specialist` (`references/structure.md`, `dataflow.md`, `environment.md`, `modifiers.md`, `localization.md`, `animations.md`, `foreach.md`, `soft-deprecation.md`, `soft-deprecated-apis.md`)
@@ -106,11 +107,14 @@ When styling controls, toolbars, and floating bars on `macOS 27.2+` and `iOS 27.
 2. **Liquid Glass Containers & Surfaces (`GlassEffectContainer` & `.glassEffect`)**:
    - Wrap adjacent glass pills or floating control bars in `GlassEffectContainer(spacing:)` so effects batch in a single rendering pass and blend smoothly.
    - Apply `.glassEffect(.regular, in: .rect(cornerRadius: ...))` or `.glassEffect(.regular.interactive(), in: .capsule)` *after* layout/padding modifiers.
-3. **Toolbar Grouping & Visibility Priority (`ToolbarSpacer` & `.visibilityPriority`)**:
+3. **Toolbar Grouping, Overflow & 27.3 Container Behavior (`ToolbarSpacer`, `.visibilityPriority`, `ToolbarOverflowMenu`, `.toolbarContainerBehavior`)**:
    - Separate logical groups in `.toolbar` using `ToolbarSpacer(.fixed)` or `ToolbarSpacer(.flexible)` rather than embedding manual `Divider()` views inside a single `ToolbarItem`.
    - Apply `.visibilityPriority(.high)` (`ToolbarItemVisibilityPriority`) to primary toolbar controls so they stay visible in narrow windows before overflowing.
-   - **Dual-SDK Availability Rule**: `ToolbarOverflowMenu` and `ToolbarItemPlacement.topBarPinnedTrailing` are `@available(iOS 27.0, visionOS 27.0, *) @available(macOS, unavailable)`. Never use them unguarded in multiplatform views; gate them with `#if os(iOS)`.
-4. **Swift 6.2 / 6.4 `@MainActor` `@Observable` Isolation**:
+   - Apply `.modifier(ToolbarContainerBehavior27_3Modifier())` (`if #available(macOS 27.3, iOS 27.3, *) { content.toolbarContainerBehavior(.automatic) }`) on the root `NavigationSplitView`.
+   - **Dual-SDK Availability Rule**: `ToolbarOverflowMenu` and `ToolbarItemPlacement.topBarPinnedTrailing` are `@available(iOS 27.0, visionOS 27.0, *) @available(macOS, unavailable)` (and `ToolbarContainerBehavior.local` is `@available(iOS 27.3, *) @available(macOS, unavailable)`). Never use iOS-only toolbar symbols unguarded in multiplatform views; gate `ToolbarOverflowMenu` with `#if os(iOS)`.
+4. **Item-Driven Confirmation Dialogs (`confirmationDialog(_:item:)`)**:
+   - Destructive actions (`Clear Index…` in `EmbeddingsSidebarSections` and `Unload All Models…` across the sidebar, `ModelsTopActionBar`, and `PerfServerSurface`) set `viewModel.pendingConfirmation` (`HeylookWorkbenchViewModel.DestructiveActionPrompt`) and present `.confirmationDialog("Confirm Action", item: $viewModel.pendingConfirmation)` at the root `HeylookWorkbenchView` level per `swiftui-whats-new-27/references/item-binding.md`.
+5. **Swift 6.2 / 6.4 `@MainActor` `@Observable` Isolation**:
    - `HeylookWorkbenchViewModel` is `@MainActor @Observable`. Background work (`ComputeScheduler`, `HybridLocalEmbeddingEngine`, `HeylookHTTPServer`, `MLXModelConverter`) runs inside dedicated actors or `@concurrent` async functions and yields `Sendable` value types back to `@MainActor`.
 
 ---
@@ -120,9 +124,16 @@ When styling controls, toolbars, and floating bars on `macOS 27.2+` and `iOS 27.
 Per Apple's exported `swiftui-specialist` and `swiftui-whats-new-27` skills:
 
 1. **Separate `View` Structs Over `@ViewBuilder` Computed Properties (`structure.md`)**:
-   - A `View` struct is SwiftUI's unit of invalidation. Multi-section layouts (such as contextual sidebar sections in `HeylookSidebarView`: `ChatConversationsSidebarSection`, `NotebooksSidebarSection`, `EmbeddingsSidebarSections`, `ModelsFilterSidebarSection`, `PerfQuickActionsSidebarSection`) must be separate `View` structs rather than `private var` computed properties on the parent view.
-2. **KeyPath `@Bindable` Projections Over Inline `Binding(get:set:)` Closures (`dataflow.md`)**:
-   - Never construct `Binding(get: { ... }, set: { ... })` closures inside `body` (which allocates a new heap closure on every evaluation and defeats binding comparison). Expose computed getter/setter properties or subscripts on `@Observable` (`HeylookWorkbenchViewModel`, e.g., `$viewModel.boundTemperature`, `$viewModel.boundEffectiveQueryTask`) and bind via `@Bindable` KeyPaths.
+   - A `View` struct is SwiftUI's unit of invalidation. Multi-section layouts must be separate `View` structs rather than monolithic `body` closures or `private func` helpers on the parent view:
+     - `HeylookWorkbenchView`: `StatusBannerBar`, `EmptyModelsDiscoveryBanner`, `ChatConversationsSidebarSection`, `NotebooksSidebarSection`, `EmbeddingsSidebarSections`, `ModelsFilterSidebarSection`, `PerfQuickActionsSidebarSection`.
+     - `ChatWorkbenchSurface`: `ChatTopControlBar`, `ChatPromptPreviewDrawer`, `ChatComposerBar`, `ChatAttachmentPillView`, `MessageBubbleView`, `StreamingAssistantView`.
+     - `EmbeddingsStudioSurface`: `EmbeddingsSearchHeaderBar`, `EmbeddingsStatusToolbar`, `EmbeddingsEvalLabDrawer`, `ModalityFilterRow`, `EmbeddingsInspectorView`, `ScoredFeatureBreakdownCard`.
+     - `ModelsInspectorSurface`: `ModelsTopActionBar`, `ModelRegistryRowView`.
+2. **Cached `@Observable` Stored Projections & `@Bindable` KeyPaths (`dataflow.md` & `foreach.md`)**:
+   - Pass `@Observable` models into child views via `@Bindable var viewModel: HeylookWorkbenchViewModel` (never `@Binding var viewModel: HeylookWorkbenchViewModel`).
+   - Cache derived collections and lookups (`activeModelDescription`, `filteredModels`, `modelCountsByProvider`, `sortedActiveGGUFPorts`) in `didSet` hooks on `HeylookWorkbenchViewModel` instead of recomputing `.first(where:)`, `.filter`, or `.sorted` inside `View.body` or `ForEach` arguments.
+   - Pass `Sequence.enumerated()` directly to `ForEach(span.frameTimes.enumerated(), id: \.offset)` or `ForEach(HeylookSurface.allCases.enumerated(), id: \.element.id)` (Swift 6.1+ `EnumeratedSequence: RandomAccessCollection`) without wrapping in `Array(...)`.
+   - Never construct `Binding(get: { ... }, set: { ... })` closures inside `body`. Expose computed getter/setter properties or subscripts on `@Observable` (`$viewModel.boundTemperature`, `$viewModel.boundEffectiveQueryTask`, `$viewModel[computeUnitFor: component]`) and bind via `@Bindable` KeyPaths.
 3. **`@State` Macro Rules in SDK 27 (`state-macro.md`)**:
    - Always mark `@State` properties `private` so `@Observable` reference types initialize lazily once per view lifetime.
    - Never provide both a declaration-site default value (`@State private var x = 0`) and an `init` assignment (`self.x = y`); drop the declaration default when initializing in `init`.
@@ -138,7 +149,7 @@ Per Apple's exported `swiftui-specialist` and `swiftui-whats-new-27` skills:
    - Read `@Environment(\.appearsActive)` on custom sidebar footers so status chrome dims when the window loses key focus.
 2. **macOS 27 SDK Linked Runtime Behavior Rules**:
    - **Menu Item Icons (`#1`)**: Linking against `MacOSX27.x.sdk` hides menu item images by default. Attach `.labelStyle(.titleAndIcon)` inside `Menu` / `CommandGroup` items whenever an icon conveys state (such as active preset checkmarks).
-   - **`NSOpenPanel` Content Types (`#2`)**: `NSOpenPanel` automatically derives `canChooseFiles` / `canChooseDirectories` from `allowedContentTypes`. Always set `allowedContentTypes` explicitly to match the intended file/folder selection mode.
+   - **`NSOpenPanel` Content Types (`#2`) & Multiplatform `.fileImporter` Parity**: `NSOpenPanel` automatically derives `canChooseFiles` / `canChooseDirectories` from `allowedContentTypes`. On `#if !os(macOS)` (`iOS 27.2+`), pair file selection actions with `.fileImporter(isPresented:allowedContentTypes:allowsMultipleSelection:)` so media attachment and corpus indexing work on both macOS and iOS.
    - **Sheet & Popover Modifier Reset (`#6`)**: Control modifiers (`.controlSize`, `.buttonStyle`, `.tint`) applied outside `.sheet` or `.popover` reset inside the presented sheet on macOS 27; apply control modifiers directly inside the sheet's root content.
-3. **Touch on Mac (36pt Hit Targets & Hover-Free Discoverability)**:
-   - Ensure compact icon-only buttons apply `.contentShape(Rectangle())` and never gate actions behind mouse-hover-only affordances so direct touch (`GestureInputKinds.directTouch` / Sidecar / PROLED displays) and iOS 27 scenes have full parity.
+3. **Touch on Mac (28pt+ Hit Targets & Hover-Free Discoverability)**:
+   - Ensure compact icon-only buttons (`StatusBannerBar` dismiss, `ChatAttachmentPillView` remove, `MessageBubbleView` edit pencil, watched-folder remove, search clear) apply `.frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())` and never gate actions behind mouse-hover-only affordances so direct touch (`GestureInputKinds.directTouch` / Sidecar / PROLED displays) and iOS 27 scenes have full parity.

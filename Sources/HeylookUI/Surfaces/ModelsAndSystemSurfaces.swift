@@ -18,52 +18,10 @@ struct ModelsInspectorSurface: View {
     var body: some View {
         let filteredModels = viewModel.filteredModels
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Text("Registered Models (\(filteredModels.count))")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                if let filter = viewModel.selectedProviderFilter {
-                    Button {
-                        viewModel.selectedProviderFilter = nil
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text(filter.displayName)
-                            Image(systemName: "xmark.circle.fill")
-                        }
-                        .font(.caption2.monospaced())
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                }
-                Spacer()
-                Button {
-                    viewModel.convertingSourceModel = nil
-                    viewModel.showMLXConverterSheet = true
-                } label: {
-                    Label("Quantize / Convert MLX…", systemImage: "cube.transparent")
-                }
-                .buttonStyle(.glass)
-                .controlSize(.small)
-
-                Button {
-                    Task { await viewModel.rescanConfiguredModels() }
-                } label: {
-                    Label("Re-scan", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.glass)
-                .controlSize(.small)
-
-                Button {
-                    Task { await viewModel.unloadAllModels() }
-                } label: {
-                    Label("Unload All Models", systemImage: "eject.circle")
-                }
-                .buttonStyle(.glass)
-                .controlSize(.small)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(.bar)
+            ModelsTopActionBar(
+                viewModel: viewModel,
+                modelCount: filteredModels.count
+            )
 
             Divider()
 
@@ -107,6 +65,67 @@ struct ModelsInspectorSurface: View {
                 initialModel: viewModel.convertingSourceModel
             )
         }
+    }
+}
+
+private struct ModelsTopActionBar: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    let modelCount: Int
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("Registered Models (\(modelCount))")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if let filter = viewModel.selectedProviderFilter {
+                Button {
+                    viewModel.selectedProviderFilter = nil
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(filter.displayName)
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .font(.caption2.monospaced())
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+            }
+            Spacer()
+            Button {
+                viewModel.convertingSourceModel = nil
+                viewModel.showMLXConverterSheet = true
+            } label: {
+                Label("Quantize / Convert MLX…", systemImage: "cube.transparent")
+            }
+            .buttonStyle(.glass)
+            .controlSize(.small)
+
+            Button {
+                Task { await viewModel.rescanConfiguredModels() }
+            } label: {
+                Label("Re-scan", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.glass)
+            .controlSize(.small)
+
+            Button {
+                let hasLoaded = viewModel.registeredModels.contains(where: \.isLoaded)
+                    || !viewModel.schedulerMetrics.loadedGPUModels.isEmpty
+                    || !viewModel.schedulerMetrics.loadedANEModels.isEmpty
+                if hasLoaded {
+                    viewModel.pendingConfirmation = .unloadAllModels
+                } else {
+                    Task { await viewModel.unloadAllModels() }
+                }
+            } label: {
+                Label("Unload All Models…", systemImage: "eject.circle")
+            }
+            .buttonStyle(.glass)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(.bar)
     }
 }
 
@@ -671,19 +690,23 @@ struct PerfServerSurface: View {
                 }
                 LabeledContent("Allocated GGUF Loopback Ports") {
                     Text(
-                        viewModel.activeGGUFPorts.isEmpty
+                        viewModel.sortedActiveGGUFPorts.isEmpty
                             ? "None (18080+ free)"
-                            : viewModel.activeGGUFPorts
-                                .sorted { $0.value < $1.value }
-                                .map { "\($0.key)::\($0.value)" }
-                                .joined(separator: ", ")
+                            : viewModel.sortedActiveGGUFPorts.joined(separator: ", ")
                     )
                     .font(.caption.monospaced().weight(.medium))
                     .lineLimit(1)
                 }
                 LabeledContent("Memory & Subprocess Reclamation") {
-                    Button("Unload All & Reclaim Memory", role: .destructive) {
-                        Task { await viewModel.unloadAllModels() }
+                    Button("Unload All & Reclaim Memory…", role: .destructive) {
+                        let hasLoaded = viewModel.registeredModels.contains(where: \.isLoaded)
+                            || !viewModel.schedulerMetrics.loadedGPUModels.isEmpty
+                            || !viewModel.schedulerMetrics.loadedANEModels.isEmpty
+                        if hasLoaded {
+                            viewModel.pendingConfirmation = .unloadAllModels
+                        } else {
+                            Task { await viewModel.unloadAllModels() }
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)

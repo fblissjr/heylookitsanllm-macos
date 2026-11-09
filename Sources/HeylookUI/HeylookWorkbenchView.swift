@@ -65,52 +65,17 @@ public struct HeylookRootView: View {
         } detail: {
             VStack(spacing: 0) {
                 if let banner = viewModel.statusBanner, !banner.isEmpty {
-                    HStack(spacing: 10) {
-                        Image(systemName: "info.circle.fill")
-                            .foregroundStyle(.blue)
-                        Text(banner)
-                            .font(.caption.weight(.medium))
-                            .lineLimit(2)
-                            .textSelection(.enabled)
-                        Spacer()
-                        Button {
-                            viewModel.statusBanner = nil
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
+                    StatusBannerBar(banner: banner) {
+                        viewModel.statusBanner = nil
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(Color.blue.opacity(0.1))
                     Divider()
                 }
 
                 if viewModel.registeredModels.isEmpty {
-                    GlassEffectContainer(spacing: 10) {
-                        HStack(spacing: 10) {
-                            Image(systemName: "externaldrive.badge.plus")
-                                .foregroundStyle(.orange)
-                            Text("No local models discovered in heylook.toml scan_folders.")
-                                .font(.caption.weight(.medium))
-                            Spacer()
-                            Button("Re-scan Folders") {
-                                Task { await viewModel.rescanConfiguredModels() }
-                            }
-                            .buttonStyle(.glass)
-                            .controlSize(.small)
-
-                            Button("Load Sample Demo Workspace") {
-                                Task { await viewModel.loadSampleDemoWorkspace() }
-                            }
-                            .buttonStyle(.glassProminent)
-                            .controlSize(.small)
-                        }
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(Color.orange.opacity(0.1))
+                    EmptyModelsDiscoveryBanner(
+                        onRescan: { Task { await viewModel.rescanConfiguredModels() } },
+                        onLoadDemo: { Task { await viewModel.loadSampleDemoWorkspace() } }
+                    )
                     Divider()
                 }
 
@@ -131,6 +96,7 @@ public struct HeylookRootView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .modifier(ToolbarContainerBehavior27_3Modifier())
             .inspector(isPresented: $viewModel.showInspector) {
                 Group {
                     switch viewModel.activeSurface {
@@ -188,11 +154,117 @@ public struct HeylookRootView: View {
                     .help("Toggle Right Inspector")
                 }
                 .visibilityPriority(.high)
+
+                #if os(iOS)
+                ToolbarOverflowMenu {
+                    Button {
+                        Task { await viewModel.rescanConfiguredModels() }
+                    } label: {
+                        Label("Re-scan Models", systemImage: "arrow.clockwise")
+                    }
+
+                    Button {
+                        Task { await viewModel.loadSampleDemoWorkspace() }
+                    } label: {
+                        Label("Load Demo Workspace", systemImage: "sparkles")
+                    }
+
+                    Button {
+                        Task { await viewModel.toggleServer() }
+                    } label: {
+                        Label(
+                            viewModel.isServerRunning ? "Stop HTTP Server" : "Start HTTP Server",
+                            systemImage: viewModel.isServerRunning ? "stop.circle" : "play.circle"
+                        )
+                    }
+                }
+                #endif
             }
             .sheet(isPresented: $viewModel.showLoadPanel) {
                 LoadAndSamplerPanelSheet(viewModel: viewModel)
             }
+            .confirmationDialog(
+                "Confirm Action",
+                item: $viewModel.pendingConfirmation
+            ) { action in
+                Button(action.confirmLabel, role: .destructive) {
+                    switch action {
+                    case .clearEmbeddingIndex:
+                        viewModel.clearEmbeddingIndex()
+                    case .unloadAllModels:
+                        Task { await viewModel.unloadAllModels() }
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { action in
+                Text(action.message)
+            }
         }
+    }
+}
+
+private struct ToolbarContainerBehavior27_3Modifier: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 27.3, iOS 27.3, *) {
+            content.toolbarContainerBehavior(.automatic)
+        } else {
+            content
+        }
+    }
+}
+
+private struct StatusBannerBar: View {
+    let banner: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "info.circle.fill")
+                .foregroundStyle(.blue)
+            Text(banner)
+                .font(.caption.weight(.medium))
+                .lineLimit(2)
+                .textSelection(.enabled)
+            Spacer()
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 28, minHeight: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss status banner")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(Color.blue.opacity(0.1))
+    }
+}
+
+private struct EmptyModelsDiscoveryBanner: View {
+    let onRescan: () -> Void
+    let onLoadDemo: () -> Void
+
+    var body: some View {
+        GlassEffectContainer(spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "externaldrive.badge.plus")
+                    .foregroundStyle(.orange)
+                Text("No local models discovered in heylook.toml scan_folders.")
+                    .font(.caption.weight(.medium))
+                Spacer()
+                Button("Re-scan Folders", action: onRescan)
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+
+                Button("Load Sample Demo Workspace", action: onLoadDemo)
+                    .buttonStyle(.glassProminent)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.1))
     }
 }
 
@@ -509,7 +581,11 @@ private struct ModelsFilterSidebarSection: View {
             .buttonStyle(.plain)
 
             Button(role: .destructive) {
-                Task { await viewModel.unloadAllModels() }
+                if viewModel.schedulerMetrics.loadedGPUModels.isEmpty && viewModel.schedulerMetrics.loadedANEModels.isEmpty {
+                    Task { await viewModel.unloadAllModels() }
+                } else {
+                    viewModel.pendingConfirmation = .unloadAllModels
+                }
             } label: {
                 Label("Unload All Models", systemImage: "eject.circle")
             }
@@ -541,7 +617,11 @@ private struct PerfQuickActionsSidebarSection: View {
             .buttonStyle(.plain)
 
             Button(role: .destructive) {
-                Task { await viewModel.unloadAllModels() }
+                if viewModel.schedulerMetrics.loadedGPUModels.isEmpty && viewModel.schedulerMetrics.loadedANEModels.isEmpty {
+                    Task { await viewModel.unloadAllModels() }
+                } else {
+                    viewModel.pendingConfirmation = .unloadAllModels
+                }
             } label: {
                 Label("Unload All & Reclaim Memory", systemImage: "memorychip")
             }

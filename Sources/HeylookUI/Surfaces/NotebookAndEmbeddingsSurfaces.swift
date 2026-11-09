@@ -87,144 +87,21 @@ struct NotebookSurface: View {
 struct EmbeddingsStudioSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
     @FocusState private var isSearchFocused: Bool
+    @State private var showIndexingImporter = false
 
     var body: some View {
         VStack(spacing: 0) {
-            // Search Bar + Query Attachment + Scoring Pipeline Banner
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                        .font(.system(size: 15, weight: .semibold))
-
-                    TextField("Search across text, code, PDFs, images, audio & video…", text: $viewModel.embeddingQuery)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 14))
-                        .focused($isSearchFocused)
-                        .defaultFocus($isSearchFocused, true)
-                        .onSubmit {
-                            Task { await viewModel.runEmbeddingSearch() }
-                        }
-                        .onChange(of: viewModel.embeddingQuery) { _, _ in
-                            Task { await viewModel.runEmbeddingSearch() }
-                        }
-
-                    #if os(macOS)
-                    Button {
-                        pickQueryAttachment()
-                    } label: {
-                        Label("Attach Media", systemImage: "paperclip")
-                    }
-                    .buttonStyle(.glass)
-                    .controlSize(.small)
-                    .help("Attach an image or audio clip for multimodal query search")
-                    #endif
-
-                    Button("Search") {
-                        Task { await viewModel.runEmbeddingSearch() }
-                    }
-                    .buttonStyle(.glassProminent)
-                    .controlSize(.small)
-
-                    if !viewModel.embeddingQuery.isEmpty || viewModel.queryAttachmentURL != nil {
-                        Button {
-                            viewModel.embeddingQuery = ""
-                            viewModel.queryAttachmentURL = nil
-                            Task { await viewModel.runEmbeddingSearch() }
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Clear search query")
-                    }
-                }
-
-                if let attachment = viewModel.queryAttachmentURL {
-                    let kind = ArtifactKind.detect(from: attachment) ?? .image
-                    HStack(spacing: 6) {
-                        Image(systemName: kind.systemImage)
-                            .font(.caption)
-                            .foregroundStyle(.tint)
-                        Text("Query Media: \(attachment.lastPathComponent)")
-                            .font(.caption.weight(.medium))
-                            .lineLimit(1)
-                        Button {
-                            viewModel.queryAttachmentURL = nil
-                            Task { await viewModel.runEmbeddingSearch() }
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Capsule().fill(Color.accentColor.opacity(0.14)))
-                }
-
-                ScoringPipelineBanner(
-                    dimension: viewModel.selectedDimension,
-                    task: viewModel.effectiveQueryTask,
-                    hasQueryMedia: viewModel.queryAttachmentURL != nil,
-                    includeSoundtrack: viewModel.loadAudioFromVideo,
-                    videoSampling: viewModel.selectedSampling,
-                    towersLabel: viewModel.activeQueryTowersLabel
-                )
-            }
-            .padding(14)
-            .background(.bar)
+            EmbeddingsSearchHeaderBar(
+                viewModel: viewModel,
+                isSearchFocused: $isSearchFocused
+            )
 
             Divider()
 
-            // Status / Progress Bar
-            HStack(spacing: 10) {
-                if viewModel.isIndexing || viewModel.isEmbeddingBusy {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-                Text(viewModel.embeddingStatusMessage)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-
-                Spacer()
-
-                if viewModel.isIndexing {
-                    Button(role: .destructive) {
-                        viewModel.cancelIndexing()
-                    } label: {
-                        Label("Stop Indexing", systemImage: "stop.circle.fill")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                }
-
-                #if os(macOS)
-                Button {
-                    openFilePickerForIndexing()
-                } label: {
-                    Label("Add Files/Folders…", systemImage: "plus.rectangle.on.folder")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-                #endif
-
-                Toggle(isOn: $viewModel.showEvalLabDrawer) {
-                    Label("Eval Lab", systemImage: "chart.bar.xaxis")
-                }
-                .toggleStyle(.button)
-                .controlSize(.mini)
-
-                Text("\(viewModel.searchHits.count) results • \(viewModel.artifactCount) indexed")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 6)
-            .background(Color.secondary.opacity(0.05))
+            EmbeddingsStatusToolbar(
+                viewModel: viewModel,
+                onAddFilesOrFolders: triggerIndexingPicker
+            )
 
             Divider()
 
@@ -237,15 +114,13 @@ struct EmbeddingsStudioSurface: View {
                 } actions: {
                     GlassEffectContainer(spacing: 10) {
                         HStack(spacing: 10) {
-                            #if os(macOS)
                             Button {
-                                openFilePickerForIndexing()
+                                triggerIndexingPicker()
                             } label: {
                                 Label("Add Files or Folders…", systemImage: "plus.rectangle.on.folder")
                             }
                             .buttonStyle(.glassProminent)
                             .controlSize(.small)
-                            #endif
 
                             Button {
                                 Task { await viewModel.seedSampleCorpusIfNeeded() }
@@ -277,92 +152,156 @@ struct EmbeddingsStudioSurface: View {
             // Optional Pairwise & Retrieval Lab Bottom Drawer
             if viewModel.showEvalLabDrawer {
                 Divider()
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Label("Pairwise Embedding Cosine & Retrieval Lab (Recall@1 / MRR)", systemImage: "chart.bar.xaxis")
-                            .font(.caption.weight(.semibold))
-                        Spacer()
-                        Button {
-                            Task { await viewModel.runFullEvalLabSuite() }
-                        } label: {
-                            Label(
-                                viewModel.isRunningEvalLab ? "Running Probes…" : "Run Eval Suite (chain + VLM + MRL)",
-                                systemImage: "checkmark.shield"
-                            )
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.mini)
-                        .disabled(viewModel.isRunningEvalLab)
-
-                        ForEach(viewModel.labMetrics) { metric in
-                            Text(String(format: "%dd R@1: %.0f%% (MRR %.2f)", metric.dimensions, metric.recallAt1 * 100, metric.mrr))
-                                .font(.caption2.monospaced())
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.12), in: Capsule())
-                        }
-                    }
-
-                    if let suite = viewModel.evalLabSuiteReport {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                ForEach(suite.probes) { probe in
-                                    HStack(spacing: 4) {
-                                        Image(systemName: probe.passed ? "checkmark.circle.fill" : "xmark.octagon.fill")
-                                            .foregroundStyle(probe.passed ? .green : .red)
-                                            .font(.caption2)
-                                        Text("\(probe.name): \(probe.detail)")
-                                            .font(.caption2.monospaced())
-                                    }
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 3)
-                                    .background(
-                                        (probe.passed ? Color.green : Color.red).opacity(0.12),
-                                        in: Capsule()
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    HStack(spacing: 10) {
-                        TextField("Left text", text: $viewModel.compareLeftText)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.caption)
-                        TextField("Right text", text: $viewModel.compareRightText)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.caption)
-                        Button("Compare") {
-                            viewModel.runPairwiseCompare()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        Button {
-                            Task { await viewModel.promoteComparePairToRetrievalLab() }
-                        } label: {
-                            Label("Add to Lab (\(viewModel.benchmarkCases.count))", systemImage: "plus.square.on.square")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .disabled(viewModel.selectedHit == nil && viewModel.searchHits.isEmpty)
-                        .help("Promote Left query + selected artifact into the Retrieval Lab benchmark suite")
-
-                        if let score = viewModel.compareCosineScore {
-                            Text(String(format: "%dd Cosine: %.4f", viewModel.selectedDimension, score))
-                                .font(.caption.monospaced().weight(.bold))
-                                .foregroundStyle(.tint)
-                        }
-                    }
-                }
-                .padding(12)
-                .background(Color.secondary.opacity(0.04))
+                EmbeddingsEvalLabDrawer(viewModel: viewModel)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             isSearchFocused = true
         }
+        #if !os(macOS)
+        .fileImporter(
+            isPresented: $showIndexingImporter,
+            allowedContentTypes: [.item, .folder],
+            allowsMultipleSelection: true
+        ) { result in
+            if case .success(let urls) = result {
+                viewModel.startIndexing(urls)
+            }
+        }
+        #endif
+    }
+
+    private func triggerIndexingPicker() {
+        #if os(macOS)
+        openFilePickerForIndexing()
+        #else
+        showIndexingImporter = true
+        #endif
+    }
+
+    #if os(macOS)
+    private func openFilePickerForIndexing() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Index"
+        if panel.runModal() == .OK {
+            viewModel.startIndexing(panel.urls)
+        }
+    }
+    #endif
+}
+
+private struct EmbeddingsSearchHeaderBar: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    var isSearchFocused: FocusState<Bool>.Binding
+    @State private var showQueryMediaImporter = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .font(.system(size: 15, weight: .semibold))
+
+                TextField("Search across text, code, PDFs, images, audio & video…", text: $viewModel.embeddingQuery)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 14))
+                    .focused(isSearchFocused)
+                    .defaultFocus(isSearchFocused, true)
+                    .onSubmit {
+                        Task { await viewModel.runEmbeddingSearch() }
+                    }
+                    .onChange(of: viewModel.embeddingQuery) { _, _ in
+                        Task { await viewModel.runEmbeddingSearch() }
+                    }
+
+                Button {
+                    #if os(macOS)
+                    pickQueryAttachment()
+                    #else
+                    showQueryMediaImporter = true
+                    #endif
+                } label: {
+                    Label("Attach Media", systemImage: "paperclip")
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+                .help("Attach an image or audio clip for multimodal query search")
+
+                Button("Search") {
+                    Task { await viewModel.runEmbeddingSearch() }
+                }
+                .buttonStyle(.glassProminent)
+                .controlSize(.small)
+
+                if !viewModel.embeddingQuery.isEmpty || viewModel.queryAttachmentURL != nil {
+                    Button {
+                        viewModel.embeddingQuery = ""
+                        viewModel.queryAttachmentURL = nil
+                        Task { await viewModel.runEmbeddingSearch() }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 28, minHeight: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear search query")
+                }
+            }
+
+            if let attachment = viewModel.queryAttachmentURL {
+                let kind = ArtifactKind.detect(from: attachment) ?? .image
+                HStack(spacing: 6) {
+                    Image(systemName: kind.systemImage)
+                        .font(.caption)
+                        .foregroundStyle(.tint)
+                    Text("Query Media: \(attachment.lastPathComponent)")
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                    Button {
+                        viewModel.queryAttachmentURL = nil
+                        Task { await viewModel.runEmbeddingSearch() }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 28, minHeight: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+            }
+
+            ScoringPipelineBanner(
+                dimension: viewModel.selectedDimension,
+                task: viewModel.effectiveQueryTask,
+                hasQueryMedia: viewModel.queryAttachmentURL != nil,
+                includeSoundtrack: viewModel.loadAudioFromVideo,
+                videoSampling: viewModel.selectedSampling,
+                towersLabel: viewModel.activeQueryTowersLabel
+            )
+        }
+        .padding(14)
+        .background(.bar)
+        #if !os(macOS)
+        .fileImporter(
+            isPresented: $showQueryMediaImporter,
+            allowedContentTypes: [.image, .audiovisualContent, .audio],
+            allowsMultipleSelection: false
+        ) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                viewModel.queryAttachmentURL = url
+                Task { await viewModel.runEmbeddingSearch() }
+            }
+        }
+        #endif
     }
 
     #if os(macOS)
@@ -378,48 +317,201 @@ struct EmbeddingsStudioSurface: View {
             Task { await viewModel.runEmbeddingSearch() }
         }
     }
-
-    private func openFilePickerForIndexing() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = true
-        panel.prompt = "Index"
-        if panel.runModal() == .OK {
-            viewModel.startIndexing(panel.urls)
-        }
-    }
     #endif
+}
+
+private struct EmbeddingsStatusToolbar: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    let onAddFilesOrFolders: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if viewModel.isIndexing || viewModel.isEmbeddingBusy {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            Text(viewModel.embeddingStatusMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            Spacer()
+
+            if viewModel.isIndexing {
+                Button(role: .destructive) {
+                    viewModel.cancelIndexing()
+                } label: {
+                    Label("Stop Indexing", systemImage: "stop.circle.fill")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+            }
+
+            Button {
+                onAddFilesOrFolders()
+            } label: {
+                Label("Add Files/Folders…", systemImage: "plus.rectangle.on.folder")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+
+            Toggle(isOn: $viewModel.showEvalLabDrawer) {
+                Label("Eval Lab", systemImage: "chart.bar.xaxis")
+            }
+            .toggleStyle(.button)
+            .controlSize(.mini)
+
+            Text("\(viewModel.searchHits.count) results • \(viewModel.artifactCount) indexed")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(Color.secondary.opacity(0.05))
+    }
+}
+
+private struct EmbeddingsEvalLabDrawer: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Pairwise Embedding Cosine & Retrieval Lab (Recall@1 / MRR)", systemImage: "chart.bar.xaxis")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Button {
+                    Task { await viewModel.runFullEvalLabSuite() }
+                } label: {
+                    Label(
+                        viewModel.isRunningEvalLab ? "Running Probes…" : "Run Eval Suite (chain + VLM + MRL)",
+                        systemImage: "checkmark.shield"
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+                .disabled(viewModel.isRunningEvalLab)
+
+                ForEach(viewModel.labMetrics) { metric in
+                    Text(String(format: "%dd R@1: %.0f%% (MRR %.2f)", metric.dimensions, metric.recallAt1 * 100, metric.mrr))
+                        .font(.caption2.monospaced())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.12), in: Capsule())
+                }
+            }
+
+            if let suite = viewModel.evalLabSuiteReport {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(suite.probes) { probe in
+                            HStack(spacing: 4) {
+                                Image(systemName: probe.passed ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                                    .foregroundStyle(probe.passed ? .green : .red)
+                                    .font(.caption2)
+                                Text("\(probe.name): \(probe.detail)")
+                                    .font(.caption2.monospaced())
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(
+                                (probe.passed ? Color.green : Color.red).opacity(0.12),
+                                in: Capsule()
+                            )
+                        }
+                    }
+                }
+            }
+
+            HStack(spacing: 10) {
+                TextField("Left text", text: $viewModel.compareLeftText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                TextField("Right text", text: $viewModel.compareRightText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                Button("Compare") {
+                    viewModel.runPairwiseCompare()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    Task { await viewModel.promoteComparePairToRetrievalLab() }
+                } label: {
+                    Label("Add to Lab (\(viewModel.benchmarkCases.count))", systemImage: "plus.square.on.square")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(viewModel.selectedHit == nil && viewModel.searchHits.isEmpty)
+                .help("Promote Left query + selected artifact into the Retrieval Lab benchmark suite")
+
+                if let score = viewModel.compareCosineScore {
+                    Text(String(format: "%dd Cosine: %.4f", viewModel.selectedDimension, score))
+                        .font(.caption.monospaced().weight(.bold))
+                        .foregroundStyle(.tint)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.04))
+    }
 }
 
 // MARK: - Embeddings Contextual Sidebar Sections (Rendered in Unified Sidebar List)
 
 struct EmbeddingsSidebarSections: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
+    @State private var showIndexingImporter = false
 
     var body: some View {
         Section("Modality Filter") {
-            modalityRow(title: "All Artifacts", icon: "square.grid.2x2", kind: nil, count: viewModel.artifactCount)
+            ModalityFilterRow(
+                title: "All Artifacts",
+                icon: "square.grid.2x2",
+                count: viewModel.artifactCount,
+                isSelected: viewModel.selectedKindFilter == nil
+            ) {
+                viewModel.selectedKindFilter = nil
+                Task { await viewModel.runEmbeddingSearch() }
+            }
             ForEach(ArtifactKind.allCases) { kind in
-                modalityRow(
+                ModalityFilterRow(
                     title: kind.displayName,
                     icon: kind.systemImage,
-                    kind: kind,
-                    count: viewModel.countsByKind[kind] ?? 0
-                )
+                    count: viewModel.countsByKind[kind] ?? 0,
+                    isSelected: viewModel.selectedKindFilter == kind
+                ) {
+                    viewModel.selectedKindFilter = kind
+                    Task { await viewModel.runEmbeddingSearch() }
+                }
             }
         }
 
         Section("Index & Watched Folders") {
-            #if os(macOS)
             Button {
+                #if os(macOS)
                 openFilePickerForIndexing()
+                #else
+                showIndexingImporter = true
+                #endif
             } label: {
                 Label("Add Files or Folders…", systemImage: "plus.rectangle.on.folder")
                     .fontWeight(.medium)
                     .foregroundStyle(Color.accentColor)
             }
             .buttonStyle(.plain)
+            #if !os(macOS)
+            .fileImporter(
+                isPresented: $showIndexingImporter,
+                allowedContentTypes: [.item, .folder],
+                allowsMultipleSelection: true
+            ) { result in
+                if case .success(let urls) = result {
+                    viewModel.startIndexing(urls)
+                }
+            }
             #endif
 
             if !viewModel.watchedFolders.isEmpty {
@@ -433,9 +525,9 @@ struct EmbeddingsSidebarSections: View {
             }
 
             Button(role: .destructive) {
-                viewModel.clearEmbeddingIndex()
+                viewModel.pendingConfirmation = .clearEmbeddingIndex
             } label: {
-                Label("Clear Index", systemImage: "trash")
+                Label("Clear Index…", systemImage: "trash")
             }
             .buttonStyle(.plain)
             .disabled(viewModel.artifactCount == 0 || viewModel.isIndexing)
@@ -461,6 +553,8 @@ struct EmbeddingsSidebarSections: View {
                         Image(systemName: "xmark.circle.fill")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .frame(minWidth: 28, minHeight: 28)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help("Stop watching \(folder.path)")
@@ -570,11 +664,30 @@ struct EmbeddingsSidebarSections: View {
         }
     }
 
-    private func modalityRow(title: String, icon: String, kind: ArtifactKind?, count: Int) -> some View {
-        let isSelected = viewModel.selectedKindFilter == kind
-        return Button {
-            viewModel.selectedKindFilter = kind
-            Task { await viewModel.runEmbeddingSearch() }
+    #if os(macOS)
+    private func openFilePickerForIndexing() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Index"
+        if panel.runModal() == .OK {
+            viewModel.startIndexing(panel.urls)
+        }
+    }
+    #endif
+}
+
+private struct ModalityFilterRow: View {
+    let title: String
+    let icon: String
+    let count: Int
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button {
+            onSelect()
         } label: {
             HStack {
                 Label(title, systemImage: icon)
@@ -592,19 +705,6 @@ struct EmbeddingsSidebarSections: View {
                 .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
         )
     }
-
-    #if os(macOS)
-    private func openFilePickerForIndexing() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = true
-        panel.prompt = "Index"
-        if panel.runModal() == .OK {
-            viewModel.startIndexing(panel.urls)
-        }
-    }
-    #endif
 }
 
 private struct ScoringPipelineBanner: View {
@@ -822,26 +922,34 @@ private struct ThumbnailBadge: View {
                 .fill(Color.secondary.opacity(0.12))
                 .frame(width: 46, height: 46)
 
-            #if os(macOS)
-            if artifact.kind == .image,
-               let nsImage = NSImage(contentsOf: artifact.url) {
-                Image(nsImage: nsImage)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 46, height: 46)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            if artifact.kind == .image {
+                AsyncImage(url: artifact.url) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 46, height: 46)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    default:
+                        Image(systemName: artifact.kind.systemImage)
+                            .font(.system(size: 20))
+                            .foregroundStyle(.tint)
+                    }
+                }
             } else {
                 Image(systemName: artifact.kind.systemImage)
                     .font(.system(size: 20))
                     .foregroundStyle(.tint)
             }
-            #else
-            Image(systemName: artifact.kind.systemImage)
-                .font(.system(size: 20))
-                .foregroundStyle(.tint)
-            #endif
         }
     }
+}
+
+private struct KeyframeStamp: Identifiable, Equatable {
+    let index: Int
+    let timeSeconds: Double
+    var id: String { "\(index)-\(timeSeconds)" }
 }
 
 // MARK: - Embeddings Artifact & Matryoshka Inspector (Rendered in Native .inspector)
@@ -927,15 +1035,24 @@ struct EmbeddingsInspectorView: View {
                     // Preview by Modality
                     switch hit.artifact.kind {
                     case .image:
-                        #if os(macOS)
-                        if let nsImage = NSImage(contentsOf: hit.artifact.url) {
-                            Image(nsImage: nsImage)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(maxHeight: 280)
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                        AsyncImage(url: hit.artifact.url) { phase in
+                            switch phase {
+                            case .success(let image):
+                                image
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(maxHeight: 280)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                            case .failure:
+                                Label("Unable to load image preview", systemImage: "photo.badge.exclamationmark")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            default:
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .frame(maxWidth: .infinity, minHeight: 120)
+                            }
                         }
-                        #endif
 
                     case .video, .audio:
                         VStack(alignment: .leading, spacing: 8) {
@@ -952,6 +1069,9 @@ struct EmbeddingsInspectorView: View {
                             }
 
                             if let span = activeSpan, !span.frameTimes.isEmpty {
+                                let keyframes = span.frameTimes.enumerated().map {
+                                    KeyframeStamp(index: $0.offset, timeSeconds: $0.element)
+                                }
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text("EXTRACTED KEYFRAME TIMESTAMPS (CLICK TO SEEK)")
                                         .font(.system(size: 10, weight: .semibold))
@@ -959,14 +1079,14 @@ struct EmbeddingsInspectorView: View {
 
                                     ScrollView(.horizontal, showsIndicators: false) {
                                         HStack(spacing: 6) {
-                                            ForEach(Array(span.frameTimes.enumerated()), id: \.offset) { idx, frameTime in
+                                            ForEach(keyframes) { stamp in
                                                 Button {
-                                                    seekAndPlay(url: hit.artifact.url, startTime: frameTime)
+                                                    seekAndPlay(url: hit.artifact.url, startTime: stamp.timeSeconds)
                                                 } label: {
                                                     HStack(spacing: 3) {
                                                         Image(systemName: "camera.viewfinder")
                                                             .font(.system(size: 9))
-                                                        Text("#\(idx + 1) \(ArtifactSpan.formatTimestampMillis(frameTime))")
+                                                        Text("#\(stamp.index + 1) \(ArtifactSpan.formatTimestampMillis(stamp.timeSeconds))")
                                                             .font(.system(size: 10, weight: .medium, design: .monospaced))
                                                     }
                                                     .padding(.horizontal, 7)
@@ -1074,6 +1194,7 @@ struct EmbeddingsInspectorView: View {
                     Divider()
 
                     // Metadata
+                    let sortedAttributes = hit.artifact.attributes.sorted { $0.key < $1.key }
                     VStack(alignment: .leading, spacing: 6) {
                         Text("METADATA")
                             .font(.caption.weight(.semibold))
@@ -1084,7 +1205,7 @@ struct EmbeddingsInspectorView: View {
                         LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: hit.artifact.fingerprint.byteCount, countStyle: .file))
                             .font(.caption)
 
-                        ForEach(hit.artifact.attributes.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in
+                        ForEach(sortedAttributes, id: \.key) { key, value in
                             LabeledContent(key.capitalized, value: value)
                                 .font(.caption)
                         }
@@ -1210,10 +1331,10 @@ private struct ScoredFeatureBreakdownCard: View {
             RoundedRectangle(cornerRadius: 9)
                 .fill(Color.accentColor.opacity(0.06))
         )
-        .overlay(
+        .overlay {
             RoundedRectangle(cornerRadius: 9)
                 .strokeBorder(Color.accentColor.opacity(0.18), lineWidth: 1)
-        )
+        }
     }
 }
 

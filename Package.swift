@@ -181,6 +181,7 @@ let package = Package(
                 "HeylookEmbeddings",
                 "HeylookEngines",
                 "HeylookServer",
+                "HeylookUI",
             ]
         ),
     ],

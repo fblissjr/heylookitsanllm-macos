@@ -35,7 +35,7 @@ Before modifying a subsystem, read the corresponding wiki page from `docs/wiki/`
 | `HeylookUI` | `macOS 27.2+`, `iOS 27.2+` | `HeylookWorkbenchViewModel` (`HeylookWorkbenchViewModel.swift`), `HeylookRootView` (`HeylookWorkbenchView.swift`), and modular surface views under `Surfaces/` (`ChatWorkbenchSurface.swift`, `NotebookAndEmbeddingsSurfaces.swift`, `ModelsAndSystemSurfaces.swift`). |
 | `HeylookApp` | `macOS 27.2+`, `iOS 27.2+` | Native desktop & mobile app entry point + macOS `MenuBarExtra` server & model lifecycle controller. |
 | `heylook-cli` | `macOS 27.2+` | Unified CLI (`serve`, `status`, `doctor`, `models`, `chat`, `index`, `search`, `watched`, `inspect-ane`, `inspect-checkpoint`, `convert-mlx`, `eval-lab`). |
-| `HeylookTests` | `macOS 27.2+`, `iOS 27.2+` | Swift Testing (`@Suite`, `@Test`) 28-test unit, lifecycle, truthful-runtime, and wire-contract verification suite. |
+| `HeylookTests` | `macOS 27.2+`, `iOS 27.2+` | Swift Testing (`@Suite`, `@Test`) 29-test unit, lifecycle, truthful-runtime, UI `@Observable` projection, and wire-contract verification suite. |
 
 ## Commands
 

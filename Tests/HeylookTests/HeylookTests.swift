@@ -4,6 +4,7 @@ import Testing
 @testable import HeylookEmbeddings
 @testable import HeylookEngines
 @testable import HeylookServer
+@testable import HeylookUI
 
 @Suite("Heylook Core, Embeddings, Engines & Server Verification Suite")
 struct HeylookTests {
@@ -2406,5 +2407,60 @@ struct HeylookTests {
             body: try JSONEncoder().encode(okDepthReq)
         )
         #expect(okDepthResp.status == 200)
+    }
+
+    // MARK: - 29. HeylookWorkbenchViewModel Cached @Observable Projections & DestructiveActionPrompt
+
+    @MainActor
+    @Test("HeylookWorkbenchViewModel caches activeModelDescription, filteredModels, modelCountsByProvider, sortedActiveGGUFPorts, and DestructiveActionPrompt")
+    func testWorkbenchViewModelCachedObservableProjectionsAndDestructivePrompt() throws {
+        let vm = HeylookWorkbenchViewModel(autoBootstrap: false)
+        #expect(vm.activeModelDescription == nil)
+        #expect(vm.filteredModels.isEmpty)
+        #expect(vm.sortedActiveGGUFPorts.isEmpty)
+        #expect(vm.pendingConfirmation == nil)
+
+        let mlxDesc = EngineDescription(
+            modelID: "qwen3.5-0.8b-mlx",
+            provider: .mlx,
+            modelPath: "/tmp/qwen3.5-0.8b",
+            supportsVision: ProvenanceField(value: false, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+        let ggufDesc = EngineDescription(
+            modelID: "gemma4-26b-gguf",
+            provider: .gguf,
+            modelPath: "/tmp/gemma4-26b.gguf",
+            supportsVision: ProvenanceField(value: true, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+
+        vm.registeredModels = [mlxDesc, ggufDesc]
+        #expect(vm.modelCountsByProvider[.mlx] == 1)
+        #expect(vm.modelCountsByProvider[.gguf] == 1)
+        #expect(vm.filteredModels.map(\.modelID) == ["qwen3.5-0.8b-mlx", "gemma4-26b-gguf"])
+
+        vm.selectedModelID = "gemma4-26b-gguf"
+        #expect(vm.activeModelDescription?.modelID == "gemma4-26b-gguf")
+        #expect(vm.activeModelDescription?.supportsVision.value == true)
+
+        vm.selectedProviderFilter = .mlx
+        #expect(vm.filteredModels.map(\.modelID) == ["qwen3.5-0.8b-mlx"])
+
+        vm.selectedProviderFilter = nil
+        #expect(vm.filteredModels.count == 2)
+
+        vm.activeGGUFPorts = ["z-model": 18082, "a-model": 18080, "m-model": 18081]
+        #expect(vm.sortedActiveGGUFPorts == ["a-model::18080", "m-model::18081", "z-model::18082"])
+
+        vm.pendingConfirmation = .clearEmbeddingIndex
+        #expect(vm.pendingConfirmation?.id == "clearEmbeddingIndex")
+        #expect(vm.pendingConfirmation?.title == "Clear Embedding Index?")
+        #expect(vm.pendingConfirmation?.confirmLabel == "Clear Index")
+
+        vm.pendingConfirmation = .unloadAllModels
+        #expect(vm.pendingConfirmation?.id == "unloadAllModels")
+        #expect(vm.pendingConfirmation?.title == "Unload All Resident Models?")
+        #expect(vm.pendingConfirmation?.confirmLabel == "Unload All Models")
     }
 }

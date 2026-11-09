@@ -19,101 +19,12 @@ struct ChatWorkbenchSurface: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Top Control Bar (no truncated preset buttons)
-            HStack(spacing: 10) {
-                Menu {
-                    Section("Sampler Presets") {
-                        ForEach(viewModel.presets) { preset in
-                            Button {
-                                viewModel.applyPreset(preset)
-                            } label: {
-                                Label(
-                                    preset.name,
-                                    systemImage: viewModel.selectedPresetName == preset.name ? "checkmark" : "circle"
-                                )
-                                .labelStyle(.titleAndIcon)
-                            }
-                        }
-                    }
-                    Divider()
-                    Button("Customize Samplers…") {
-                        viewModel.showInspector = true
-                    }
-                    Button("Reset Overrides") {
-                        viewModel.resetSamplerOverrides()
-                    }
-                    .disabled(viewModel.userOverriddenSamplerKeys.isEmpty)
-                } label: {
-                    Label(viewModel.selectedPresetName, systemImage: "dial.medium")
-                }
-                .controlSize(.small)
-                .fixedSize()
-
-                Divider().frame(height: 16)
-
-                Toggle(isOn: $viewModel.thinkingEnabled) {
-                    Label("Thinking", systemImage: "brain")
-                }
-                .toggleStyle(.button)
-                .controlSize(.small)
-                .disabled(viewModel.activeModelDescription?.supportsThinking.value == false)
-                .onChange(of: viewModel.thinkingEnabled) { _, _ in
-                    viewModel.userOverriddenSamplerKeys.insert("thinking")
-                }
-
-                if let controls = viewModel.activeModelDescription?.thinkingControls,
-                   !controls.depthValues.isEmpty {
-                    Picker("Depth", selection: $viewModel.thinkingDepth) {
-                        ForEach(controls.depthValues, id: \.self) { level in
-                            Text(level).tag(level)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .controlSize(.small)
-                    .frame(maxWidth: 200)
-                    .onChange(of: viewModel.thinkingDepth) { _, _ in
-                        viewModel.userOverriddenSamplerKeys.insert("thinking_depth")
-                    }
-                }
-
-                Spacer()
-
-                Toggle(isOn: $viewModel.showPromptPreview) {
-                    Label("Prompt Preview", systemImage: "curlybraces")
-                }
-                .toggleStyle(.button)
-                .controlSize(.small)
-                .keyboardShortcut("p", modifiers: [.command, .shift])
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.bar)
+            ChatTopControlBar(viewModel: viewModel)
 
             Divider()
 
             if viewModel.showPromptPreview {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text("Live Rendered Template Preview")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        if let tmplSource = viewModel.activeModelDescription?.templateSource.value {
-                            Text(tmplSource)
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    ScrollView {
-                        Text(viewModel.renderedPromptPreview())
-                            .font(.system(.caption, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                    }
-                    .frame(maxHeight: 140)
-                }
-                .padding(12)
-                .background(Color.secondary.opacity(0.08))
+                ChatPromptPreviewDrawer(viewModel: viewModel)
                 Divider()
             }
 
@@ -161,156 +72,10 @@ struct ChatWorkbenchSurface: View {
 
             Divider()
 
-            // Prompt Composer Bar
-            VStack(alignment: .leading, spacing: 8) {
-                if let warning = viewModel.chatAttachmentCapabilityWarning {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                        Text(warning)
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
-                }
-
-                if !viewModel.draftAttachments.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(viewModel.draftAttachments) { att in
-                                HStack(spacing: 6) {
-                                    Image(systemName: att.kind == "audio" ? "waveform" : "photo")
-                                        .font(.caption)
-                                        .foregroundStyle(.tint)
-                                    Text(att.filename ?? att.mediaType)
-                                        .font(.caption.weight(.medium))
-                                        .lineLimit(1)
-                                    Text(att.mediaType)
-                                        .font(.caption2.monospaced())
-                                        .foregroundStyle(.secondary)
-                                    Text("~\(att.estimatedTokens) tok")
-                                        .font(.caption2.monospaced().weight(.semibold))
-                                        .foregroundStyle(.secondary)
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 2)
-                                        .background(Color.secondary.opacity(0.12), in: Capsule())
-                                    Button {
-                                        viewModel.removeChatAttachment(id: att.id)
-                                    } label: {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Color.accentColor.opacity(0.12), in: Capsule())
-                            }
-                        }
-                    }
-                }
-
-                if viewModel.isRecordingVoice {
-                    HStack(spacing: 6) {
-                        Image(systemName: "waveform.badge.mic")
-                            .foregroundStyle(.red)
-                        Text("Recording 16 kHz mono WAV for ANE transcription — click Stop Mic to send")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.red)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.red.opacity(0.1), in: Capsule())
-                } else if let voiceMeta = viewModel.lastVoiceTranscription {
-                    HStack(spacing: 6) {
-                        Image(systemName: "waveform.circle.fill")
-                            .foregroundStyle(.green)
-                        Text(String(format: "ANE Voice (%@): %.1fs, %d mel frames", voiceMeta.computePlacement.label, voiceMeta.durationSeconds, voiceMeta.melFrames))
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button {
-                            viewModel.lastVoiceTranscription = nil
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(Color.green.opacity(0.1), in: Capsule())
-                }
-
-                GlassEffectContainer(spacing: 10) {
-                    HStack(alignment: .bottom, spacing: 10) {
-                        #if os(macOS)
-                        Button {
-                            pickChatAttachments()
-                        } label: {
-                            Image(systemName: "paperclip")
-                                .font(.system(size: 14, weight: .semibold))
-                        }
-                        .buttonStyle(.glass)
-                        .help("Attach image or audio files")
-                        #endif
-
-                        Button {
-                            Task { await viewModel.toggleVoiceRecording() }
-                        } label: {
-                            Image(systemName: viewModel.isRecordingVoice ? "stop.circle.fill" : "mic.fill")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(viewModel.isRecordingVoice ? .red : .primary)
-                        }
-                        .buttonStyle(.glass)
-                        .disabled(viewModel.isGenerating)
-                        .help(viewModel.isRecordingVoice ? "Stop recording & transcribe on ANE" : "Record voice turn (16 kHz ANE transcription)")
-
-                        TextField("Ask anything or drop images/audio (⌘↩ to send)…", text: $viewModel.draftPrompt, axis: .vertical)
-                            .lineLimit(1...6)
-                            .textFieldStyle(.roundedBorder)
-                            .focused($isPromptFocused)
-                            .defaultFocus($isPromptFocused, true)
-                            .onSubmit {
-                                Task { await viewModel.sendChatPrompt() }
-                            }
-
-                        if viewModel.isGenerating {
-                            Button("Stop", role: .destructive) {
-                                Task { await viewModel.cancelGeneration() }
-                            }
-                            .buttonStyle(.glassProminent)
-                            .keyboardShortcut(.escape, modifiers: [])
-                            .help("Cancel generation (Esc)")
-                        } else {
-                            Button("Send") {
-                                Task { await viewModel.sendChatPrompt() }
-                            }
-                            .buttonStyle(.glassProminent)
-                            .keyboardShortcut(.return, modifiers: [.command])
-                            .disabled(
-                                viewModel.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                    && viewModel.draftAttachments.isEmpty
-                            )
-                            .help("Send message (⌘↩)")
-                        }
-                    }
-                }
-            }
-            .padding(12)
-            .glassEffect(.regular, in: .rect(cornerRadius: 16))
-            .padding(.horizontal, 12)
-            .padding(.bottom, 10)
-            .padding(.top, 6)
-            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                handleDroppedChatFiles(providers)
-            }
+            ChatComposerBar(
+                viewModel: viewModel,
+                isPromptFocused: $isPromptFocused
+            )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
@@ -319,6 +84,258 @@ struct ChatWorkbenchSurface: View {
         .onChange(of: viewModel.selectedConversationID) { _, _ in
             isPromptFocused = true
         }
+    }
+}
+
+private struct ChatTopControlBar: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Menu {
+                Section("Sampler Presets") {
+                    ForEach(viewModel.presets) { preset in
+                        Button {
+                            viewModel.applyPreset(preset)
+                        } label: {
+                            Label(
+                                preset.name,
+                                systemImage: viewModel.selectedPresetName == preset.name ? "checkmark" : "circle"
+                            )
+                            .labelStyle(.titleAndIcon)
+                        }
+                    }
+                }
+                Divider()
+                Button("Customize Samplers…") {
+                    viewModel.showInspector = true
+                }
+                Button("Reset Overrides") {
+                    viewModel.resetSamplerOverrides()
+                }
+                .disabled(viewModel.userOverriddenSamplerKeys.isEmpty)
+            } label: {
+                Label(viewModel.selectedPresetName, systemImage: "dial.medium")
+            }
+            .controlSize(.small)
+            .fixedSize()
+
+            Divider().frame(height: 16)
+
+            Toggle(isOn: $viewModel.thinkingEnabled) {
+                Label("Thinking", systemImage: "brain")
+            }
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .disabled(viewModel.activeModelDescription?.supportsThinking.value == false)
+            .onChange(of: viewModel.thinkingEnabled) { _, _ in
+                viewModel.userOverriddenSamplerKeys.insert("thinking")
+            }
+
+            if let controls = viewModel.activeModelDescription?.thinkingControls,
+               !controls.depthValues.isEmpty {
+                Picker("Depth", selection: $viewModel.thinkingDepth) {
+                    ForEach(controls.depthValues, id: \.self) { level in
+                        Text(level).tag(level)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .controlSize(.small)
+                .frame(maxWidth: 200)
+                .onChange(of: viewModel.thinkingDepth) { _, _ in
+                    viewModel.userOverriddenSamplerKeys.insert("thinking_depth")
+                }
+            }
+
+            Spacer()
+
+            Toggle(isOn: $viewModel.showPromptPreview) {
+                Label("Prompt Preview", systemImage: "curlybraces")
+            }
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .keyboardShortcut("p", modifiers: [.command, .shift])
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+}
+
+private struct ChatPromptPreviewDrawer: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Live Rendered Template Preview")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let tmplSource = viewModel.activeModelDescription?.templateSource.value {
+                    Text(tmplSource)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ScrollView {
+                Text(viewModel.renderedPromptPreview())
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .frame(maxHeight: 140)
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.08))
+    }
+}
+
+private struct ChatComposerBar: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    var isPromptFocused: FocusState<Bool>.Binding
+    @State private var showAttachmentImporter = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let warning = viewModel.chatAttachmentCapabilityWarning {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(warning)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            if !viewModel.draftAttachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(viewModel.draftAttachments) { att in
+                            ChatAttachmentPillView(attachment: att) {
+                                viewModel.removeChatAttachment(id: att.id)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if viewModel.isRecordingVoice {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform.badge.mic")
+                        .foregroundStyle(.red)
+                    Text("Recording 16 kHz mono WAV for ANE transcription — click Stop Mic to send")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.red)
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.red.opacity(0.1), in: Capsule())
+            } else if let voiceMeta = viewModel.lastVoiceTranscription {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform.circle.fill")
+                        .foregroundStyle(.green)
+                    Text(String(format: "ANE Voice (%@): %.1fs, %d mel frames", voiceMeta.computePlacement.label, voiceMeta.durationSeconds, voiceMeta.melFrames))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        viewModel.lastVoiceTranscription = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 28, minHeight: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Color.green.opacity(0.1), in: Capsule())
+            }
+
+            GlassEffectContainer(spacing: 10) {
+                HStack(alignment: .bottom, spacing: 10) {
+                    Button {
+                        #if os(macOS)
+                        pickChatAttachments()
+                        #else
+                        showAttachmentImporter = true
+                        #endif
+                    } label: {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 14, weight: .semibold))
+                    }
+                    .buttonStyle(.glass)
+                    .help("Attach image or audio files")
+
+                    Button {
+                        Task { await viewModel.toggleVoiceRecording() }
+                    } label: {
+                        Image(systemName: viewModel.isRecordingVoice ? "stop.circle.fill" : "mic.fill")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(viewModel.isRecordingVoice ? .red : .primary)
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(viewModel.isGenerating)
+                    .help(viewModel.isRecordingVoice ? "Stop recording & transcribe on ANE" : "Record voice turn (16 kHz ANE transcription)")
+
+                    TextField("Ask anything or drop images/audio (⌘↩ to send)…", text: $viewModel.draftPrompt, axis: .vertical)
+                        .lineLimit(1...6)
+                        .textFieldStyle(.roundedBorder)
+                        .focused(isPromptFocused)
+                        .defaultFocus(isPromptFocused, true)
+                        .onSubmit {
+                            Task { await viewModel.sendChatPrompt() }
+                        }
+
+                    if viewModel.isGenerating {
+                        Button("Stop", role: .destructive) {
+                            Task { await viewModel.cancelGeneration() }
+                        }
+                        .buttonStyle(.glassProminent)
+                        .keyboardShortcut(.escape, modifiers: [])
+                        .help("Cancel generation (Esc)")
+                    } else {
+                        Button("Send") {
+                            Task { await viewModel.sendChatPrompt() }
+                        }
+                        .buttonStyle(.glassProminent)
+                        .keyboardShortcut(.return, modifiers: [.command])
+                        .disabled(
+                            viewModel.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                && viewModel.draftAttachments.isEmpty
+                        )
+                        .help("Send message (⌘↩)")
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .padding(.horizontal, 12)
+        .padding(.bottom, 10)
+        .padding(.top, 6)
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            handleDroppedChatFiles(providers)
+        }
+        #if !os(macOS)
+        .fileImporter(
+            isPresented: $showAttachmentImporter,
+            allowedContentTypes: [.image, .audio],
+            allowsMultipleSelection: true
+        ) { result in
+            if case .success(let urls) = result {
+                viewModel.attachChatMedia(from: urls)
+            }
+        }
+        #endif
     }
 
     #if os(macOS)
@@ -347,6 +364,44 @@ struct ChatWorkbenchSurface: View {
             }
         }
         return handled
+    }
+}
+
+private struct ChatAttachmentPillView: View {
+    let attachment: MessagesRequest.MediaAttachment
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: attachment.kind == "audio" ? "waveform" : "photo")
+                .font(.caption)
+                .foregroundStyle(.tint)
+            Text(attachment.filename ?? attachment.mediaType)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+            Text(attachment.mediaType)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+            Text("~\(attachment.estimatedTokens) tok")
+                .font(.caption2.monospaced().weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(Color.secondary.opacity(0.12), in: Capsule())
+            Button {
+                onRemove()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 28, minHeight: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 3)
+        .background(Color.accentColor.opacity(0.12), in: Capsule())
     }
 }
 
@@ -473,7 +528,7 @@ struct MessageBubbleView: View {
                 } label: {
                     Image(systemName: "pencil")
                         .font(.caption)
-                        .padding(4)
+                        .frame(minWidth: 28, minHeight: 28)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
