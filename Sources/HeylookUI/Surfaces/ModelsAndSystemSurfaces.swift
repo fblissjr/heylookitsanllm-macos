@@ -16,11 +16,25 @@ struct ModelsInspectorSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
 
     var body: some View {
+        let filteredModels = viewModel.filteredModels
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Text("Registered Models (\(viewModel.registeredModels.count))")
+                Text("Registered Models (\(filteredModels.count))")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
+                if let filter = viewModel.selectedProviderFilter {
+                    Button {
+                        viewModel.selectedProviderFilter = nil
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(filter.displayName)
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .font(.caption2.monospaced())
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
                 Spacer()
                 Button {
                     viewModel.convertingSourceModel = nil
@@ -28,7 +42,7 @@ struct ModelsInspectorSurface: View {
                 } label: {
                     Label("Quantize / Convert MLX…", systemImage: "cube.transparent")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.glass)
                 .controlSize(.small)
 
                 Button {
@@ -36,7 +50,7 @@ struct ModelsInspectorSurface: View {
                 } label: {
                     Label("Re-scan", systemImage: "arrow.clockwise")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.glass)
                 .controlSize(.small)
 
                 Button {
@@ -44,96 +58,46 @@ struct ModelsInspectorSurface: View {
                 } label: {
                     Label("Unload All Models", systemImage: "eject.circle")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.glass)
                 .controlSize(.small)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
+            .background(.bar)
 
             Divider()
 
-            List(viewModel.registeredModels) { model in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(model.isLoaded ? Color.green : Color.secondary.opacity(0.35))
-                            .frame(width: 8, height: 8)
-                        Text(model.modelID)
-                            .font(.headline)
-                        Text(model.provider.displayName)
-                            .font(.caption2.monospaced().weight(.bold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.accentColor.opacity(0.15), in: Capsule())
-                        Text(model.computePlacement.value.label)
-                            .font(.caption2.monospaced())
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.green.opacity(0.15), in: Capsule())
-                        if model.isPinned {
-                            Text("PINNED")
-                                .font(.caption2.monospaced().weight(.bold))
-                                .foregroundStyle(.orange)
-                        }
-                        Spacer()
-
-                        Button(model.isPinned ? "Unpin" : "Pin") {
-                            Task { await viewModel.toggleModelPin(model) }
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        Button(model.isLoaded ? "Unload" : "Load") {
-                            Task { await viewModel.toggleModelLoaded(model) }
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        if model.provider == .mlx {
-                            Button {
-                                viewModel.convertingSourceModel = model
-                                viewModel.showMLXConverterSheet = true
-                            } label: {
-                                Label("Quantize…", systemImage: "cube.transparent")
+            if filteredModels.isEmpty {
+                ContentUnavailableView {
+                    Label("No Models Registered", systemImage: "cpu")
+                } description: {
+                    Text("Configure scan_folders in heylook.toml to discover MLX, CoreAI, or GGUF checkpoints, or load the sample demo workspace.")
+                } actions: {
+                    GlassEffectContainer(spacing: 10) {
+                        HStack(spacing: 10) {
+                            Button("Re-scan heylook.toml") {
+                                Task { await viewModel.rescanConfiguredModels() }
                             }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(.glass)
                             .controlSize(.small)
-                        }
 
-                        Button {
-                            viewModel.editingSidecarModel = model
-                        } label: {
-                            Label("Sidecar", systemImage: "doc.badge.gearshape")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        Button("Select") {
-                            viewModel.selectedModelID = model.modelID
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                    }
-
-                    Text(
-                        "Path: \(model.modelPath) • Arch: \(model.architecture.value) (\(model.architecture.provenance.rawValue)) • Quant: \(model.quantization.value) • Ctx: \(model.contextSize.value) (\(model.contextSize.provenance.rawValue)) • Reasoning: \(model.reasoningFormat.value) • Template: \(model.templateSource.value)"
-                    )
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-
-                    HStack(spacing: 8) {
-                        ForEach(model.tags, id: \.self) { tag in
-                            Text(tag)
-                                .font(.caption2.monospaced())
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.12), in: Capsule())
+                            Button("Load Sample Demo Workspace") {
+                                Task { await viewModel.loadSampleDemoWorkspace() }
+                            }
+                            .buttonStyle(.glassProminent)
+                            .controlSize(.small)
                         }
                     }
                 }
-                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(filteredModels) { model in
+                    ModelRegistryRowView(model: model, viewModel: viewModel)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .sheet(item: $viewModel.editingSidecarModel) { model in
             ModelSidecarEditorSheet(viewModel: viewModel, model: model)
         }
@@ -143,6 +107,93 @@ struct ModelsInspectorSurface: View {
                 initialModel: viewModel.convertingSourceModel
             )
         }
+    }
+}
+
+private struct ModelRegistryRowView: View {
+    let model: EngineDescription
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(model.isLoaded ? Color.green : Color.secondary.opacity(0.35))
+                    .frame(width: 8, height: 8)
+                Text(model.modelID)
+                    .font(.headline)
+                Text(model.provider.displayName)
+                    .font(.caption2.monospaced().weight(.bold))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.15), in: Capsule())
+                Text(model.computePlacement.value.label)
+                    .font(.caption2.monospaced())
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.green.opacity(0.15), in: Capsule())
+                if model.isPinned {
+                    Text("PINNED")
+                        .font(.caption2.monospaced().weight(.bold))
+                        .foregroundStyle(.orange)
+                }
+                Spacer()
+
+                Button(model.isPinned ? "Unpin" : "Pin") {
+                    Task { await viewModel.toggleModelPin(model) }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button(model.isLoaded ? "Unload" : "Load") {
+                    Task { await viewModel.toggleModelLoaded(model) }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                if model.provider == .mlx {
+                    Button {
+                        viewModel.convertingSourceModel = model
+                        viewModel.showMLXConverterSheet = true
+                    } label: {
+                        Label("Quantize…", systemImage: "cube.transparent")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                Button {
+                    viewModel.editingSidecarModel = model
+                } label: {
+                    Label("Sidecar", systemImage: "doc.badge.gearshape")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button("Select") {
+                    viewModel.selectedModelID = model.modelID
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+
+            Text(
+                "Path: \(model.modelPath) • Arch: \(model.architecture.value) (\(model.architecture.provenance.rawValue)) • Quant: \(model.quantization.value) • Ctx: \(model.contextSize.value) (\(model.contextSize.provenance.rawValue)) • Reasoning: \(model.reasoningFormat.value) • Template: \(model.templateSource.value)"
+            )
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                ForEach(model.tags, id: \.self) { tag in
+                    Text(tag)
+                        .font(.caption2.monospaced())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.12), in: Capsule())
+                }
+            }
+        }
+        .padding(.vertical, 6)
     }
 }
 
@@ -516,10 +567,10 @@ private struct ModelSidecarEditorSheet: View {
                 TextEditor(text: $chatTemplateText)
                     .font(.system(.caption, design: .monospaced))
                     .frame(minHeight: 110, maxHeight: 150)
-                    .overlay(
+                    .overlay {
                         RoundedRectangle(cornerRadius: 6)
                             .strokeBorder(Color.secondary.opacity(0.22), lineWidth: 1)
-                    )
+                    }
             }
 
             HStack {
@@ -589,176 +640,150 @@ struct PerfServerSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                GroupBox("Unified Memory & Dual-Lane Compute Residency (\(viewModel.memorySnapshot.deviceName))") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack(spacing: 24) {
-                            VStack(alignment: .leading) {
-                                Text("Physical Unified RAM")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(String(format: "%.1f GB", viewModel.memorySnapshot.totalPhysicalRAMGB))
-                                    .font(.title3.monospaced().weight(.semibold))
-                            }
-                            VStack(alignment: .leading) {
-                                Text("Metal Max Working Set")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(String(format: "%.1f GB", viewModel.memorySnapshot.metalRecommendedMaxWorkingSetGB))
-                                    .font(.title3.monospaced().weight(.semibold))
-                            }
-                            VStack(alignment: .leading) {
-                                Text("GPU Models / ANE Models")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text("\(viewModel.schedulerMetrics.loadedGPUModels.count) GPU / \(viewModel.schedulerMetrics.loadedANEModels.count) ANE")
-                                    .font(.title3.monospaced().weight(.semibold))
-                            }
-                            Spacer()
-                            Button("Refresh Telemetry") {
-                                Task { await viewModel.refreshMetrics() }
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                    }
-                    .padding(8)
+        Form {
+            Section("Unified Memory & Dual-Lane Compute Residency (\(viewModel.memorySnapshot.deviceName))") {
+                LabeledContent("Physical Unified RAM") {
+                    Text(String(format: "%.1f GB", viewModel.memorySnapshot.totalPhysicalRAMGB))
+                        .font(.subheadline.monospaced().weight(.semibold))
                 }
-
-                GroupBox("Lifecycle Reclamation, Subprocess Registry & GGUF Port Pool") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack(spacing: 24) {
-                            VStack(alignment: .leading) {
-                                Text("Active llama-server Subprocesses")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text("\(viewModel.activeSubprocessCount)")
-                                    .font(.title3.monospaced().weight(.semibold))
-                                    .foregroundStyle(viewModel.activeSubprocessCount > 0 ? .orange : .green)
-                            }
-                            VStack(alignment: .leading) {
-                                Text("Allocated GGUF Loopback Ports")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(
-                                    viewModel.activeGGUFPorts.isEmpty
-                                        ? "None (18080+ free)"
-                                        : viewModel.activeGGUFPorts
-                                            .sorted { $0.value < $1.value }
-                                            .map { "\($0.key)::\($0.value)" }
-                                            .joined(separator: ", ")
-                                )
-                                .font(.caption.monospaced().weight(.medium))
-                                .lineLimit(1)
-                            }
-                            Spacer()
-                            Button("Unload All & Reclaim Memory", role: .destructive) {
-                                Task { await viewModel.unloadAllModels() }
-                            }
-                            .buttonStyle(.borderedProminent)
-                        }
-                        Text("Calls `provider.unload()`, `MLX.Memory.clearCache()`, `ANECoreMLRuntime.unload()`, and `SubprocessLifecycleRegistry.shared.terminateAll()` (`SIGTERM` -> `SIGKILL`).")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(8)
+                LabeledContent("Metal Recommended Max Working Set") {
+                    Text(String(format: "%.1f GB", viewModel.memorySnapshot.metalRecommendedMaxWorkingSetGB))
+                        .font(.subheadline.monospaced().weight(.semibold))
                 }
-
-                GroupBox("Embedded HTTP & SSE Server (/v1/messages, /v1/embeddings, /v1/conversations)") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Circle()
-                                .fill(viewModel.isServerRunning ? Color.green : Color.secondary)
-                                .frame(width: 10, height: 10)
-                            Text(
-                                viewModel.isServerRunning
-                                    ? "Listening on http://127.0.0.1:\(viewModel.serverPort)"
-                                    : "Embedded server stopped"
-                            )
-                            .font(.subheadline.monospaced())
-                            Spacer()
-                            Button(viewModel.isServerRunning ? "Stop Server" : "Start Server") {
-                                Task { await viewModel.toggleServer() }
-                            }
-                            .buttonStyle(.borderedProminent)
+                LabeledContent("Resident GPU / ANE Models") {
+                    HStack(spacing: 10) {
+                        Text("\(viewModel.schedulerMetrics.loadedGPUModels.count) GPU • \(viewModel.schedulerMetrics.loadedANEModels.count) ANE")
+                            .font(.subheadline.monospaced().weight(.semibold))
+                        Button("Refresh Telemetry") {
+                            Task { await viewModel.refreshMetrics() }
                         }
-                        Text("Supports disconnect-resilient background generation (`heylook_saved`) for iOS 27.2+ mobile clients over LAN/Tailscale.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                     }
-                    .padding(8)
-                }
-
-                GroupBox("Bonjour (_heylook._tcp) Auto-Discovery & Remote Mac Studio Connection (iOS 27.2+ / LAN / Tailscale)") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Label(
-                                viewModel.isBrowsingBonjour ? "Scanning LAN for _heylook._tcp peers..." : "Bonjour Auto-Discovery",
-                                systemImage: "antenna.radiowaves.left.and.right"
-                            )
-                            .font(.subheadline.weight(.medium))
-                            Spacer()
-                            Button(viewModel.isBrowsingBonjour ? "Stop Scan" : "Scan Bonjour") {
-                                if viewModel.isBrowsingBonjour {
-                                    viewModel.stopBonjourDiscovery()
-                                } else {
-                                    viewModel.startBonjourDiscovery()
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
-
-                        if !viewModel.discoveredServers.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                ForEach(viewModel.discoveredServers) { peer in
-                                    HStack {
-                                        Image(systemName: "desktopcomputer")
-                                            .foregroundStyle(.tint)
-                                        Text(peer.name)
-                                            .font(.caption.weight(.semibold))
-                                        Text(peer.baseURLString)
-                                            .font(.caption2.monospaced())
-                                            .foregroundStyle(.secondary)
-                                        Spacer()
-                                        Button("Connect") {
-                                            Task { await viewModel.connectToRemoteServer(peer.baseURLString) }
-                                        }
-                                        .buttonStyle(.borderedProminent)
-                                        .controlSize(.mini)
-                                    }
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 5)
-                                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                                }
-                            }
-                        }
-
-                        HStack(spacing: 8) {
-                            TextField("http://mac-studio.local:8000 or Tailscale URL", text: $viewModel.remoteServerURLString)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.caption.monospaced())
-                            Button("Connect Remote") {
-                                Task { await viewModel.connectToRemoteServer(viewModel.remoteServerURLString) }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                        }
-
-                        if let connected = viewModel.connectedRemoteServerURL {
-                            HStack(spacing: 6) {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                                Text("Connected to remote Mac Studio: \(connected)")
-                                    .font(.caption.monospaced())
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    .padding(8)
                 }
             }
-            .padding(16)
+
+            Section {
+                LabeledContent("Active llama-server Subprocesses") {
+                    Text("\(viewModel.activeSubprocessCount)")
+                        .font(.subheadline.monospaced().weight(.semibold))
+                        .foregroundStyle(viewModel.activeSubprocessCount > 0 ? .orange : .green)
+                }
+                LabeledContent("Allocated GGUF Loopback Ports") {
+                    Text(
+                        viewModel.activeGGUFPorts.isEmpty
+                            ? "None (18080+ free)"
+                            : viewModel.activeGGUFPorts
+                                .sorted { $0.value < $1.value }
+                                .map { "\($0.key)::\($0.value)" }
+                                .joined(separator: ", ")
+                    )
+                    .font(.caption.monospaced().weight(.medium))
+                    .lineLimit(1)
+                }
+                LabeledContent("Memory & Subprocess Reclamation") {
+                    Button("Unload All & Reclaim Memory", role: .destructive) {
+                        Task { await viewModel.unloadAllModels() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            } header: {
+                Text("Lifecycle Reclamation, Subprocess Registry & GGUF Port Pool")
+            } footer: {
+                Text("Calls `provider.unload()`, `MLX.Memory.clearCache()`, `ANECoreMLRuntime.unload()`, and `SubprocessLifecycleRegistry.shared.terminateAll()` (`SIGTERM` -> `SIGKILL`).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                LabeledContent("HTTP & SSE Status") {
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(viewModel.isServerRunning ? Color.green : Color.secondary)
+                            .frame(width: 8, height: 8)
+                        Text(
+                            viewModel.isServerRunning
+                                ? "Listening on http://127.0.0.1:\(viewModel.serverPort)"
+                                : "Embedded server stopped"
+                        )
+                        .font(.caption.monospaced())
+                        Button(viewModel.isServerRunning ? "Stop Server" : "Start Server") {
+                            Task { await viewModel.toggleServer() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+            } header: {
+                Text("Embedded HTTP & SSE Server (/v1/messages, /v1/embeddings, /v1/conversations)")
+            } footer: {
+                Text("Supports disconnect-resilient background generation (`heylook_saved`) for iOS 27.2+ mobile clients over LAN/Tailscale.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Bonjour (_heylook._tcp) Auto-Discovery & Remote Mac Studio Connection") {
+                LabeledContent("LAN Discovery") {
+                    HStack(spacing: 8) {
+                        Text(viewModel.isBrowsingBonjour ? "Scanning LAN for _heylook._tcp peers…" : "Idle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button(viewModel.isBrowsingBonjour ? "Stop Scan" : "Scan Bonjour") {
+                            if viewModel.isBrowsingBonjour {
+                                viewModel.stopBonjourDiscovery()
+                            } else {
+                                viewModel.startBonjourDiscovery()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+
+                ForEach(viewModel.discoveredServers) { peer in
+                    LabeledContent {
+                        Button("Connect") {
+                            Task { await viewModel.connectToRemoteServer(peer.baseURLString) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "desktopcomputer")
+                                .foregroundStyle(.tint)
+                            Text(peer.name)
+                                .font(.caption.weight(.semibold))
+                            Text(peer.baseURLString)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    TextField("http://mac-studio.local:8000 or Tailscale URL", text: $viewModel.remoteServerURLString)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption.monospaced())
+                    Button("Connect Remote") {
+                        Task { await viewModel.connectToRemoteServer(viewModel.remoteServerURLString) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+
+                if let connected = viewModel.connectedRemoteServerURL {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text("Connected to remote Mac Studio: \(connected)")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
         }
+        .formStyle(.grouped)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

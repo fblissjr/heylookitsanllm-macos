@@ -21,7 +21,11 @@ public final class HeylookWorkbenchViewModel {
     public var config: HeylookConfig
 
     // Models & Engine State
-    public var registeredModels: [EngineDescription] = []
+    public var registeredModels: [EngineDescription] = [] {
+        didSet { recomputeFilteredModels() }
+    }
+    public private(set) var filteredModels: [EngineDescription] = []
+    public private(set) var modelCountsByProvider: [EngineProviderKind: Int] = [:]
     public var selectedModelID: String = ""
     public var editingSidecarModel: EngineDescription?
     public var showMLXConverterSheet: Bool = false
@@ -50,6 +54,10 @@ public final class HeylookWorkbenchViewModel {
     public var streamingContent: String = ""
     public var showPromptPreview: Bool = false
     public var showLoadPanel: Bool = false
+    public var showInspector: Bool = false
+    public var selectedProviderFilter: EngineProviderKind? = nil {
+        didSet { recomputeFilteredModels() }
+    }
     public var isRecordingVoice: Bool = false
     public var lastVoiceTranscription: CoreAIProvider.ANESpeechTranscriptionResult?
     private var voiceRecorder: AVAudioRecorder?
@@ -421,8 +429,92 @@ public final class HeylookWorkbenchViewModel {
         }
     }
 
+    // MARK: - KeyPath-Bindable Projections (swiftui-specialist / dataflow.md)
+
+    public var boundTemperature: Double {
+        get { temperatureOverride }
+        set {
+            temperatureOverride = newValue
+            userOverriddenSamplerKeys.insert("temperature")
+        }
+    }
+
+    public var boundTopP: Double {
+        get { topPOverride }
+        set {
+            topPOverride = newValue
+            userOverriddenSamplerKeys.insert("top_p")
+        }
+    }
+
+    public var boundTopK: Int {
+        get { topKOverride }
+        set {
+            topKOverride = newValue
+            userOverriddenSamplerKeys.insert("top_k")
+        }
+    }
+
+    public var boundMinP: Double {
+        get { minPOverride }
+        set {
+            minPOverride = newValue
+            userOverriddenSamplerKeys.insert("min_p")
+        }
+    }
+
+    public var boundMaxTokens: Int {
+        get { maxTokensOverride }
+        set {
+            maxTokensOverride = newValue
+            userOverriddenSamplerKeys.insert("max_tokens")
+        }
+    }
+
+    public var boundThinkingBudget: Int {
+        get { thinkingBudgetOverride }
+        set {
+            thinkingBudgetOverride = newValue
+            userOverriddenSamplerKeys.insert("thinking_budget")
+        }
+    }
+
+    public var boundEffectiveQueryTask: EmbeddingTask {
+        get { effectiveQueryTask }
+        set {
+            selectedTaskOverride = newValue
+            Task { await runEmbeddingSearch() }
+        }
+    }
+
+    public var boundComputePreset: ComputePreset {
+        get { modelComputeOptions.preset }
+        set { applyComputePreset(newValue) }
+    }
+
+    public subscript(computeUnitFor component: EmbeddingComponent) -> TowerComputeUnit {
+        get { modelComputeOptions[component] }
+        set {
+            modelComputeOptions[component] = newValue
+            setupEmbeddingCoordinator()
+        }
+    }
+
     public var activeModelDescription: EngineDescription? {
         registeredModels.first(where: { $0.modelID == selectedModelID }) ?? registeredModels.first
+    }
+
+    private func recomputeFilteredModels() {
+        var counts: [EngineProviderKind: Int] = [:]
+        for model in registeredModels {
+            counts[model.provider, default: 0] += 1
+        }
+        modelCountsByProvider = counts
+        if let provider = selectedProviderFilter {
+            filteredModels = registeredModels.filter { $0.provider == provider }
+        } else {
+            filteredModels = registeredModels
+        }
     }
 
     public var currentResolvedSamplers: SamplerCascade.ResolvedSampling {
@@ -720,6 +812,44 @@ public final class HeylookWorkbenchViewModel {
     }
 
     // MARK: - Notebook Operations
+
+    public func createNewNotebook() {
+        do {
+            let model = selectedModelID.isEmpty ? (registeredModels.first?.modelID ?? "") : selectedModelID
+            let nb = NotebookRecord(
+                title: "Untitled Notebook",
+                body: "",
+                modelID: model
+            )
+            try store.upsertNotebook(nb)
+            notebooks = try store.listNotebooks()
+            selectNotebook(nb.id)
+        } catch {
+            statusBanner = "Could not create notebook: \(error.localizedDescription)"
+        }
+    }
+
+    public func selectNotebook(_ id: String) {
+        selectedNotebookID = id
+        if let nb = notebooks.first(where: { $0.id == id }) {
+            notebookTitle = nb.title
+            notebookBody = nb.body
+        }
+    }
+
+    public func deleteNotebook(_ id: String) {
+        try? store.deleteNotebook(id: id)
+        notebooks = (try? store.listNotebooks()) ?? []
+        if selectedNotebookID == id {
+            if let first = notebooks.first {
+                selectNotebook(first.id)
+            } else {
+                selectedNotebookID = nil
+                notebookTitle = "Scratchpad"
+                notebookBody = ""
+            }
+        }
+    }
 
     public func saveNotebook() {
         do {
@@ -1058,6 +1188,9 @@ public final class HeylookWorkbenchViewModel {
             searchHits = results
             selectedHit = results.first
             selectedSpanIndex = 0
+            if !results.isEmpty {
+                showInspector = true
+            }
             embeddingStatusMessage = "Found \(results.count) results (\(selectedDimension)d Matryoshka slice)."
         } catch {
             embeddingStatusMessage = "Search failed: \(error.localizedDescription)"

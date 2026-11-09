@@ -16,7 +16,8 @@ Welcome to the **LLM Knowledge Wiki** for `heylookitsanllm-macos` (`heylook`) â€
 | **4. Multimodal Embeddings, ANE Towers & Matryoshka Store** | [multimodal_embeddings_and_ane.md](./multimodal_embeddings_and_ane.md) | `Sources/HeylookEmbeddings/Domain/Artifact.swift`, `Engine/EmbeddingEngine.swift`, `NativeMLXEmbeddingGemma2.swift`, `ModelComputeOptions.swift`, `Pipeline/ArtifactProcessor.swift`, `Store/VectorStore.swift`, `IndexCoordinator.swift` |
 | **5. HTTP/SSE Wire API, Disconnect Resilience & SQLite WAL** | [wire_api_and_sqlite_store.md](./wire_api_and_sqlite_store.md) | `Sources/HeylookCore/Wire/MessagesWire.swift`, `Store/SQLiteStore.swift`, `Sources/HeylookServer/HeylookHTTPServer.swift` |
 | **6. Model Family Onboarding, Quantization & Export Playbooks** | [model_family_onboarding.md](./model_family_onboarding.md) | `Sources/HeylookCore/Domain/ModelTemplateInfo.swift`, `Sources/HeylookEngines/Providers/MLXSwiftProvider.swift` (`MLXModelConverter`), `scripts/export_coreai.sh`, `scripts/export_ane_coreml.py` |
-| **7. Sharp Edges & Incident Rationales** | [sharp_edges.md](./sharp_edges.md) | Cross-cutting invariants across `HeylookCore`, `HeylookEmbeddings`, `HeylookEngines`, `HeylookServer`, and `HeylookUI` |
+| **7. SwiftUI Architecture & macOS 27.2+ Design System** | [ui_architecture_and_macos27.md](./ui_architecture_and_macos27.md) | `Sources/HeylookUI/`, `Sources/HeylookApp/`, `scripts/build_native.sh` |
+| **8. Sharp Edges & Incident Rationales** | [sharp_edges.md](./sharp_edges.md) | Cross-cutting invariants across `HeylookCore`, `HeylookEmbeddings`, `HeylookEngines`, `HeylookServer`, and `HeylookUI` |
 
 ---
 

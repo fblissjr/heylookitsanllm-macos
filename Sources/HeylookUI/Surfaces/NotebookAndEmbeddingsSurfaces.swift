@@ -17,40 +17,68 @@ import AppKit
 
 struct NotebookSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
+    @FocusState private var isBodyFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            HStack(spacing: 10) {
                 TextField("Notebook Title", text: $viewModel.notebookTitle)
                     .font(.title3.weight(.semibold))
                     .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 340)
+                    .frame(maxWidth: 360)
 
                 Spacer()
 
-                Button("Continue Writing") {
-                    Task { await viewModel.continueNotebookGeneration() }
+                if viewModel.isNotebookGenerating {
+                    ProgressView()
+                        .controlSize(.small)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(viewModel.isNotebookGenerating)
 
-                Button("Save Notebook") {
-                    viewModel.saveNotebook()
-                }
-                .buttonStyle(.bordered)
+                GlassEffectContainer(spacing: 10) {
+                    HStack(spacing: 8) {
+                        Button {
+                            Task { await viewModel.continueNotebookGeneration() }
+                        } label: {
+                            Label("Continue Writing", systemImage: "sparkles")
+                        }
+                        .buttonStyle(.glassProminent)
+                        .disabled(viewModel.isNotebookGenerating)
 
-                Button("Save to Conversations") {
-                    viewModel.saveNotebookToConversations()
+                        Button {
+                            viewModel.saveNotebook()
+                        } label: {
+                            Label("Save", systemImage: "square.and.arrow.down")
+                        }
+                        .buttonStyle(.glass)
+                        .keyboardShortcut("s", modifiers: [.command])
+
+                        Button {
+                            viewModel.saveNotebookToConversations()
+                        } label: {
+                            Label("Send to Chat", systemImage: "bubble.left.and.bubble.right")
+                        }
+                        .buttonStyle(.glass)
+                    }
                 }
-                .buttonStyle(.bordered)
             }
 
             TextEditor(text: $viewModel.notebookBody)
                 .font(.system(.body, design: .monospaced))
+                .focused($isBodyFocused)
+                .defaultFocus($isBodyFocused, true)
                 .padding(8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+                }
         }
         .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            isBodyFocused = true
+        }
     }
 }
 
@@ -58,434 +86,26 @@ struct NotebookSurface: View {
 
 struct EmbeddingsStudioSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
-
-    var body: some View {
-        #if os(macOS)
-        HSplitView {
-            EmbeddingsSidebarView(viewModel: viewModel)
-                .frame(minWidth: 260, idealWidth: 290, maxWidth: 340)
-
-            EmbeddingsSearchAndResultsView(viewModel: viewModel)
-                .frame(minWidth: 420, idealWidth: 560)
-
-            EmbeddingsInspectorView(
-                hit: viewModel.selectedHit,
-                selectedDimension: viewModel.selectedDimension,
-                onSendToCompare: { hit in
-                    viewModel.sendHitToPairwiseCompare(hit)
-                },
-                onPinToLab: { hit in
-                    Task { await viewModel.pinHitToRetrievalLab(hit) }
-                }
-            )
-            .frame(minWidth: 340, idealWidth: 400)
-        }
-        #else
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                EmbeddingsSidebarView(viewModel: viewModel)
-                EmbeddingsSearchAndResultsView(viewModel: viewModel)
-                EmbeddingsInspectorView(
-                    hit: viewModel.selectedHit,
-                    selectedDimension: viewModel.selectedDimension,
-                    onSendToCompare: { hit in
-                        viewModel.sendHitToPairwiseCompare(hit)
-                    },
-                    onPinToLab: { hit in
-                        Task { await viewModel.pinHitToRetrievalLab(hit) }
-                    }
-                )
-            }
-            .padding(12)
-        }
-        #endif
-    }
-}
-
-private struct EmbeddingsSidebarView: View {
-    @Bindable var viewModel: HeylookWorkbenchViewModel
-    @State private var isTargeted = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                Image(systemName: "sparkle.magnifyingglass")
-                    .font(.system(size: 20, weight: .bold))
-                    .foregroundStyle(.tint)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("mbed Studio")
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                    Text("Multimodal ANE / GPU Finder")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(.horizontal, 14)
-            .padding(.top, 12)
-
-            Divider()
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    // Modality Filter
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("MODALITY FILTER")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 14)
-
-                        modalityFilterButton(title: "All Artifacts", icon: "square.grid.2x2", kind: nil, count: viewModel.artifactCount)
-
-                        ForEach(ArtifactKind.allCases) { kind in
-                            modalityFilterButton(
-                                title: kind.displayName,
-                                icon: kind.systemImage,
-                                kind: kind,
-                                count: viewModel.countsByKind[kind] ?? 0
-                            )
-                        }
-                    }
-
-                    Divider()
-
-                    // Engine & Compute Placement
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("ENGINE & COMPUTE PLACEMENT")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-
-                        Picker("Engine", selection: $viewModel.selectedBackend) {
-                            ForEach(EngineBackend.allCases, id: \.self) { engine in
-                                Text(engine.label).tag(engine)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .onChange(of: viewModel.selectedBackend) {
-                            viewModel.setupEmbeddingCoordinator()
-                        }
-
-                        Picker("Dimensions", selection: $viewModel.selectedDimension) {
-                            Text("768d (Full)").tag(768)
-                            Text("512d").tag(512)
-                            Text("256d (Fast)").tag(256)
-                            Text("128d (Compact)").tag(128)
-                        }
-                        .pickerStyle(.menu)
-                        .onChange(of: viewModel.selectedDimension) {
-                            Task { await viewModel.runEmbeddingSearch() }
-                        }
-
-                        Picker(
-                            "Query Task",
-                            selection: Binding(
-                                get: { viewModel.effectiveQueryTask },
-                                set: { newTask in
-                                    viewModel.selectedTaskOverride = newTask
-                                    Task { await viewModel.runEmbeddingSearch() }
-                                }
-                            )
-                        ) {
-                            Text("Retrieval Query (Asymmetric)").tag(EmbeddingTask.query)
-                            Text("Semantic Similarity (Symmetric)").tag(EmbeddingTask.sts)
-                            Text("Code Retrieval").tag(EmbeddingTask.codeRetrieval)
-                            Text("Question Answering").tag(EmbeddingTask.questionAnswering)
-                            Text("Fact Verification").tag(EmbeddingTask.factVerification)
-                        }
-                        .pickerStyle(.menu)
-
-                        Picker("Video Sampling", selection: $viewModel.selectedSampling) {
-                            ForEach(VideoWindowSampling.allCases, id: \.self) { mode in
-                                Text(mode.label).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.menu)
-
-                        Toggle("Include Video Soundtrack", isOn: $viewModel.loadAudioFromVideo)
-                            .font(.caption)
-                            .toggleStyle(.switch)
-                            .controlSize(.small)
-
-                        Divider()
-
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Label("Per-Tower Compute", systemImage: "cpu.fill")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                Text(viewModel.modelComputeOptions.shortSummaryBadge)
-                                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Picker(
-                                "Preset",
-                                selection: Binding(
-                                    get: { viewModel.modelComputeOptions.preset },
-                                    set: { viewModel.applyComputePreset($0) }
-                                )
-                            ) {
-                                ForEach(ComputePreset.allCases, id: \.self) { preset in
-                                    Text(preset.label).tag(preset)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .controlSize(.small)
-
-                            ForEach(EmbeddingComponent.allCases) { component in
-                                HStack(spacing: 6) {
-                                    Image(systemName: component.systemImage)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 14)
-                                    Text(component.title)
-                                        .font(.caption2.weight(.medium))
-                                    Spacer()
-                                    Picker(
-                                        "",
-                                        selection: Binding(
-                                            get: { viewModel.modelComputeOptions[component] },
-                                            set: { newUnit in
-                                                viewModel.modelComputeOptions[component] = newUnit
-                                                viewModel.setupEmbeddingCoordinator()
-                                            }
-                                        )
-                                    ) {
-                                        ForEach(TowerComputeUnit.allCases, id: \.self) { unit in
-                                            Text(unit.label).tag(unit)
-                                        }
-                                    }
-                                    .labelsHidden()
-                                    .pickerStyle(.menu)
-                                    .controlSize(.mini)
-                                    .frame(width: 122)
-                                }
-
-                                if let report = viewModel.aneInspectionReports.first(where: { $0.component == component }) {
-                                    HStack(spacing: 4) {
-                                        Circle()
-                                            .fill(report.isCompiledBundlePresent ? Color.green : Color.orange)
-                                            .frame(width: 6, height: 6)
-                                        Text(
-                                            report.isCompiledBundlePresent
-                                                ? "CoreML Ready (\(Int((report.aneResidencyFraction * 100).rounded()))% ANE ops)"
-                                                : "CoreML missing — run scripts/export_ane_coreml.py"
-                                        )
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                    }
-                                    .padding(.leading, 20)
-                                }
-                            }
-
-                            ComputeMemorySplitBar(split: viewModel.modelComputeOptions.memorySplitMB)
-                                .padding(.top, 4)
-                        }
-
-                        if viewModel.selectedBackend == .heylook {
-                            TextField("Server URL", text: $viewModel.embeddingServerURLString)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.caption)
-                                .onSubmit {
-                                    viewModel.setupEmbeddingCoordinator()
-                                }
-                        } else if viewModel.selectedBackend == .nativeMLX {
-                            TextField("Checkpoint Path", text: $viewModel.checkpointPath)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.caption)
-                                .onSubmit {
-                                    viewModel.setupEmbeddingCoordinator()
-                                }
-                        }
-                    }
-                    .padding(.horizontal, 14)
-
-                    Divider()
-
-                    // Index Actions
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("INDEXING & EVALUATION")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-
-                        #if os(macOS)
-                        Button {
-                            openFilePickerForIndexing()
-                        } label: {
-                            Label("Add Files or Folders…", systemImage: "plus.rectangle.on.folder")
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.regular)
-                        #endif
-
-                        HStack(spacing: 6) {
-                            Button {
-                                viewModel.reindexWatchedFolders()
-                            } label: {
-                                Label("Re-scan", systemImage: "arrow.clockwise")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(viewModel.watchedFolders.isEmpty || viewModel.isIndexing)
-
-                            Button(role: .destructive) {
-                                viewModel.clearEmbeddingIndex()
-                            } label: {
-                                Label("Clear", systemImage: "trash")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(viewModel.artifactCount == 0 || viewModel.isIndexing)
-                        }
-
-                        Button {
-                            viewModel.showEvalLabDrawer.toggle()
-                        } label: {
-                            Label(
-                                viewModel.showEvalLabDrawer ? "Hide Pairwise & Eval Lab" : "Show Pairwise & Eval Lab",
-                                systemImage: "chart.bar.xaxis"
-                            )
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        if !viewModel.watchedFolders.isEmpty {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack {
-                                    Image(systemName: "eye.fill")
-                                        .font(.caption2)
-                                        .foregroundStyle(.green)
-                                    Text("WATCHED FOLDERS (FSEVENTS)")
-                                        .font(.system(size: 10, weight: .semibold))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.top, 4)
-
-                                ForEach(viewModel.watchedFolders) { folder in
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "folder")
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                        Text(folder.url.lastPathComponent)
-                                            .font(.caption2)
-                                            .lineLimit(1)
-                                            .help(folder.path)
-                                        Spacer()
-                                        Button {
-                                            viewModel.removeWatchedFolder(folder)
-                                        } label: {
-                                            Image(systemName: "xmark.circle.fill")
-                                                .font(.caption2)
-                                                .foregroundStyle(.tertiary)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .help("Stop watching \(folder.path)")
-                                    }
-                                }
-                            }
-                        }
-
-                        Text("Drop folders, videos, audio, PDFs, images, or code here to index.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 14)
-                }
-            }
-        }
-        .background(isTargeted ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.04))
-        .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
-            handleDrop(providers: providers)
-        }
-    }
-
-    private func modalityFilterButton(title: String, icon: String, kind: ArtifactKind?, count: Int) -> some View {
-        let isSelected = viewModel.selectedKindFilter == kind
-        return Button {
-            viewModel.selectedKindFilter = kind
-            Task { await viewModel.runEmbeddingSearch() }
-        } label: {
-            HStack {
-                Image(systemName: icon)
-                    .frame(width: 18)
-                    .foregroundStyle(isSelected ? .white : .primary)
-                Text(title)
-                    .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
-                    .foregroundStyle(isSelected ? .white : .primary)
-                Spacer()
-                Text("\(count)")
-                    .font(.caption2.monospacedDigit())
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        Capsule()
-                            .fill(isSelected ? Color.white.opacity(0.25) : Color.secondary.opacity(0.15))
-                    )
-                    .foregroundStyle(isSelected ? .white : .secondary)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 7)
-                    .fill(isSelected ? Color.accentColor : Color.clear)
-            )
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 8)
-    }
-
-    #if os(macOS)
-    private func openFilePickerForIndexing() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = true
-        panel.prompt = "Index"
-        if panel.runModal() == .OK {
-            viewModel.startIndexing(panel.urls)
-        }
-    }
-    #endif
-
-    private func handleDrop(providers: [NSItemProvider]) -> Bool {
-        for provider in providers {
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                guard let url else { return }
-                Task { @MainActor in
-                    viewModel.startIndexing([url])
-                }
-            }
-        }
-        return true
-    }
-}
-
-private struct EmbeddingsSearchAndResultsView: View {
-    @Bindable var viewModel: HeylookWorkbenchViewModel
+    @FocusState private var isSearchFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
-            // Search Bar + Query Attachment
-            VStack(alignment: .leading, spacing: 8) {
+            // Search Bar + Query Attachment + Scoring Pipeline Banner
+            VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 10) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
-                        .font(.system(size: 15, weight: .medium))
+                        .font(.system(size: 15, weight: .semibold))
 
                     TextField("Search across text, code, PDFs, images, audio & video…", text: $viewModel.embeddingQuery)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 15))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 14))
+                        .focused($isSearchFocused)
+                        .defaultFocus($isSearchFocused, true)
                         .onSubmit {
                             Task { await viewModel.runEmbeddingSearch() }
                         }
-                        .onChange(of: viewModel.embeddingQuery) {
+                        .onChange(of: viewModel.embeddingQuery) { _, _ in
                             Task { await viewModel.runEmbeddingSearch() }
                         }
 
@@ -493,12 +113,18 @@ private struct EmbeddingsSearchAndResultsView: View {
                     Button {
                         pickQueryAttachment()
                     } label: {
-                        Image(systemName: "paperclip")
-                            .foregroundStyle(viewModel.queryAttachmentURL != nil ? Color.accentColor : Color.secondary)
+                        Label("Attach Media", systemImage: "paperclip")
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
                     .help("Attach an image or audio clip for multimodal query search")
                     #endif
+
+                    Button("Search") {
+                        Task { await viewModel.runEmbeddingSearch() }
+                    }
+                    .buttonStyle(.glassProminent)
+                    .controlSize(.small)
 
                     if !viewModel.embeddingQuery.isEmpty || viewModel.queryAttachmentURL != nil {
                         Button {
@@ -510,6 +136,7 @@ private struct EmbeddingsSearchAndResultsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help("Clear search query")
                     }
                 }
 
@@ -542,37 +169,56 @@ private struct EmbeddingsSearchAndResultsView: View {
                     task: viewModel.effectiveQueryTask,
                     hasQueryMedia: viewModel.queryAttachmentURL != nil,
                     includeSoundtrack: viewModel.loadAudioFromVideo,
-                    videoSampling: viewModel.selectedSampling
+                    videoSampling: viewModel.selectedSampling,
+                    towersLabel: viewModel.activeQueryTowersLabel
                 )
             }
             .padding(14)
+            .background(.bar)
 
             Divider()
 
             // Status / Progress Bar
-            HStack {
+            HStack(spacing: 10) {
                 if viewModel.isIndexing || viewModel.isEmbeddingBusy {
                     ProgressView()
                         .controlSize(.small)
-                        .scaleEffect(0.75)
                 }
                 Text(viewModel.embeddingStatusMessage)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+
                 Spacer()
+
                 if viewModel.isIndexing {
-                    Button {
+                    Button(role: .destructive) {
                         viewModel.cancelIndexing()
                     } label: {
-                        Label("Stop", systemImage: "stop.circle.fill")
+                        Label("Stop Indexing", systemImage: "stop.circle.fill")
                             .font(.caption.weight(.semibold))
-                            .foregroundStyle(.red)
                     }
-                    .buttonStyle(.plain)
-                    .help("Cancel current indexing job")
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
                 }
-                Text("\(viewModel.searchHits.count) results")
+
+                #if os(macOS)
+                Button {
+                    openFilePickerForIndexing()
+                } label: {
+                    Label("Add Files/Folders…", systemImage: "plus.rectangle.on.folder")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                #endif
+
+                Toggle(isOn: $viewModel.showEvalLabDrawer) {
+                    Label("Eval Lab", systemImage: "chart.bar.xaxis")
+                }
+                .toggleStyle(.button)
+                .controlSize(.mini)
+
+                Text("\(viewModel.searchHits.count) results • \(viewModel.artifactCount) indexed")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -582,14 +228,36 @@ private struct EmbeddingsSearchAndResultsView: View {
 
             Divider()
 
-            // Results List
+            // Results List or Empty State
             if viewModel.searchHits.isEmpty {
-                ContentUnavailableView(
-                    "No Matching Artifacts",
-                    systemImage: "doc.text.magnifyingglass",
-                    description: Text("Try another query, attach an image/audio clip, or drop folders onto the sidebar to index.")
-                )
-                .frame(maxHeight: .infinity)
+                ContentUnavailableView {
+                    Label("No Matching Artifacts", systemImage: "doc.text.magnifyingglass")
+                } description: {
+                    Text("Type a search query above, attach an image or audio clip, or index local folders from the sidebar.")
+                } actions: {
+                    GlassEffectContainer(spacing: 10) {
+                        HStack(spacing: 10) {
+                            #if os(macOS)
+                            Button {
+                                openFilePickerForIndexing()
+                            } label: {
+                                Label("Add Files or Folders…", systemImage: "plus.rectangle.on.folder")
+                            }
+                            .buttonStyle(.glassProminent)
+                            .controlSize(.small)
+                            #endif
+
+                            Button {
+                                Task { await viewModel.seedSampleCorpusIfNeeded() }
+                            } label: {
+                                Label("Load Sample Demo Corpus", systemImage: "sparkles")
+                            }
+                            .buttonStyle(.glass)
+                            .controlSize(.small)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(selection: $viewModel.selectedHit) {
                     ForEach(viewModel.searchHits) { hit in
@@ -598,8 +266,15 @@ private struct EmbeddingsSearchAndResultsView: View {
                     }
                 }
                 .listStyle(.inset)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onChange(of: viewModel.selectedHit) { _, newHit in
+                    if newHit != nil {
+                        viewModel.showInspector = true
+                    }
+                }
             }
 
+            // Optional Pairwise & Retrieval Lab Bottom Drawer
             if viewModel.showEvalLabDrawer {
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
@@ -611,7 +286,7 @@ private struct EmbeddingsSearchAndResultsView: View {
                             Task { await viewModel.runFullEvalLabSuite() }
                         } label: {
                             Label(
-                                viewModel.isRunningEvalLab ? "Running Probes..." : "Run Eval Suite (chain + VLM + MRL)",
+                                viewModel.isRunningEvalLab ? "Running Probes…" : "Run Eval Suite (chain + VLM + MRL)",
                                 systemImage: "checkmark.shield"
                             )
                         }
@@ -619,7 +294,7 @@ private struct EmbeddingsSearchAndResultsView: View {
                         .controlSize(.mini)
                         .disabled(viewModel.isRunningEvalLab)
 
-                        ForEach(viewModel.labMetrics, id: \.dimensions) { metric in
+                        ForEach(viewModel.labMetrics) { metric in
                             Text(String(format: "%dd R@1: %.0f%% (MRR %.2f)", metric.dimensions, metric.recallAt1 * 100, metric.mrr))
                                 .font(.caption2.monospaced())
                                 .padding(.horizontal, 6)
@@ -631,7 +306,7 @@ private struct EmbeddingsSearchAndResultsView: View {
                     if let suite = viewModel.evalLabSuiteReport {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 8) {
-                                ForEach(suite.probes, id: \.name) { probe in
+                                ForEach(suite.probes) { probe in
                                     HStack(spacing: 4) {
                                         Image(systemName: probe.passed ? "checkmark.circle.fill" : "xmark.octagon.fill")
                                             .foregroundStyle(probe.passed ? .green : .red)
@@ -684,6 +359,10 @@ private struct EmbeddingsSearchAndResultsView: View {
                 .background(Color.secondary.opacity(0.04))
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            isSearchFocused = true
+        }
     }
 
     #if os(macOS)
@@ -692,10 +371,237 @@ private struct EmbeddingsSearchAndResultsView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.image, .audiovisualContent, .audio]
         panel.prompt = "Attach Query Media"
         if panel.runModal() == .OK, let url = panel.url {
             viewModel.queryAttachmentURL = url
             Task { await viewModel.runEmbeddingSearch() }
+        }
+    }
+
+    private func openFilePickerForIndexing() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Index"
+        if panel.runModal() == .OK {
+            viewModel.startIndexing(panel.urls)
+        }
+    }
+    #endif
+}
+
+// MARK: - Embeddings Contextual Sidebar Sections (Rendered in Unified Sidebar List)
+
+struct EmbeddingsSidebarSections: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+
+    var body: some View {
+        Section("Modality Filter") {
+            modalityRow(title: "All Artifacts", icon: "square.grid.2x2", kind: nil, count: viewModel.artifactCount)
+            ForEach(ArtifactKind.allCases) { kind in
+                modalityRow(
+                    title: kind.displayName,
+                    icon: kind.systemImage,
+                    kind: kind,
+                    count: viewModel.countsByKind[kind] ?? 0
+                )
+            }
+        }
+
+        Section("Index & Watched Folders") {
+            #if os(macOS)
+            Button {
+                openFilePickerForIndexing()
+            } label: {
+                Label("Add Files or Folders…", systemImage: "plus.rectangle.on.folder")
+                    .fontWeight(.medium)
+                    .foregroundStyle(Color.accentColor)
+            }
+            .buttonStyle(.plain)
+            #endif
+
+            if !viewModel.watchedFolders.isEmpty {
+                Button {
+                    viewModel.reindexWatchedFolders()
+                } label: {
+                    Label("Re-scan Watched Folders", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.isIndexing)
+            }
+
+            Button(role: .destructive) {
+                viewModel.clearEmbeddingIndex()
+            } label: {
+                Label("Clear Index", systemImage: "trash")
+            }
+            .buttonStyle(.plain)
+            .disabled(viewModel.artifactCount == 0 || viewModel.isIndexing)
+
+            ForEach(viewModel.watchedFolders) { folder in
+                HStack(spacing: 6) {
+                    Image(systemName: "folder.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(folder.url.lastPathComponent)
+                            .font(.caption)
+                            .lineLimit(1)
+                        Text(folder.path)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button {
+                        viewModel.removeWatchedFolder(folder)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Stop watching \(folder.path)")
+                }
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        viewModel.removeWatchedFolder(folder)
+                    } label: {
+                        Label("Remove", systemImage: "trash")
+                    }
+                }
+            }
+        }
+
+        Section("MLX EmbeddingGemma 2") {
+            Picker("Engine", selection: $viewModel.selectedBackend) {
+                ForEach(EngineBackend.allCases, id: \.self) { engine in
+                    Text(engine.label).tag(engine)
+                }
+            }
+            .onChange(of: viewModel.selectedBackend) { _, _ in
+                viewModel.setupEmbeddingCoordinator()
+            }
+
+            Picker("Matryoshka Dim", selection: $viewModel.selectedDimension) {
+                Text("768d (Full)").tag(768)
+                Text("512d").tag(512)
+                Text("256d (Fast)").tag(256)
+                Text("128d (Compact)").tag(128)
+            }
+            .onChange(of: viewModel.selectedDimension) { _, _ in
+                Task { await viewModel.runEmbeddingSearch() }
+            }
+
+            Picker("Query Task", selection: $viewModel.boundEffectiveQueryTask) {
+                Text("Retrieval Query").tag(EmbeddingTask.query)
+                Text("Semantic Similarity").tag(EmbeddingTask.sts)
+                Text("Code Retrieval").tag(EmbeddingTask.codeRetrieval)
+                Text("Question Answering").tag(EmbeddingTask.questionAnswering)
+                Text("Fact Verification").tag(EmbeddingTask.factVerification)
+            }
+
+            Picker("Video Sampling", selection: $viewModel.selectedSampling) {
+                ForEach(VideoWindowSampling.allCases, id: \.self) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+
+            Toggle("Include Video Soundtrack", isOn: $viewModel.loadAudioFromVideo)
+
+            if viewModel.selectedBackend == .heylook {
+                TextField("Server URL", text: $viewModel.embeddingServerURLString)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .onSubmit {
+                        viewModel.setupEmbeddingCoordinator()
+                    }
+            } else {
+                TextField("Checkpoint Path", text: $viewModel.checkpointPath)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .onSubmit {
+                        viewModel.setupEmbeddingCoordinator()
+                    }
+            }
+        }
+
+        Section("Compute Placement (ANE / GPU)") {
+            Picker("Preset", selection: $viewModel.boundComputePreset) {
+                ForEach(ComputePreset.allCases, id: \.self) { preset in
+                    Text(preset.label).tag(preset)
+                }
+            }
+
+            ForEach(EmbeddingComponent.allCases) { component in
+                VStack(alignment: .leading, spacing: 3) {
+                    Picker(
+                        component.title,
+                        selection: $viewModel[computeUnitFor: component]
+                    ) {
+                        ForEach(TowerComputeUnit.allCases, id: \.self) { unit in
+                            Text(unit.shortBadge).tag(unit)
+                        }
+                    }
+
+                    if let report = viewModel.aneInspectionReports.first(where: { $0.component == component }) {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(report.isCompiledBundlePresent ? Color.green : Color.orange)
+                                .frame(width: 6, height: 6)
+                            Text(
+                                report.isCompiledBundlePresent
+                                    ? "CoreML Ready (\(Int((report.aneResidencyFraction * 100).rounded()))% ANE ops)"
+                                    : "MLX GPU fallback (no .mlmodelc)"
+                            )
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+
+            ComputeMemorySplitBar(split: viewModel.modelComputeOptions.memorySplitMB)
+                .padding(.vertical, 4)
+        }
+    }
+
+    private func modalityRow(title: String, icon: String, kind: ArtifactKind?, count: Int) -> some View {
+        let isSelected = viewModel.selectedKindFilter == kind
+        return Button {
+            viewModel.selectedKindFilter = kind
+            Task { await viewModel.runEmbeddingSearch() }
+        } label: {
+            HStack {
+                Label(title, systemImage: icon)
+                    .fontWeight(isSelected ? .semibold : .regular)
+                Spacer()
+                Text("\(count)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
+        )
+    }
+
+    #if os(macOS)
+    private func openFilePickerForIndexing() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Index"
+        if panel.runModal() == .OK {
+            viewModel.startIndexing(panel.urls)
         }
     }
     #endif
@@ -707,43 +613,46 @@ private struct ScoringPipelineBanner: View {
     let hasQueryMedia: Bool
     let includeSoundtrack: Bool
     let videoSampling: VideoWindowSampling
+    let towersLabel: String
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                FeaturePill(
-                    icon: "cpu",
-                    label: "Gemma-2 2B Multimodal",
-                    tint: .purple
-                )
-                FeaturePill(
-                    icon: "ruler",
-                    label: "Matryoshka \(dimension)d L2 Cosine",
-                    tint: .blue
-                )
-                FeaturePill(
-                    icon: "arrow.triangle.branch",
-                    label: task == .query ? "Asymmetric Query→Doc" : "Symmetric Similarity",
-                    tint: .indigo
-                )
-                FeaturePill(
-                    icon: "film.stack",
-                    label: "Video: \(videoSampling.label)",
-                    tint: .orange
-                )
-                if includeSoundtrack {
+            GlassEffectContainer(spacing: 8) {
+                HStack(spacing: 6) {
                     FeaturePill(
-                        icon: "waveform.and.magnifyingglass",
-                        label: "Dual Video+Soundtrack Spans",
-                        tint: .pink
+                        icon: "cpu",
+                        label: towersLabel,
+                        tint: .purple
                     )
-                }
-                if hasQueryMedia {
                     FeaturePill(
-                        icon: "photo.on.rectangle.angled",
-                        label: "Cross-Modal Media Query",
-                        tint: .green
+                        icon: "ruler",
+                        label: "Matryoshka \(dimension)d L2 Cosine",
+                        tint: .blue
                     )
+                    FeaturePill(
+                        icon: "arrow.triangle.branch",
+                        label: task == .query ? "Asymmetric Query→Doc" : "Symmetric Similarity",
+                        tint: .indigo
+                    )
+                    FeaturePill(
+                        icon: "film.stack",
+                        label: "Video: \(videoSampling.label)",
+                        tint: .orange
+                    )
+                    if includeSoundtrack {
+                        FeaturePill(
+                            icon: "waveform.and.magnifyingglass",
+                            label: "Dual Video+Soundtrack Spans",
+                            tint: .pink
+                        )
+                    }
+                    if hasQueryMedia {
+                        FeaturePill(
+                            icon: "photo.on.rectangle.angled",
+                            label: "Cross-Modal Media Query",
+                            tint: .green
+                        )
+                    }
                 }
             }
         }
@@ -935,9 +844,12 @@ private struct ThumbnailBadge: View {
     }
 }
 
-private struct EmbeddingsInspectorView: View {
+// MARK: - Embeddings Artifact & Matryoshka Inspector (Rendered in Native .inspector)
+
+struct EmbeddingsInspectorView: View {
     let hit: SearchHit?
     let selectedDimension: Int
+    var onSelectDimension: ((Int) -> Void)? = nil
     var onSendToCompare: ((SearchHit) -> Void)? = nil
     var onPinToLab: ((SearchHit) -> Void)? = nil
     @State private var player: AVPlayer?
@@ -991,7 +903,7 @@ private struct EmbeddingsInspectorView: View {
                                 Button {
                                     onPinToLab(hit)
                                 } label: {
-                                    Label("Pin to Retrieval Lab", systemImage: "chart.bar.doc.horizontal")
+                                    Label("Pin to Lab", systemImage: "chart.bar.doc.horizontal")
                                 }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
@@ -1007,7 +919,8 @@ private struct EmbeddingsInspectorView: View {
                         ScoredFeatureBreakdownCard(
                             artifact: hit.artifact,
                             spanMatch: match,
-                            selectedDimension: selectedDimension
+                            selectedDimension: selectedDimension,
+                            onSelectDimension: onSelectDimension
                         )
                     }
 
@@ -1071,7 +984,7 @@ private struct EmbeddingsInspectorView: View {
                         .onAppear {
                             seekAndPlay(url: hit.artifact.url, startTime: activeSpan?.startTimeSeconds)
                         }
-                        .onChange(of: hit.artifact.id) {
+                        .onChange(of: hit.artifact.id) { _, _ in
                             selectedChunkID = nil
                             seekAndPlay(url: hit.artifact.url, startTime: hit.bestSpan.startTimeSeconds)
                         }
@@ -1200,8 +1113,9 @@ private struct EmbeddingsInspectorView: View {
             ContentUnavailableView(
                 "Select an Artifact",
                 systemImage: "sidebar.right",
-                description: Text("Inspect multimodal previews, Matryoshka cosine attribution, and jump directly to matching timestamps or pages.")
+                description: Text("Select a search result to inspect multimodal previews, Matryoshka cosine attribution, and matching timestamps or pages.")
             )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -1226,6 +1140,7 @@ private struct ScoredFeatureBreakdownCard: View {
     let artifact: Artifact
     let spanMatch: SearchHit.SpanMatch
     let selectedDimension: Int
+    var onSelectDimension: ((Int) -> Void)? = nil
 
     var body: some View {
         let feature = spanMatch.scoredFeature(for: artifact)
@@ -1253,33 +1168,39 @@ private struct ScoredFeatureBreakdownCard: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Matryoshka Cosine Across Subspaces (L2 Re-Normalized)")
+                Text("Matryoshka Cosine Across Subspaces (Click to Switch)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
                 ForEach([128, 256, 512, 768], id: \.self) { dim in
                     if let dimScore = spanMatch.scoresByDimension[dim] {
-                        HStack(spacing: 8) {
-                            Text("\(dim)d")
-                                .font(.system(size: 10, weight: dim == selectedDimension ? .bold : .regular, design: .monospaced))
-                                .frame(width: 34, alignment: .leading)
-                                .foregroundStyle(dim == selectedDimension ? Color.accentColor : .secondary)
+                        Button {
+                            onSelectDimension?(dim)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Text("\(dim)d")
+                                    .font(.system(size: 10, weight: dim == selectedDimension ? .bold : .regular, design: .monospaced))
+                                    .frame(width: 34, alignment: .leading)
+                                    .foregroundStyle(dim == selectedDimension ? Color.accentColor : .secondary)
 
-                            GeometryReader { geo in
-                                ZStack(alignment: .leading) {
-                                    Capsule()
-                                        .fill(Color.secondary.opacity(0.15))
-                                    Capsule()
-                                        .fill(dim == selectedDimension ? Color.accentColor : Color.blue.opacity(0.6))
-                                        .frame(width: max(4, geo.size.width * CGFloat(max(0, min(1, dimScore)))))
+                                GeometryReader { geo in
+                                    ZStack(alignment: .leading) {
+                                        Capsule()
+                                            .fill(Color.secondary.opacity(0.15))
+                                        Capsule()
+                                            .fill(dim == selectedDimension ? Color.accentColor : Color.blue.opacity(0.6))
+                                            .frame(width: max(4, geo.size.width * CGFloat(max(0, min(1, dimScore)))))
+                                    }
                                 }
-                            }
-                            .frame(height: 6)
+                                .frame(height: 6)
 
-                            Text(String(format: "%.3f", dimScore))
-                                .font(.system(size: 10, weight: dim == selectedDimension ? .bold : .regular, design: .monospaced))
-                                .frame(width: 42, alignment: .trailing)
+                                Text(String(format: "%.3f", dimScore))
+                                    .font(.system(size: 10, weight: dim == selectedDimension ? .bold : .regular, design: .monospaced))
+                                    .frame(width: 42, alignment: .trailing)
+                            }
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                     }
                 }
             }

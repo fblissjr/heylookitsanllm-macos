@@ -21,6 +21,7 @@ Before modifying a subsystem, read the corresponding wiki page from `docs/wiki/`
 | **Multimodal Embeddings, ANE Towers & Matryoshka Store** | `Sources/HeylookEmbeddings/**` | [docs/wiki/multimodal_embeddings_and_ane.md](./docs/wiki/multimodal_embeddings_and_ane.md) |
 | **HTTP/SSE Wire Contract & SQLite WAL Store** | `Sources/HeylookServer/**`, `Sources/HeylookCore/Wire/**`, `Sources/HeylookCore/Store/**` | [docs/wiki/wire_api_and_sqlite_store.md](./docs/wiki/wire_api_and_sqlite_store.md) |
 | **Model Onboarding, Quantization & Export Playbooks** | `Sources/HeylookCore/Domain/ModelTemplateInfo.swift`, `scripts/**` | [docs/wiki/model_family_onboarding.md](./docs/wiki/model_family_onboarding.md) |
+| **SwiftUI Architecture & macOS 27.2+ Design System** | `Sources/HeylookUI/**`, `Sources/HeylookApp/**` | [docs/wiki/ui_architecture_and_macos27.md](./docs/wiki/ui_architecture_and_macos27.md) |
 | **Sharp Edges & Incident Rationales** | Cross-cutting (`HeylookCore`, `HeylookEmbeddings`, `HeylookEngines`, `HeylookServer`, `HeylookUI`) | [docs/wiki/sharp_edges.md](./docs/wiki/sharp_edges.md) |
 
 ## Module Architecture
@@ -56,7 +57,8 @@ Before modifying a subsystem, read the corresponding wiki page from `docs/wiki/`
   - `swift run heylook-cli chat [--model <id_or_path>] [--max-tokens <n>] [--no-thinking] "<prompt>"`
   - `swift run heylook-cli eval-lab`
   - `swift run heylook-cli serve 8000`
-- Model conversion & export scripts:
+- Model conversion, export & agent skills sync scripts:
+  - Sync Apple Xcode 27.x (`xcrun agent skills export`), Xcode `AdditionalDocumentation`, and `coreai-models` skills into `.agents/skills/`: `./scripts/sync_agent_skills.sh`
   - Pure-Swift MLX quantization (`MLXLMCommon.convert`): `./scripts/build_native.sh cli convert-mlx <src-dir> <dst-dir> --bits 4 --group-size 64 --mode affine`
   - Core AI `.aimodel` export (`coreai-models` + `xcrun coreai-build`): `./scripts/export_coreai.sh [list|llm|gemma4|embedding|compile] ...`
   - 3-Tower CoreML ANE `EmbeddingGemma 2` export (`coremltools` + `xcrun coremlcompiler`): `uv run --python 3.12 --with coremltools --with safetensors --with "torch<2.8" --with "numpy<2" python ./scripts/export_ane_coreml.py --compile`

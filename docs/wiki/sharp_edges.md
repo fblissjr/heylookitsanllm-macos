@@ -50,6 +50,9 @@ Every non-obvious mechanism in `heylookitsanllm-macos` exists because a real har
 - **Portrait iPhone Video Orientation**:
   - **What bit**: `AVAssetImageGenerator` defaults `appliesPreferredTrackTransform = false`, decoding portrait iPhone videos sideways (`90°` rotated) and degrading vision embedding recall.
   - **The mechanism**: Every `AVAssetImageGenerator` in `ArtifactProcessor` sets `appliesPreferredTrackTransform = true`.
+- **`ANELargeModelCompilerService` 30–35 GB Temporary Scratch Pre-Allocation on Core AI `.aimodel` Compilation**:
+  - **What bit**: When compiling multi-gigabyte Core AI `.aimodel` bundles (`xcrun coreai-build` or first-load `AIModel(asset:)` compilation via `ANELargeModelCompilerService`), macOS pre-allocates 30–35 GB of temporary scratch space under `/private/var/tmp/` (`com.apple.ane.compiler.*`). If free disk space is below ~35 GB, `ANELargeModelCompilerService` fails mid-compile or leaves partial compiler artifacts in `/private/var/tmp/`.
+  - **The mechanism**: Verify at least 40 GB of free disk space (`df -h /private/var/tmp`) before invoking `./scripts/export_coreai.sh compile`, and pre-compile `.aimodel` bundles ahead of time rather than triggering cold on-demand compilation during an interactive chat turn.
 
 ---
 
@@ -58,3 +61,23 @@ Every non-obvious mechanism in `heylookitsanllm-macos` exists because a real har
 - **Homebrew `swift` (`macOS-14.0`) vs. Xcode `MacOSX27.2.sdk` (`27.0`) Manifest Linker Warning**:
   - **What bit**: When `/opt/homebrew/opt/swift/bin/swift` precedes `/usr/bin/swift` in `$PATH`, running bare `swift build` emits `ld: warning: building for macOS-14.0, but linking with dylib '/usr/lib/swift/libswiftCore.dylib' which was built for newer version 27.0` while compiling `Package.swift` into a temporary manifest executable (`heylookitsanllm-macos-manifest`). Homebrew's open-source `swift-package` hardcodes `MinimumDeploymentTarget.default = macOS 14.0` for manifest compilation, while linking against Xcode's `MacOSX27.2.sdk` `.tbd` stubs (`27.0`).
   - **The mechanism**: Package targets themselves compile cleanly for `arm64-apple-macosx27.2`. To silence the manifest-loader warning on the CLI, invoke Xcode's native Swift toolchain via `xcrun swift build` / `/usr/bin/swift build` (whose host target is `arm64-apple-macosx27.2.0`) or `brew unlink swift`.
+
+---
+
+## 6. SwiftUI & AppKit Window / Split-View Sharp Edges (`HeylookApp` & `HeylookUI`)
+
+- **Unresponsive Keyboard Input & Non-Resizable Windows on Bare SwiftPM Executables**:
+  - **What bit**: Launching a raw SwiftPM executable (`heylook-app`) outside a `.app` bundle starts the process with `NSApplication.ActivationPolicy.prohibited` / `.accessory`. The window appears on screen, but AppKit never makes it key (`NSTextInputClient` keyboard events never reach `TextField` or `TextEditor`) and may omit `.resizable` from `window.styleMask`.
+  - **The mechanism**: `HeylookApp` wires `@NSApplicationDelegateAdaptor(HeylookAppDelegate.self)` calling `NSApplication.shared.setActivationPolicy(.regular)`, `NSApplication.shared.activate()`, `window.styleMask.insert(.resizable)`, and `window.makeKeyAndOrderFront(nil)`, while `scripts/build_native.sh` packages `HeylookWorkbench.app` with `Contents/Info.plist`.
+- **Nested `HSplitView` Inside `NavigationSplitView` Collapsing to Bottom-Left**:
+  - **What bit**: Placing an AppKit-backed `HSplitView` inside the `detail:` column of a `NavigationSplitView` without infinite frame bounds causes `NSSplitView` to collapse to its intrinsic minimum size in the bottom-left corner and push the leading sidebar off-screen.
+  - **The mechanism**: `HeylookRootView` uses a single `NavigationSplitView` + contextual `HeylookSidebarView` sections + native trailing `.inspector(isPresented:)` modifier, with `.frame(maxWidth: .infinity, maxHeight: .infinity)` on the detail container.
+- **`ToolbarOverflowMenu` and `.topBarPinnedTrailing` Are Unavailable on macOS 27**:
+  - **What bit**: Some community WWDC26 / Golden Gate blog posts place `ToolbarOverflowMenu` and `ToolbarItem(placement: .topBarPinnedTrailing)` inside macOS `NavigationSplitView` examples. In `MacOSX27.2.sdk` (`SwiftUI.swiftinterface` lines 8033 & 31555), both symbols are annotated `@available(iOS 27.0, visionOS 27.0, *) @available(macOS, unavailable)` and fail to compile on macOS.
+  - **The mechanism**: Use `.visibilityPriority(.high)` / `.visibilityPriority(.low)` and `.contentMarginsRemoved()` on shared multiplatform toolbars, and gate `ToolbarOverflowMenu` / `.topBarPinnedTrailing` inside `#if os(iOS)`.
+- **Xcode 27 `@State` Macro Double-Assignment & Inline `Binding(get:set:)` Closures**:
+  - **What bit**: In SDK 27, `@State` is a macro that synthesizes backing storage. Providing both a default value at declaration (`@State private var x = 0`) and assigning `self.x = y` in `init` either fails to compile (`Variable used before being initialized`) or silently ignores the `init` assignment. Separately, inline `Binding(get:set:)` closures inside `body` allocate a new closure on every evaluation and trigger redundant child invalidations.
+  - **The mechanism**: Declare `@State private var` with either a declaration default OR an `init` assignment (never both), and bind `@Observable` view-model projections via `@Bindable` KeyPaths (`$viewModel.boundTemperature`) instead of closure bindings.
+- **Antigravity (`agy`) Skill Discovery vs. `~/.agents/skills` Sandbox Block**:
+  - **What bit**: Exporting Xcode's `xcrun agent skills export` bundles only to `~/.agents/skills/` leaves them outside `agy`'s workspace discovery root (`<repo>/.agents/skills/`) and outside the terminal sandbox's readable paths (`Operation not permitted` when reading `references/*.md`).
+  - **The mechanism**: `./scripts/sync_agent_skills.sh` exports Xcode 27.x skills, Xcode's `AdditionalDocumentation` guides, and `apple/coreai-models` skills directly into `<repo>/.agents/skills/` (gitignored), where `agy` discovers them at highest workspace precedence with full in-sandbox read access.
