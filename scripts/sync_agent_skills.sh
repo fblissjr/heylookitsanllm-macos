@@ -13,17 +13,38 @@ SKILLS_DIR="${1:-$REPO_ROOT/.agents/skills}"
 
 mkdir -p "$SKILLS_DIR"
 
-echo "==> 1. Exporting official Apple Xcode 27.x Agent Skills via xcrun agent skills export..."
-if xcrun --find agent >/dev/null 2>&1; then
-    xcrun agent skills export --replace-existing "$SKILLS_DIR"
+DEV_DIR="$(xcode-select -p 2>/dev/null || echo "/Applications/Xcode.app/Contents/Developer")"
+XCODE_CONTENTS="$(cd "$DEV_DIR/.." && pwd)"
+IDE_CHAT_RES="$XCODE_CONTENTS/PlugIns/IDEIntelligenceChat.framework/Versions/A/Resources"
+ADD_DOCS_DIR="$IDE_CHAT_RES/AdditionalDocumentation"
+
+echo "==> 1. Exporting official Apple Xcode 27.x Agent Skills..."
+chmod -R u+w "$SKILLS_DIR" 2>/dev/null || true
+if xcrun --find agent >/dev/null 2>&1 && xcrun agent skills export --replace-existing "$SKILLS_DIR" 2>/dev/null; then
+    chmod -R u+w "$SKILLS_DIR" 2>/dev/null || true
+elif [[ -d "$IDE_CHAT_RES" ]]; then
+    for tmpl in "$IDE_CHAT_RES"/*.idechatprompttemplate; do
+        [[ -f "$tmpl" ]] || continue
+        if head -n 1 "$tmpl" | grep -q '^---$'; then
+            skill_name="$(basename "$tmpl" .idechatprompttemplate)"
+            mkdir -p "$SKILLS_DIR/$skill_name/references"
+            cp -f "$tmpl" "$SKILLS_DIR/$skill_name/SKILL.md"
+            chmod u+w "$SKILLS_DIR/$skill_name/SKILL.md"
+            for ref in "$IDE_CHAT_RES/${skill_name}-ref-"*.md.packaged; do
+                [[ -f "$ref" ]] || continue
+                ref_base="$(basename "$ref" .md.packaged)"
+                ref_name="${ref_base#${skill_name}-ref-}.md"
+                cp -f "$ref" "$SKILLS_DIR/$skill_name/references/$ref_name"
+                chmod u+w "$SKILLS_DIR/$skill_name/references/$ref_name"
+            done
+            echo "    ✓ Unpacked Xcode skill: $skill_name"
+        fi
+    done
 else
-    echo "    [warn] 'xcrun agent' not found in active Xcode toolchain; skipping Xcode skill export."
+    echo "    [warn] Neither 'xcrun agent' nor IDEIntelligenceChat resources found."
 fi
 
 echo "==> 2. Materializing Xcode IDEIntelligenceChat AdditionalDocumentation guides..."
-DEV_DIR="$(xcode-select -p 2>/dev/null || echo "/Applications/Xcode.app/Contents/Developer")"
-XCODE_CONTENTS="$(cd "$DEV_DIR/.." && pwd)"
-ADD_DOCS_DIR="$XCODE_CONTENTS/PlugIns/IDEIntelligenceChat.framework/Versions/A/Resources/AdditionalDocumentation"
 
 if [[ -d "$ADD_DOCS_DIR" ]]; then
     GUIDES_SKILL_DIR="$SKILLS_DIR/xcode-27-guides"
