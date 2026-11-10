@@ -17,10 +17,13 @@ cd "${REPO_ROOT}"
 
 find_products_dir() {
   local dir
-  dir="$(ls -td "${HOME}"/Library/Developer/Xcode/DerivedData/heylookitsanllm-macos-*/Build/Products/Debug "${REPO_ROOT}/.build/out/Products/Debug" 2>/dev/null | head -n 1 || true)"
+  dir="$(ls -td "${HOME}"/Library/Developer/Xcode/DerivedData/heylookitsanllm-macos-*/Build/Products/Debug 2>/dev/null | head -n 1 || true)"
   if [[ -z "${dir}" || ! -d "${dir}" ]]; then
     dir="$(xcodebuild -scheme heylook-app -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation -showBuildSettings 2>/dev/null \
       | awk -F' = ' '/^[[:space:]]*BUILT_PRODUCTS_DIR = / {print $2; exit}' || true)"
+  fi
+  if [[ -z "${dir}" || ! -d "${dir}" ]]; then
+    dir="${REPO_ROOT}/.build/out/Products/Debug"
   fi
   echo "${dir}"
 }
@@ -97,24 +100,37 @@ PLIST
 }
 
 case "${ACTION}" in
-  build|test)
-    xcodebuild "${ACTION}" \
-      -scheme heylookitsanllm-macos-Package \
+  build)
+    xcodebuild build \
+      -scheme heylook-app \
       -destination 'platform=macOS,arch=arm64' \
       -skipPackagePluginValidation \
       -skipMacroValidation \
       "$@"
-    if [[ "${ACTION}" == "build" ]]; then
-      PRODUCTS_DIR="$(find_products_dir)"
-      if [[ -x "${PRODUCTS_DIR}/heylook-app" ]]; then
-        assemble_app_bundle "${PRODUCTS_DIR}" >/dev/null
-      fi
+    xcodebuild build \
+      -scheme heylook-cli \
+      -destination 'platform=macOS,arch=arm64' \
+      -skipPackagePluginValidation \
+      -skipMacroValidation \
+      "$@"
+    PRODUCTS_DIR="$(find_products_dir)"
+    if [[ -x "${PRODUCTS_DIR}/heylook-app" ]]; then
+      assemble_app_bundle "${PRODUCTS_DIR}" >/dev/null
     fi
+    ;;
+  test)
+    xcodebuild test \
+      -scheme heylookitsanllm-macos-Package \
+      -destination 'platform=macOS,arch=arm64' \
+      -only-testing:HeylookTests \
+      -skipPackagePluginValidation \
+      -skipMacroValidation \
+      "$@"
     ;;
   cli)
     PRODUCTS_DIR="$(find_products_dir)"
     if needs_build "${PRODUCTS_DIR}/heylook-cli"; then
-      xcodebuild build -scheme heylookitsanllm-macos-Package -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation
+      xcodebuild build -scheme heylook-cli -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation
       PRODUCTS_DIR="$(find_products_dir)"
     fi
     exec "${PRODUCTS_DIR}/heylook-cli" "$@"
@@ -122,7 +138,7 @@ case "${ACTION}" in
   app)
     PRODUCTS_DIR="$(find_products_dir)"
     if needs_build "${PRODUCTS_DIR}/heylook-app"; then
-      xcodebuild build -scheme heylookitsanllm-macos-Package -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation
+      xcodebuild build -scheme heylook-app -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation
       PRODUCTS_DIR="$(find_products_dir)"
     fi
     APP_BUNDLE="$(assemble_app_bundle "${PRODUCTS_DIR}")"

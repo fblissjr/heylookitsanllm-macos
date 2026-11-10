@@ -5,10 +5,60 @@ import Foundation
 
 #if canImport(MLXVLM)
 import MLX
-import MLXHuggingFace
 import MLXLMCommon
 import MLXVLM
 import Tokenizers
+
+/// Direct `MLXLMCommon.TokenizerLoader` bridge to `swift-transformers` (`Tokenizers.AutoTokenizer`),
+/// avoiding the external `MLXHuggingFaceMacros` (`swift-syntax`) compiler plugin dependency.
+public struct HeylookTransformersTokenizerLoader: MLXLMCommon.TokenizerLoader, Sendable {
+    private struct TokenizerBridge: MLXLMCommon.Tokenizer {
+        let upstream: any Tokenizers.Tokenizer
+
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+            upstream.encode(text: text, addSpecialTokens: addSpecialTokens)
+        }
+
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+            upstream.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
+        }
+
+        func convertTokenToId(_ token: String) -> Int? {
+            upstream.convertTokenToId(token)
+        }
+
+        func convertIdToToken(_ id: Int) -> String? {
+            upstream.convertIdToToken(id)
+        }
+
+        var bosToken: String? { upstream.bosToken }
+        var eosToken: String? { upstream.eosToken }
+        var unknownToken: String? { upstream.unknownToken }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            do {
+                return try upstream.applyChatTemplate(
+                    messages: messages,
+                    tools: tools,
+                    additionalContext: additionalContext
+                )
+            } catch Tokenizers.TokenizerError.missingChatTemplate {
+                throw MLXLMCommon.TokenizerError.missingChatTemplate
+            }
+        }
+    }
+
+    public init() {}
+
+    public func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+        let upstream = try await Tokenizers.AutoTokenizer.from(modelFolder: directory)
+        return TokenizerBridge(upstream: upstream)
+    }
+}
 #endif
 
 /// Standalone MLX Swift + CoreML ANE integration for `EmbeddingGemma 2` (`embedding_gemma2`).
@@ -138,7 +188,7 @@ public enum NativeMLXEmbeddingGemma2 {
     }
 
     public static var isAvailableInProcess: Bool {
-        #if canImport(MLXVLM) && canImport(MLXLMCommon) && canImport(MLXHuggingFace)
+        #if canImport(MLXVLM) && canImport(MLXLMCommon) && canImport(Tokenizers)
         return true
         #else
         return false
@@ -383,7 +433,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         if let cachedTokenizer {
             return cachedTokenizer
         }
-        let loader: any TokenizerLoader = customTokenizerLoader ?? #huggingFaceTokenizerLoader()
+        let loader: any TokenizerLoader = customTokenizerLoader ?? HeylookTransformersTokenizerLoader()
         let tok = try await loader.load(from: checkpointURL)
         self.cachedTokenizer = tok
         return tok
@@ -393,7 +443,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         if let cachedEmbedder {
             return cachedEmbedder
         }
-        let loader: any TokenizerLoader = customTokenizerLoader ?? #huggingFaceTokenizerLoader()
+        let loader: any TokenizerLoader = customTokenizerLoader ?? HeylookTransformersTokenizerLoader()
         let loaded = try await MLXVLM.EmbeddingGemma2Embedding(
             modelDirectory: checkpointURL,
             tokenizerLoader: loader,

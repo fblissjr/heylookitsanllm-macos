@@ -41,7 +41,6 @@ if enableNativeMLX {
         .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
         .product(name: "MLXLLM", package: "mlx-swift-lm"),
         .product(name: "MLXVLM", package: "mlx-swift-lm"),
-        .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
         .product(name: "Transformers", package: "swift-transformers"),
     ]
     embeddingsDependencies.append(contentsOf: mlxProducts)

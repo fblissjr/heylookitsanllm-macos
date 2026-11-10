@@ -8,7 +8,6 @@ import CoreImage
 
 #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM)
 import MLX
-import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
 import MLXNN
@@ -55,7 +54,7 @@ public actor MLXSwiftProvider: InferenceProvider {
     private var kvSession = KVCacheSessionState()
     private var unloadCount: Int = 0
 
-    #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
+    #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
     private final class MLXKVCacheBox: @unchecked Sendable {
         var caches: [KVCache]? = nil
     }
@@ -68,7 +67,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         if let tokenCounter {
             return tokenCounter
         }
-        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
+        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
         if let tok = loadedTokenizer {
             return { text in
                 max(1, tok.encode(text: text).count)
@@ -138,7 +137,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         kvSession.cachedTokenCount = 0
         kvSession.sliceTruncations = 0
         descriptionState.isLoaded = false
-        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
+        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
         loadedContainer = nil
         loadedTokenizer = nil
         kvCacheBox.caches = nil
@@ -164,7 +163,7 @@ public actor MLXSwiftProvider: InferenceProvider {
 
         let enableThinking = (effectiveSampling.thinking ?? true) && descriptionState.supportsThinking.value
 
-        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
+        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
         if Self.hasSafetensorsWeights(at: descriptionState.modelPath) {
             if cacheReport.outcome == .miss {
                 kvCacheBox.caches = nil
@@ -239,7 +238,7 @@ public actor MLXSwiftProvider: InferenceProvider {
         return items.contains { $0.pathExtension.lowercased() == "safetensors" }
     }
 
-    #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXHuggingFace)
+    #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
     private func updateCachedTokenCount(_ count: Int) {
         kvSession.cachedTokenCount = max(kvSession.cachedTokenCount, count)
     }
@@ -249,7 +248,7 @@ public actor MLXSwiftProvider: InferenceProvider {
             return loadedContainer
         }
         let dirURL = URL(fileURLWithPath: descriptionState.modelPath)
-        let loader: any TokenizerLoader = #huggingFaceTokenizerLoader()
+        let loader: any TokenizerLoader = HeylookTransformersTokenizerLoader()
         // Pass `reasoningConfig: nil` so `mlx-swift-lm` yields raw token chunks without running a
         // competing internal `StreamingReasoningParser`; `HeylookCore.ReasoningParser` handles all
         // 4 reasoning protocols (`.tagPair`, `.gemmaChannel`, `.harmonyChannel`, `.recipientChannel`)
