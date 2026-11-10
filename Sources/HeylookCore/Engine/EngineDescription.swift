@@ -158,9 +158,15 @@ public struct GenerationChunk: Codable, Sendable, Equatable {
     public let text: String
     public let thinking: String
     public let tokenCount: Int
+    public let thinkingTokens: Int
+    public let contentTokens: Int
     public let promptTokens: Int
     public let generationTPS: Double
     public let promptTPS: Double
+    public let ttftMs: Double?
+    public let thinkingDurationMs: Double?
+    public let contentDurationMs: Double?
+    public let generationDurationMs: Double?
     public let peakMemoryGB: Double
     public let stopReason: StopReason?
     public let cacheReport: CacheReport?
@@ -171,9 +177,15 @@ public struct GenerationChunk: Codable, Sendable, Equatable {
         text: String = "",
         thinking: String = "",
         tokenCount: Int = 0,
+        thinkingTokens: Int = 0,
+        contentTokens: Int = 0,
         promptTokens: Int = 0,
         generationTPS: Double = 0,
         promptTPS: Double = 0,
+        ttftMs: Double? = nil,
+        thinkingDurationMs: Double? = nil,
+        contentDurationMs: Double? = nil,
+        generationDurationMs: Double? = nil,
         peakMemoryGB: Double = 0,
         stopReason: StopReason? = nil,
         cacheReport: CacheReport? = nil,
@@ -183,9 +195,15 @@ public struct GenerationChunk: Codable, Sendable, Equatable {
         self.text = text
         self.thinking = thinking
         self.tokenCount = tokenCount
+        self.thinkingTokens = thinkingTokens
+        self.contentTokens = contentTokens
         self.promptTokens = promptTokens
         self.generationTPS = generationTPS
         self.promptTPS = promptTPS
+        self.ttftMs = ttftMs
+        self.thinkingDurationMs = thinkingDurationMs
+        self.contentDurationMs = contentDurationMs
+        self.generationDurationMs = generationDurationMs
         self.peakMemoryGB = peakMemoryGB
         self.stopReason = stopReason
         self.cacheReport = cacheReport

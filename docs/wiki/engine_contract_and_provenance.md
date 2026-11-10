@@ -59,11 +59,18 @@ Following `VISION.md` (*"Derive, don't copy"*), `ModelTemplateInfo.inspect(model
 
 ---
 
-## 4. 4-Rung Chat Template Ladder (`HeylookConfig.swift`)
+## 4. 4-Rung Chat Template Ladder, `HeylookJinjaRenderer` & `ChatTemplateInspection` (`HeylookConfig.swift`, `HeylookJinjaRenderer.swift`)
 
-When resolving a model's chat template (for `llama-server --chat-template-file`, `MLXSwiftProvider`, or `POST /v1/conversations/{id}/prompt`), `HeylookConfig.resolveGGUFTemplate` evaluates 4 rungs in order:
+When resolving a model's chat template (for `llama-server --chat-template-file`, `MLXSwiftProvider`, or `GET`/`POST /v1/conversations/{id}/prompt`), `HeylookConfig` evaluates the template ladder in order:
 
-1. **Rung 1 (`chat_template_path` in `model.heylook.toml`)**: Explicit path in sidecar (`.configured`).
-2. **Rung 2 (`chat_template.heylook.jinja`)**: Operator override file written by `PUT /v1/admin/models/{id}/chat-template` or the Sidecar Editor sheet (`.configured`). Deleting the override via `DELETE /v1/admin/models/{id}/chat-template` cleanly reverts to Rung 3 or 4 without mutating vendor files.
-3. **Rung 3 (`chat_template.jinja`)**: Vendor-shipped Jinja file in the model directory or parent repo folder (`.derived`).
-4. **Rung 4 (`tokenizer_config.json` / `gguf_embedded`)**: `chat_template` string embedded in `tokenizer_config.json` or `tokenizer.chat_template` in the `.gguf` binary header (`.derived`).
+1. **Rung 1 (`chat_template_path` / `chat_template` in `model.heylook.toml`)**: Explicit path or inline Jinja string in sidecar (`.configured`, `origin = "sidecar"`). When `chat_template_path` is set, `ChatTemplateInspection.inertReason` warns that `chat_template.heylook.jinja` is shadowed.
+2. **Rung 2 (`chat_template.heylook.jinja`)**: Operator override file written by `PUT /v1/admin/models/{id}/chat-template` or the Template Override sheet (`.configured`, `origin = "operator_override"`). Deleting the override via `DELETE /v1/admin/models/{id}/chat-template` cleanly reverts to Rung 3 or 4 without mutating vendor files.
+3. **Rung 3 (`chat_template.jinja`)**: Vendor-shipped Jinja file in the model directory (`.derived`, `origin = "vendor_file"`), skipped if `use_sidecar_chat_template = false` or if `--mmproj` vision/audio is active and the sidecar template lacks media placeholders while the `.gguf` header carries a multimodal template.
+4. **Rung 4 (`tokenizer_config.json` / `gguf_embedded`)**: `chat_template` string embedded in `tokenizer_config.json` or `tokenizer.chat_template` in the `.gguf` binary header (`.derived`, `origin = "gguf_header"`).
+
+### Real Jinja2 AST Evaluation & Integrity Checks
+- **`HeylookJinjaRenderer`**: Provides a full recursive-descent Jinja2 lexer, AST parser, syntax validator (`validateSyntax`), and evaluator supporting `for`/`else` (`loop.index0`, `loop.first`, `loop.last`), `if`/`elif`/`else`, `set` & `namespace(...)` mutation across loop iterations, `macro` definitions, array slicing (`messages[::-1]`), filters (`tojson`, `trim`, `length`, `join`, `replace`, `selectattr`), `raise_exception(...)`, and `huggingface/swift-jinja` execution when linked under `HEYLOOK_ENABLE_NATIVE_MLX=1`.
+- **Prefix-Stability Lint (`checkPrefixStability`)**: Renders a 2-turn conversation and a 3-turn extension and verifies that the 2-turn output (minus generation prompt tail) is an exact byte prefix of the 3-turn render, flagging `strftime_now()` or history-mutating templates (`prefixStable = false`).
+- **Post-Download Vendor Modification Detection (`checkModifiedSinceDownload`)**: Computes git-blob `SHA-1` (`blob <len>\0...`) or Git-LFS `SHA-256` against `.cache/huggingface/download/<filename>.metadata` ETags so operators can see when a vendor `chat_template.jinja` or `tokenizer_config.json` was edited on disk (`modifiedSinceDownload == true`).
+- **Offline Subword Tokenization (`CheckpointPieceTokenizer`)**: Parses both BPE (`vocab` + merge ranks) and SentencePiece Unigram (`vocab` `[piece, score]` log-probabilities via Viterbi dynamic programming) from `tokenizer.json` for accurate offline prompt/budget token counting.
+- **Non-Destructive Config Helpers**: `HeylookConfig.addScanFolder(_:configURL:)`, `removeScanFolder(_:configURL:)`, and `save(to:)` update `heylook.toml` atomically while preserving `[[models]]`, `admin_token`, and `allowed_hosts`.

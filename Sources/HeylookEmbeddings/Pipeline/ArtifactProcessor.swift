@@ -380,19 +380,149 @@ public enum ArtifactProcessor {
     }
 
     public static func decodeMonoPCM(for url: URL, sampleRate: Int = audioSampleRate) async throws -> [Float] {
+        let targetRate = Double(max(1000, sampleRate))
+
+        // 1. Try AVAudioFile first (WAV, AIFF, CAF, MP3, M4A, FLAC), downmixing to mono and resampling to `sampleRate`.
         if let audioFile = try? AVAudioFile(forReading: url) {
+            let srcFormat = audioFile.processingFormat
             let frameCount = AVAudioFrameCount(audioFile.length)
             if frameCount > 0,
-               let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount) {
-                try audioFile.read(into: buffer)
-                if let channelData = buffer.floatChannelData {
-                    let nFrames = Int(buffer.frameLength)
-                    return Array(UnsafeBufferPointer(start: channelData[0], count: nFrames))
+               let srcBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: frameCount) {
+                try? audioFile.read(into: srcBuffer)
+                let readFrames = Int(srcBuffer.frameLength)
+                if readFrames > 0, let channelData = srcBuffer.floatChannelData {
+                    let channels = max(1, Int(srcFormat.channelCount))
+                    var monoSource = [Float](repeating: 0, count: readFrames)
+                    if channels == 1 {
+                        monoSource = Array(UnsafeBufferPointer(start: channelData[0], count: readFrames))
+                    } else {
+                        for ch in 0..<channels {
+                            let chPtr = UnsafeBufferPointer(start: channelData[ch], count: readFrames)
+                            vDSP_vadd(monoSource, 1, Array(chPtr), 1, &monoSource, 1, vDSP_Length(readFrames))
+                        }
+                        var invCh = 1.0 / Float(channels)
+                        vDSP_vsmul(monoSource, 1, &invCh, &monoSource, 1, vDSP_Length(readFrames))
+                    }
+
+                    if abs(srcFormat.sampleRate - targetRate) < 0.5 {
+                        return monoSource
+                    }
+                    return resampleMonoFloatPCM(
+                        samples: monoSource,
+                        sourceSampleRate: srcFormat.sampleRate,
+                        targetSampleRate: targetRate
+                    )
                 }
             }
         }
-        return []
+
+        // 2. Fallback to AVAssetReaderTrackOutput for video containers (.mp4, .mov, .m4v) with audio soundtracks.
+        let asset = AVURLAsset(url: url)
+        guard let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first,
+              let reader = try? AVAssetReader(asset: asset)
+        else {
+            return []
+        }
+
+        let outputSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: targetRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        let trackOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: outputSettings)
+        let sampleProvider = reader.outputProvider(for: trackOutput)
+        guard (try? reader.start()) != nil else { return [] }
+
+        var decoded = [Float]()
+        while let readySampleBuffer = try? await sampleProvider.next() {
+            readySampleBuffer.withUnsafeSampleBuffer { sampleBuffer in
+                if let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) {
+                    let byteLen = CMBlockBufferGetDataLength(blockBuffer)
+                    if byteLen >= MemoryLayout<Float>.size {
+                        var rawBytes = [UInt8](repeating: 0, count: byteLen)
+                        let copyStatus = CMBlockBufferCopyDataBytes(
+                            blockBuffer,
+                            atOffset: 0,
+                            dataLength: byteLen,
+                            destination: &rawBytes
+                        )
+                        if copyStatus == kCMBlockBufferNoErr {
+                            let sampleCount = byteLen / MemoryLayout<Float>.size
+                            rawBytes.withUnsafeBytes { rawPtr in
+                                if let fPtr = rawPtr.baseAddress?.assumingMemoryBound(to: Float.self) {
+                                    decoded.append(contentsOf: UnsafeBufferPointer(start: fPtr, count: sampleCount))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return decoded
     }
+
+    /// Resamples mono Float32 PCM from `sourceSampleRate` to `targetSampleRate` via `AVAudioConverter`
+    /// (with a `vDSP_vlint` linear-interpolation fallback if `AVAudioConverter` declines an exotic rate).
+    public static func resampleMonoFloatPCM(
+        samples: [Float],
+        sourceSampleRate: Double,
+        targetSampleRate: Double
+    ) -> [Float] {
+        guard !samples.isEmpty, sourceSampleRate > 0, targetSampleRate > 0 else { return [] }
+        if abs(sourceSampleRate - targetRate(targetSampleRate)) < 0.5 {
+            return samples
+        }
+
+        let outCountEst = max(1, Int((Double(samples.count) * targetSampleRate / sourceSampleRate).rounded()))
+        if let srcFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sourceSampleRate, channels: 1, interleaved: false),
+           let dstFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: targetSampleRate, channels: 1, interleaved: false),
+           let converter = AVAudioConverter(from: srcFmt, to: dstFmt),
+           let inBuf = AVAudioPCMBuffer(pcmFormat: srcFmt, frameCapacity: AVAudioFrameCount(samples.count)),
+           let outBuf = AVAudioPCMBuffer(pcmFormat: dstFmt, frameCapacity: AVAudioFrameCount(outCountEst + 64)) {
+            inBuf.frameLength = AVAudioFrameCount(samples.count)
+            if let dstPtr = inBuf.floatChannelData?[0] {
+                samples.withUnsafeBufferPointer { srcPtr in
+                    dstPtr.update(from: srcPtr.baseAddress!, count: samples.count)
+                }
+            }
+            final class FeedState: @unchecked Sendable {
+                var didSupply = false
+            }
+            let feedState = FeedState()
+            var convError: NSError?
+            let status = converter.convert(to: outBuf, error: &convError) { _, outStatus in
+                if feedState.didSupply {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                feedState.didSupply = true
+                outStatus.pointee = .haveData
+                return inBuf
+            }
+            if (status == .haveData || status == .endOfStream), convError == nil,
+               outBuf.frameLength > 0,
+               let outPtr = outBuf.floatChannelData?[0] {
+                return Array(UnsafeBufferPointer(start: outPtr, count: Int(outBuf.frameLength)))
+            }
+        }
+
+        // Pure-Accelerate `vDSP_vlint` fallback
+        var positions = [Float](repeating: 0, count: outCountEst)
+        let ratio = Float(sourceSampleRate / targetSampleRate)
+        let maxIndex = Float(max(0, samples.count - 1))
+        for i in 0..<outCountEst {
+            positions[i] = min(maxIndex, Float(i) * ratio)
+        }
+        var resampled = [Float](repeating: 0, count: outCountEst)
+        vDSP_vlint(samples, positions, 1, &resampled, 1, vDSP_Length(outCountEst), vDSP_Length(samples.count))
+        return resampled
+    }
+
+    private static func targetRate(_ r: Double) -> Double { r }
 
     public static func encodeWAV16Mono(samples: [Float], sampleRate: Int = audioSampleRate) -> Data {
         let numSamples = samples.count

@@ -22,9 +22,103 @@ public enum ProviderFactory {
     }
 }
 
-/// Deterministic conversation prefix-cache state machine tracking system prompt and
-/// message turn prefixes to produce exact `CacheReport` telemetry (`cold`, `reused`,
-/// `system_changed`, `history_diverged`) and branch-edit KV truncation counts.
+/// Multi-chunk holdback filter matching `stop_sequences` across arbitrary token boundaries.
+/// Never emits a matched stop sequence or partial prefix until disambiguated.
+public struct StopSequenceFilter: Sendable {
+    public let stopSequences: [String]
+    private var pending: String = ""
+    public private(set) var matchedStopSequence: String?
+
+    public init(stopSequences: [String]) {
+        self.stopSequences = stopSequences.filter { !$0.isEmpty }
+    }
+
+    public var isActive: Bool {
+        !stopSequences.isEmpty
+    }
+
+    public mutating func feed(_ chunk: String) -> (emitted: String, matchedStop: String?) {
+        guard !stopSequences.isEmpty else {
+            return (chunk, nil)
+        }
+        if let matchedStopSequence {
+            return ("", matchedStopSequence)
+        }
+        guard !chunk.isEmpty else {
+            return ("", nil)
+        }
+
+        pending.append(chunk)
+
+        // 1. Check for full stop sequence match (earliest match wins; longest wins on tie).
+        var earliestRange: Range<String.Index>?
+        var earliestStop: String?
+        for stop in stopSequences {
+            if let range = pending.range(of: stop) {
+                if let currentEarliest = earliestRange {
+                    if range.lowerBound < currentEarliest.lowerBound
+                        || (range.lowerBound == currentEarliest.lowerBound && stop.count > (earliestStop?.count ?? 0)) {
+                        earliestRange = range
+                        earliestStop = stop
+                    }
+                } else {
+                    earliestRange = range
+                    earliestStop = stop
+                }
+            }
+        }
+
+        if let matchRange = earliestRange, let stop = earliestStop {
+            let safePrefix = String(pending[..<matchRange.lowerBound])
+            pending.removeAll(keepingCapacity: false)
+            matchedStopSequence = stop
+            return (safePrefix, stop)
+        }
+
+        // 2. Hold back the longest suffix of `pending` that is a proper prefix of any stop sequence.
+        var holdbackCount = 0
+        for stop in stopSequences {
+            let maxCheck = min(pending.count, stop.count - 1)
+            guard maxCheck > holdbackCount else { continue }
+            for k in stride(from: maxCheck, through: holdbackCount + 1, by: -1) {
+                if pending.suffix(k) == stop.prefix(k) {
+                    holdbackCount = k
+                    break
+                }
+            }
+        }
+
+        if holdbackCount == 0 {
+            let out = pending
+            pending.removeAll(keepingCapacity: true)
+            return (out, nil)
+        }
+
+        let emitCount = pending.count - holdbackCount
+        guard emitCount > 0 else {
+            return ("", nil)
+        }
+        let splitIdx = pending.index(pending.startIndex, offsetBy: emitCount)
+        let emitted = String(pending[..<splitIdx])
+        pending = String(pending[splitIdx...])
+        return (emitted, nil)
+    }
+
+    public mutating func flush() -> String {
+        guard matchedStopSequence == nil, !pending.isEmpty else {
+            let empty = ""
+            pending.removeAll(keepingCapacity: false)
+            return empty
+        }
+        let out = pending
+        pending.removeAll(keepingCapacity: false)
+        return out
+    }
+}
+
+/// Deterministic conversation prefix-cache state machine tracking system prompt, message turn
+/// prefixes, and exact post-template token IDs to produce truthful `CacheReport` telemetry
+/// (`cold`, `reused`, `system_changed`, `history_diverged`) and branch-edit KV truncation counts.
 public struct PrefixCacheTracker: Sendable {
     public struct TurnEntry: Sendable, Equatable {
         public let role: String
@@ -42,6 +136,7 @@ public struct PrefixCacheTracker: Sendable {
     private var cachedSystemPrompt: String?
     private var cachedSystemTokens: Int = 0
     private var cachedTurns: [TurnEntry] = []
+    public private(set) var cachedTokenIDs: [Int] = []
     public private(set) var branchTruncationsCount: Int = 0
 
     public init() {}
@@ -54,12 +149,13 @@ public struct PrefixCacheTracker: Sendable {
         cachedTurns.count
     }
 
-    /// Resets all cached prefix state when a model is unloaded or evicted.
+    /// Resets all cached prefix state when a model is unloaded, evicted, or cleared.
     public mutating func reset() {
         hasEvaluated = false
         cachedSystemPrompt = nil
         cachedSystemTokens = 0
         cachedTurns.removeAll()
+        cachedTokenIDs.removeAll()
         branchTruncationsCount = 0
     }
 
@@ -68,6 +164,31 @@ public struct PrefixCacheTracker: Sendable {
         guard !trimmed.isEmpty else { return 0 }
         let words = trimmed.split(whereSeparator: \.isWhitespace).count
         return max(2, words * 2)
+    }
+
+    /// Evaluates exact post-template token ID prefix overlap against `cachedTokenIDs`.
+    /// Always leaves at least 1 token to feed into `generate()` so logits are produced.
+    public mutating func evaluateTokenIDs(_ promptTokenIDs: [Int]) -> (commonPrefixCount: Int, truncatedTrailingCount: Int) {
+        guard !cachedTokenIDs.isEmpty, !promptTokenIDs.isEmpty else {
+            cachedTokenIDs = promptTokenIDs
+            return (0, 0)
+        }
+        let limit = min(cachedTokenIDs.count, max(0, promptTokenIDs.count - 1))
+        var common = 0
+        while common < limit && cachedTokenIDs[common] == promptTokenIDs[common] {
+            common += 1
+        }
+        let truncated = max(0, cachedTokenIDs.count - common)
+        if common > 0 && truncated > 0 {
+            branchTruncationsCount += 1
+        }
+        cachedTokenIDs = promptTokenIDs
+        return (common, truncated)
+    }
+
+    public mutating func appendGeneratedTokenIDs(_ tokenIDs: [Int]) {
+        guard !tokenIDs.isEmpty else { return }
+        cachedTokenIDs.append(contentsOf: tokenIDs)
     }
 
     /// Evaluates how much of `system` + `messages` reuses the cached KV prefix and updates
@@ -108,6 +229,7 @@ public struct PrefixCacheTracker: Sendable {
             cachedSystemPrompt = normalizedSystem
             cachedSystemTokens = sysTokens
             cachedTurns = turnEntries
+            cachedTokenIDs.removeAll()
             return CacheReport(
                 promptTokens: totalPromptTokens,
                 cachedTokens: 0,
@@ -134,6 +256,7 @@ public struct PrefixCacheTracker: Sendable {
                 )
             }
             cachedTurns = turnEntries
+            cachedTokenIDs.removeAll()
             return CacheReport(
                 promptTokens: totalPromptTokens,
                 cachedTokens: 0,
@@ -172,6 +295,7 @@ public struct PrefixCacheTracker: Sendable {
         cachedTurns = turnEntries
 
         guard matchedTurnCount > 0 else {
+            cachedTokenIDs.removeAll()
             return CacheReport(
                 promptTokens: totalPromptTokens,
                 cachedTokens: 0,
@@ -230,9 +354,9 @@ public enum ProviderStreamEvent: Sendable {
 }
 
 /// Single canonical token-streaming state machine shared by `MLXSwiftProvider`, `CoreAIProvider`,
-/// and `GGUFSubprocessProvider`. Centralizes `RequestRegistry` polling (`isAborted`, `isReasoningEndRequested`),
-/// `ReasoningParser` state transitions (`forceEndReasoning()`, `finalize()`), `StripSpecials` scrubbing,
-/// and final `CacheReport` / `SpeculativeReport` assembly.
+/// and `GGUFSubprocessProvider`. Centralizes immediate `RequestRegistry` cancellation,
+/// `ReasoningParser` state transitions (`forceEndReasoning()`, `thinkingBudget`), `StripSpecials`,
+/// multi-chunk `StopSequenceFilter`, and `CacheReport` / `SpeculativeReport` / phase timing assembly.
 public enum StreamingPipeline {
     public static func transformEventStream(
         requestID: String,
@@ -242,6 +366,9 @@ public enum StreamingPipeline {
         reasoningFormat: ReasoningFormat? = nil,
         thinkingEnabled: Bool = true,
         strippableSpecialTokens: [String]? = nil,
+        stopSequences: [String] = [],
+        maxTokens: Int? = nil,
+        thinkingBudget: Int? = nil,
         computePlacement: ComputePlacement,
         registry: RequestRegistry,
         onReasoningEndHook: (@Sendable () async -> Void)? = nil,
@@ -249,19 +376,52 @@ public enum StreamingPipeline {
         onComplete: (@Sendable (String) async -> Void)? = nil,
         producer: @escaping @Sendable (AsyncThrowingStream<ProviderStreamEvent, Error>.Continuation) async throws -> Void
     ) -> AsyncThrowingStream<GenerationChunk, Error> {
+        final class ProducerTaskBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var task: Task<Void, Never>?
+            func set(_ t: Task<Void, Never>) {
+                lock.lock()
+                task = t
+                lock.unlock()
+            }
+            func cancel() {
+                lock.lock()
+                let t = task
+                lock.unlock()
+                t?.cancel()
+            }
+        }
+        let producerBox = ProducerTaskBox()
+
         let events = AsyncThrowingStream<ProviderStreamEvent, Error> { eventCont in
-            Task {
+            let pTask = Task {
                 do {
                     try await producer(eventCont)
+                    eventCont.finish()
+                } catch is CancellationError {
+                    eventCont.finish()
+                } catch let urlErr as URLError where urlErr.code == .cancelled {
                     eventCont.finish()
                 } catch {
                     eventCont.finish(throwing: error)
                 }
             }
+            producerBox.set(pTask)
+            eventCont.onTermination = { _ in
+                pTask.cancel()
+            }
+        }
+
+        // Register synchronous abort handler so `DELETE /v1/requests/{id}` cancels prefill / HTTP reads immediately
+        registry.addCancelHandler(for: requestID) {
+            producerBox.cancel()
+            if let onAbortHook {
+                Task { await onAbortHook() }
+            }
         }
 
         return AsyncThrowingStream { continuation in
-            Task {
+            let consumerTask = Task {
                 var reasoningParser: ReasoningParser
                 if let reasoningFormat {
                     reasoningParser = ReasoningParser(
@@ -275,7 +435,10 @@ public enum StreamingPipeline {
                 var stripSpecials = StripSpecials(
                     tokens: strippableSpecialTokens ?? StripSpecials.defaultSpecialTokens
                 )
+                var stopFilter = StopSequenceFilter(stopSequences: stopSequences)
                 var generatedCount = 0
+                var thinkingTokenCount = 0
+                var contentTokenCount = 0
                 var accumulatedVisibleText = ""
                 var promptTokens = cacheReport.promptTokens
                 var cachedTokens = cacheReport.cachedTokens
@@ -284,26 +447,80 @@ public enum StreamingPipeline {
                 var generationTPS = 0.0
                 var observedSpecReport = defaultSpeculativeReport
                 var firedReasoningEndHook = false
+                var finalStopReason: StopReason = .endTurn
                 let memGB = Double(HardwareMemoryMonitor.snapshot().processResidentMB) / 1024.0
 
+                let startWall = Date.timeIntervalSinceReferenceDate
+                var firstTokenWall: TimeInterval?
+                var thinkingStartWall: TimeInterval?
+                var thinkingEndWall: TimeInterval?
+                var contentStartWall: TimeInterval?
+
+                func recordTokenTiming(hasThinking: Bool, hasContent: Bool) {
+                    let now = Date.timeIntervalSinceReferenceDate
+                    if firstTokenWall == nil && (hasThinking || hasContent) {
+                        firstTokenWall = now
+                    }
+                    if hasThinking {
+                        if thinkingStartWall == nil { thinkingStartWall = now }
+                        thinkingEndWall = now
+                    }
+                    if hasContent {
+                        if contentStartWall == nil { contentStartWall = now }
+                        if thinkingStartWall != nil && thinkingEndWall == nil {
+                            thinkingEndWall = now
+                        }
+                    }
+                }
+
+                func buildTimingMetrics() -> (ttft: Double?, thinkDur: Double?, contentDur: Double?, genDur: Double, computedGenTPS: Double) {
+                    let endWall = Date.timeIntervalSinceReferenceDate
+                    let genDurMs = max(0.0, (endWall - startWall) * 1000.0)
+                    let ttftMs = firstTokenWall.map { max(0.0, ($0 - startWall) * 1000.0) }
+                    let thinkMs: Double? = if let ts = thinkingStartWall {
+                        max(0.0, ((thinkingEndWall ?? contentStartWall ?? endWall) - ts) * 1000.0)
+                    } else {
+                        nil
+                    }
+                    let contentMs: Double? = if let cs = contentStartWall {
+                        max(0.0, (endWall - cs) * 1000.0)
+                    } else {
+                        nil
+                    }
+                    let decodeSecs = max(1e-4, endWall - (firstTokenWall ?? startWall))
+                    let calcTPS = generatedCount > 0 ? (Double(generatedCount) / decodeSecs) : 0.0
+                    return (ttftMs, thinkMs, contentMs, genDurMs, calcTPS)
+                }
+
                 do {
-                    for try await event in events {
-                        let state = await registry.state(for: requestID)
+                    streamLoop: for try await event in events {
+                        let state = registry.state(for: requestID)
                         if state.isAborted || Task.isCancelled {
+                            producerBox.cancel()
                             if let onAbortHook {
                                 await onAbortHook()
                             }
                             let flushed = reasoningParser.finalize()
-                            let cleanText = stripSpecials.feed(flushed.text) + stripSpecials.finalize()
+                            let rawTail = stripSpecials.feed(flushed.text) + stripSpecials.finalize()
+                            let (filteredTail, _) = stopFilter.feed(rawTail)
+                            let flushedStop = stopFilter.flush()
+                            let cleanText = filteredTail + flushedStop
                             accumulatedVisibleText.append(cleanText)
+                            let timings = buildTimingMetrics()
                             continuation.yield(
                                 GenerationChunk(
                                     text: cleanText,
                                     thinking: flushed.thinking,
                                     tokenCount: generatedCount,
+                                    thinkingTokens: thinkingTokenCount,
+                                    contentTokens: contentTokenCount,
                                     promptTokens: promptTokens,
-                                    generationTPS: generationTPS,
+                                    generationTPS: generationTPS > 0 ? generationTPS : timings.computedGenTPS,
                                     promptTPS: promptTPS,
+                                    ttftMs: timings.ttft,
+                                    thinkingDurationMs: timings.thinkDur,
+                                    contentDurationMs: timings.contentDur,
+                                    generationDurationMs: timings.genDur,
                                     peakMemoryGB: memGB,
                                     stopReason: .cancelled,
                                     cacheReport: cacheReport,
@@ -315,7 +532,13 @@ public enum StreamingPipeline {
                             return
                         }
 
-                        if state.isReasoningEndRequested {
+                        let budgetExceeded = if let budget = thinkingBudget, budget > 0 {
+                            thinkingTokenCount >= budget && !reasoningParser.reasoningEndedForced
+                        } else {
+                            false
+                        }
+
+                        if state.isReasoningEndRequested || budgetExceeded {
                             if !firedReasoningEndHook {
                                 firedReasoningEndHook = true
                                 if let onReasoningEndHook {
@@ -324,14 +547,18 @@ public enum StreamingPipeline {
                             }
                             if !reasoningParser.reasoningEndedForced {
                                 let forced = reasoningParser.forceEndReasoning()
-                                let cleanForcedText = stripSpecials.feed(forced.text)
+                                let scrubbedForced = stripSpecials.feed(forced.text)
+                                let (cleanForcedText, matched) = stopFilter.feed(scrubbedForced)
                                 accumulatedVisibleText.append(cleanForcedText)
+                                recordTokenTiming(hasThinking: !forced.thinking.isEmpty, hasContent: !cleanForcedText.isEmpty)
                                 if !cleanForcedText.isEmpty || !forced.thinking.isEmpty {
                                     continuation.yield(
                                         GenerationChunk(
                                             text: cleanForcedText,
                                             thinking: forced.thinking,
                                             tokenCount: generatedCount,
+                                            thinkingTokens: thinkingTokenCount,
+                                            contentTokens: contentTokenCount,
                                             promptTokens: promptTokens,
                                             generationTPS: generationTPS,
                                             promptTPS: promptTPS,
@@ -339,6 +566,11 @@ public enum StreamingPipeline {
                                             activeComputePlacement: computePlacement
                                         )
                                     )
+                                }
+                                if matched != nil {
+                                    finalStopReason = .stopSequence
+                                    producerBox.cancel()
+                                    break streamLoop
                                 }
                             }
                         }
@@ -347,14 +579,24 @@ public enum StreamingPipeline {
                         case .rawToken(let rawTok):
                             generatedCount += 1
                             let delta = reasoningParser.feed(rawTok)
-                            let cleanText = stripSpecials.feed(delta.text)
+                            let scrubbedText = stripSpecials.feed(delta.text)
+                            let (cleanText, matched) = stopFilter.feed(scrubbedText)
+                            if !delta.thinking.isEmpty {
+                                thinkingTokenCount += 1
+                            }
+                            if !cleanText.isEmpty || (!scrubbedText.isEmpty && matched == nil) {
+                                contentTokenCount += 1
+                            }
                             accumulatedVisibleText.append(cleanText)
+                            recordTokenTiming(hasThinking: !delta.thinking.isEmpty, hasContent: !cleanText.isEmpty)
                             if !cleanText.isEmpty || !delta.thinking.isEmpty {
                                 continuation.yield(
                                     GenerationChunk(
                                         text: cleanText,
                                         thinking: delta.thinking,
                                         tokenCount: generatedCount,
+                                        thinkingTokens: thinkingTokenCount,
+                                        contentTokens: contentTokenCount,
                                         promptTokens: promptTokens,
                                         generationTPS: generationTPS,
                                         promptTPS: promptTPS,
@@ -363,31 +605,29 @@ public enum StreamingPipeline {
                                     )
                                 )
                             }
+                            if matched != nil {
+                                finalStopReason = .stopSequence
+                                producerBox.cancel()
+                                break streamLoop
+                            }
+
                         case .splitReasoning(let thinkTok):
-                            generatedCount += 1
                             if reasoningParser.reasoningEndedForced {
-                                let cleanText = stripSpecials.feed(thinkTok)
-                                accumulatedVisibleText.append(cleanText)
-                                if !cleanText.isEmpty {
-                                    continuation.yield(
-                                        GenerationChunk(
-                                            text: cleanText,
-                                            thinking: "",
-                                            tokenCount: generatedCount,
-                                            promptTokens: promptTokens,
-                                            generationTPS: generationTPS,
-                                            promptTPS: promptTPS,
-                                            peakMemoryGB: memGB,
-                                            activeComputePlacement: computePlacement
-                                        )
-                                    )
-                                }
-                            } else if thinkingEnabled && !thinkTok.isEmpty {
+                                // Suppress buffered upstream reasoning chunks after forced reasoning end
+                                // so internal chain-of-thought never leaks into visible assistant output.
+                                continue
+                            }
+                            generatedCount += 1
+                            if thinkingEnabled && !thinkTok.isEmpty {
+                                thinkingTokenCount += 1
+                                recordTokenTiming(hasThinking: true, hasContent: false)
                                 continuation.yield(
                                     GenerationChunk(
                                         text: "",
                                         thinking: thinkTok,
                                         tokenCount: generatedCount,
+                                        thinkingTokens: thinkingTokenCount,
+                                        contentTokens: contentTokenCount,
                                         promptTokens: promptTokens,
                                         generationTPS: generationTPS,
                                         promptTPS: promptTPS,
@@ -396,16 +636,24 @@ public enum StreamingPipeline {
                                     )
                                 )
                             }
+
                         case .splitContent(let contentTok):
                             generatedCount += 1
-                            let cleanText = stripSpecials.feed(contentTok)
+                            let scrubbedText = stripSpecials.feed(contentTok)
+                            let (cleanText, matched) = stopFilter.feed(scrubbedText)
+                            if !cleanText.isEmpty || (!scrubbedText.isEmpty && matched == nil) {
+                                contentTokenCount += 1
+                            }
                             accumulatedVisibleText.append(cleanText)
+                            recordTokenTiming(hasThinking: false, hasContent: !cleanText.isEmpty)
                             if !cleanText.isEmpty {
                                 continuation.yield(
                                     GenerationChunk(
                                         text: cleanText,
                                         thinking: "",
                                         tokenCount: generatedCount,
+                                        thinkingTokens: thinkingTokenCount,
+                                        contentTokens: contentTokenCount,
                                         promptTokens: promptTokens,
                                         generationTPS: generationTPS,
                                         promptTPS: promptTPS,
@@ -414,6 +662,12 @@ public enum StreamingPipeline {
                                     )
                                 )
                             }
+                            if matched != nil {
+                                finalStopReason = .stopSequence
+                                producerBox.cancel()
+                                break streamLoop
+                            }
+
                         case let .telemetry(pTok, cTok, pTPS, gTPS, spec):
                             if let pTok { promptTokens = pTok }
                             if let cTok {
@@ -424,12 +678,35 @@ public enum StreamingPipeline {
                             if let gTPS { generationTPS = gTPS }
                             if let spec { observedSpecReport = spec }
                         }
+
+                        if let limit = maxTokens, limit > 0, generatedCount >= limit {
+                            finalStopReason = .maxTokens
+                            producerBox.cancel()
+                            break streamLoop
+                        }
+                    }
+
+                    // Check once more if abort raced with producer stream completion
+                    if registry.state(for: requestID).isAborted || Task.isCancelled {
+                        finalStopReason = .cancelled
                     }
 
                     let tail = reasoningParser.finalize()
-                    let tailText = stripSpecials.feed(tail.text) + stripSpecials.finalize()
+                    let rawTailText = stripSpecials.feed(tail.text) + stripSpecials.finalize()
+                    let tailText: String
+                    if finalStopReason == .stopSequence {
+                        tailText = ""
+                    } else {
+                        let (filteredTail, matched) = stopFilter.feed(rawTailText)
+                        if matched != nil {
+                            finalStopReason = .stopSequence
+                            tailText = filteredTail
+                        } else {
+                            tailText = filteredTail + stopFilter.flush()
+                        }
+                    }
                     accumulatedVisibleText.append(tailText)
-                    if let onComplete {
+                    if finalStopReason != .cancelled, let onComplete {
                         await onComplete(accumulatedVisibleText)
                     }
                     let finalCache: CacheReport = sawObservedCache
@@ -441,17 +718,24 @@ public enum StreamingPipeline {
                             cause: cachedTokens > 0 ? nil : cacheReport.cause
                         )
                         : cacheReport
+                    let timings = buildTimingMetrics()
 
                     continuation.yield(
                         GenerationChunk(
                             text: tailText,
-                            thinking: tail.thinking,
+                            thinking: finalStopReason == .stopSequence ? "" : tail.thinking,
                             tokenCount: generatedCount,
+                            thinkingTokens: thinkingTokenCount,
+                            contentTokens: contentTokenCount,
                             promptTokens: promptTokens,
-                            generationTPS: generationTPS,
+                            generationTPS: generationTPS > 0 ? generationTPS : timings.computedGenTPS,
                             promptTPS: promptTPS,
+                            ttftMs: timings.ttft,
+                            thinkingDurationMs: timings.thinkDur,
+                            contentDurationMs: timings.contentDur,
+                            generationDurationMs: timings.genDur,
                             peakMemoryGB: memGB,
-                            stopReason: .endTurn,
+                            stopReason: finalStopReason,
                             cacheReport: finalCache,
                             speculativeReport: observedSpecReport,
                             activeComputePlacement: computePlacement
@@ -459,8 +743,13 @@ public enum StreamingPipeline {
                     )
                     continuation.finish()
                 } catch {
+                    producerBox.cancel()
                     continuation.finish(throwing: error)
                 }
+            }
+            continuation.onTermination = { _ in
+                producerBox.cancel()
+                consumerTask.cancel()
             }
         }
     }
@@ -474,6 +763,9 @@ public enum StreamingPipeline {
         reasoningFormat: ReasoningFormat? = nil,
         thinkingEnabled: Bool = true,
         strippableSpecialTokens: [String]? = nil,
+        stopSequences: [String] = [],
+        maxTokens: Int? = nil,
+        thinkingBudget: Int? = nil,
         computePlacement: ComputePlacement,
         registry: RequestRegistry,
         onComplete: (@Sendable (String) async -> Void)? = nil
@@ -486,11 +778,15 @@ public enum StreamingPipeline {
             reasoningFormat: reasoningFormat,
             thinkingEnabled: thinkingEnabled,
             strippableSpecialTokens: strippableSpecialTokens,
+            stopSequences: stopSequences,
+            maxTokens: maxTokens,
+            thinkingBudget: thinkingBudget,
             computePlacement: computePlacement,
             registry: registry,
             onComplete: onComplete
         ) { eventCont in
             for tok in rawTokens {
+                try Task.checkCancellation()
                 eventCont.yield(.rawToken(tok))
             }
         }

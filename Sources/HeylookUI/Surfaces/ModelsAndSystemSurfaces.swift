@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import SwiftUI
+import UniformTypeIdentifiers
 import HeylookCore
 import HeylookEmbeddings
 import HeylookEngines
@@ -8,19 +9,30 @@ import HeylookServer
 
 #if os(macOS)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
 #endif
 
 // MARK: - 4. Models & Provenance Inspector Surface
 
 struct ModelsInspectorSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
+    @State private var showScanFolderImporter: Bool = false
 
     var body: some View {
         let filteredModels = viewModel.filteredModels
         VStack(spacing: 0) {
             ModelsTopActionBar(
                 viewModel: viewModel,
-                modelCount: filteredModels.count
+                modelCount: filteredModels.count,
+                onAddScanFolder: { showScanFolderImporter = true }
+            )
+
+            Divider()
+
+            ScanFoldersStripView(
+                viewModel: viewModel,
+                onAddScanFolder: { showScanFolderImporter = true }
             )
 
             Divider()
@@ -65,18 +77,40 @@ struct ModelsInspectorSurface: View {
                 initialModel: viewModel.convertingSourceModel
             )
         }
+        .fileImporter(
+            isPresented: $showScanFolderImporter,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: true
+        ) { result in
+            if case .success(let urls) = result {
+                Task {
+                    for url in urls {
+                        await viewModel.addModelScanFolder(url)
+                    }
+                }
+            }
+        }
     }
 }
 
 private struct ModelsTopActionBar: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
     let modelCount: Int
+    let onAddScanFolder: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
             Text("Registered Models (\(modelCount))")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
+            if HeylookConfig.isModelConfigReadOnly {
+                Label("READ-ONLY", systemImage: "lock.fill")
+                    .font(.caption2.monospaced().weight(.bold))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.15), in: Capsule())
+                    .foregroundStyle(.orange)
+            }
             if let filter = viewModel.selectedProviderFilter {
                 Button {
                     viewModel.selectedProviderFilter = nil
@@ -91,6 +125,12 @@ private struct ModelsTopActionBar: View {
                 .controlSize(.mini)
             }
             Spacer()
+            Button(action: onAddScanFolder) {
+                Label("Add Folder…", systemImage: "folder.badge.plus")
+            }
+            .buttonStyle(.glass)
+            .controlSize(.small)
+            .disabled(HeylookConfig.isModelConfigReadOnly)
             Button {
                 viewModel.convertingSourceModel = nil
                 viewModel.showMLXConverterSheet = true
@@ -129,34 +169,164 @@ private struct ModelsTopActionBar: View {
     }
 }
 
+private struct ScanFoldersStripView: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    let onAddScanFolder: () -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                Label("scan_folders:", systemImage: "folder")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                if viewModel.config.scanFolders.isEmpty {
+                    Text("None configured in heylook.toml")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ForEach(viewModel.config.scanFolders, id: \.self) { folder in
+                        HStack(spacing: 4) {
+                            Text(folder)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .lineLimit(1)
+                            if !HeylookConfig.isModelConfigReadOnly {
+                                Button {
+                                    Task { await viewModel.removeModelScanFolder(folder) }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .frame(minWidth: 28, minHeight: 28)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help("Remove scan folder from heylook.toml")
+                            }
+                        }
+                        .padding(.leading, 8)
+                        .padding(.trailing, HeylookConfig.isModelConfigReadOnly ? 8 : 2)
+                        .background(Capsule().fill(Color.secondary.opacity(0.11)))
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+        }
+        .background(Color.secondary.opacity(0.03))
+    }
+}
+
 private struct ModelRegistryRowView: View {
     let model: EngineDescription
     @Bindable var viewModel: HeylookWorkbenchViewModel
 
+    private static let quickContextPresets: [Int] = [2048, 4096, 8192, 16384, 32768, 65536, 131072]
+
     var body: some View {
+        let isLoading = viewModel.loadingModelIDs.contains(model.modelID)
+        let isSelected = viewModel.selectedModelID == model.modelID
+        let isPureEmbedding = model.supportsEmbeddings.value
+        let hasSidecar = viewModel.hasSidecarFileOnDisk(for: model)
+        let fit = viewModel.assessModelRAMFit(model)
+        let fitBadge: (label: String, color: Color) = {
+            if !fit.fitsInMemory {
+                return ("EXCEEDS RAM", .red)
+            } else if fit.remainingHeadroomGB < 2.0 {
+                return (String(format: "TIGHT (+%.1fGB)", fit.remainingHeadroomGB), .orange)
+            } else {
+                return (String(format: "FITS (+%.1fGB)", fit.remainingHeadroomGB), .green)
+            }
+        }()
+
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Circle()
-                    .fill(model.isLoaded ? Color.green : Color.secondary.opacity(0.35))
-                    .frame(width: 8, height: 8)
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Circle()
+                        .fill(model.isLoaded ? Color.green : Color.secondary.opacity(0.35))
+                        .frame(width: 8, height: 8)
+                }
+
                 Text(model.modelID)
                     .font(.headline)
+
                 Text(model.provider.displayName)
                     .font(.caption2.monospaced().weight(.bold))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background(Color.accentColor.opacity(0.15), in: Capsule())
+
                 Text(model.computePlacement.value.label)
                     .font(.caption2.monospaced())
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background(Color.green.opacity(0.15), in: Capsule())
+
+                Text(fitBadge.label)
+                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(fitBadge.color.opacity(0.15), in: Capsule())
+                    .foregroundStyle(fitBadge.color)
+                    .help(String(format: "Weights %.1f GB + KV %.2f GB vs %.1f GB working set (recommended ctx %dk)", fit.modelWeightGB + fit.mmprojWeightGB + fit.drafterWeightGB, fit.estimatedKVGB, fit.availableWorkingSetGB, fit.recommendedCtxSize / 1024))
+
+                if fit.droppedDrafterForMemory {
+                    Text("MTP DROPPED")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.orange)
+                }
+
                 if model.isPinned {
                     Text("PINNED")
                         .font(.caption2.monospaced().weight(.bold))
                         .foregroundStyle(.orange)
                 }
+
+                if hasSidecar {
+                    Text("SIDECAR")
+                        .font(.caption2.monospaced().weight(.semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.purple.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.purple)
+                }
+
                 Spacer()
+
+                if !isPureEmbedding {
+                    Menu {
+                        ForEach(Self.quickContextPresets, id: \.self) { size in
+                            Button {
+                                Task { await viewModel.applyQuickContextSize(size, for: model) }
+                            } label: {
+                                HStack {
+                                    Text("\(size / 1024)k (\(size) tokens)")
+                                    if model.contextSize.value == size {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        Text("ctx \(max(1, model.contextSize.value / 1024))k")
+                            .font(.caption2.monospaced())
+                    }
+                    #if os(macOS)
+                    .menuStyle(.borderedButton)
+                    #else
+                    .menuStyle(.button)
+                    #endif
+                    .controlSize(.small)
+                    .fixedSize()
+                    .disabled(HeylookConfig.isModelConfigReadOnly)
+                    .help("Quick-set context window in model.heylook.toml")
+                }
 
                 Button(model.isPinned ? "Unpin" : "Pin") {
                     Task { await viewModel.toggleModelPin(model) }
@@ -164,11 +334,21 @@ private struct ModelRegistryRowView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
 
-                Button(model.isLoaded ? "Unload" : "Load") {
+                Button {
                     Task { await viewModel.toggleModelLoaded(model) }
+                } label: {
+                    if isLoading {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.mini)
+                            Text("Loading…")
+                        }
+                    } else {
+                        Text(model.isLoaded ? "Unload" : "Load")
+                    }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .disabled(isLoading)
 
                 if model.provider == .mlx {
                     Button {
@@ -189,11 +369,22 @@ private struct ModelRegistryRowView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
 
-                Button("Select") {
-                    viewModel.selectedModelID = model.modelID
+                if isPureEmbedding {
+                    Text("Embeddings")
+                        .font(.caption2.monospaced().weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.purple.opacity(0.14), in: Capsule())
+                        .foregroundStyle(.purple)
+                        .help("Embedding models run on the Embeddings & ANE surface and /v1/embeddings")
+                } else {
+                    Button(isSelected ? "Active" : "Select") {
+                        viewModel.selectGenerationModel(model.modelID)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(isSelected)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
             }
 
             Text(
@@ -202,13 +393,15 @@ private struct ModelRegistryRowView: View {
             .font(.caption.monospaced())
             .foregroundStyle(.secondary)
 
-            HStack(spacing: 8) {
-                ForEach(model.tags, id: \.self) { tag in
-                    Text(tag)
-                        .font(.caption2.monospaced())
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.secondary.opacity(0.12), in: Capsule())
+            if !model.tags.isEmpty {
+                HStack(spacing: 8) {
+                    ForEach(model.tags, id: \.self) { tag in
+                        Text(tag)
+                            .font(.caption2.monospaced())
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.12), in: Capsule())
+                    }
                 }
             }
 
@@ -318,6 +511,8 @@ private struct ProvenanceDetailRow: View {
     }
 }
 
+// MARK: - Pure-Swift MLX Checkpoint Quantizer Sheet
+
 private struct MLXModelConverterSheet: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
     let initialModel: EngineDescription?
@@ -333,6 +528,8 @@ private struct MLXModelConverterSheet: View {
     @State private var isConverting: Bool = false
     @State private var progressMessage: String = ""
     @State private var conversionError: String?
+    @State private var showFolderImporter: Bool = false
+    @State private var pickingOutputFolder: Bool = false
 
     private var activeSpec: MLXConversionSpec {
         MLXConversionSpec(
@@ -380,26 +577,24 @@ private struct MLXModelConverterSheet: View {
                         .onChange(of: sourcePath) {
                             autoUpdateOutputPathIfEmptyOrDefault()
                         }
-                    #if os(macOS)
                     Button("Browse…") {
-                        pickFolder(isOutput: false)
+                        pickingOutputFolder = false
+                        showFolderImporter = true
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    #endif
                 }
 
                 HStack {
                     TextField("Output quantized directory", text: $outputPath)
                         .textFieldStyle(.roundedBorder)
                         .font(.caption.monospaced())
-                    #if os(macOS)
                     Button("Browse…") {
-                        pickFolder(isOutput: true)
+                        pickingOutputFolder = true
+                        showFolderImporter = true
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    #endif
                 }
             }
 
@@ -520,6 +715,21 @@ private struct MLXModelConverterSheet: View {
                 outputPath = "\(initialModel.modelPath)-MLX-\(bits)bit"
             }
         }
+        .fileImporter(
+            isPresented: $showFolderImporter,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            guard case .success(let urls) = result, let url = urls.first else { return }
+            _ = url.startAccessingSecurityScopedResource()
+            defer { url.stopAccessingSecurityScopedResource() }
+            if pickingOutputFolder {
+                outputPath = url.path
+            } else {
+                sourcePath = url.path
+                autoUpdateOutputPathIfEmptyOrDefault()
+            }
+        }
     }
 
     private func autoUpdateOutputPathIfEmptyOrDefault() {
@@ -559,25 +769,32 @@ private struct MLXModelConverterSheet: View {
             }
         }
     }
+}
 
-    #if os(macOS)
-    private func pickFolder(isOutput: Bool) {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = isOutput
-        panel.allowsMultipleSelection = false
-        panel.prompt = isOutput ? "Select Output Folder" : "Select Source Checkpoint"
-        if panel.runModal() == .OK, let url = panel.url {
-            if isOutput {
-                outputPath = url.path
-            } else {
-                sourcePath = url.path
-                autoUpdateOutputPathIfEmptyOrDefault()
-            }
+// MARK: - Override-Only Sidecar (`model.heylook.toml`) & Chat Template Editor Sheet
+
+private enum TriStateOverride: String, CaseIterable, Identifiable {
+    case inherit = "inherit"
+    case enabled = "true"
+    case disabled = "false"
+
+    var id: String { rawValue }
+
+    init(boolValue: Bool?) {
+        switch boolValue {
+        case nil: self = .inherit
+        case true?: self = .enabled
+        case false?: self = .disabled
         }
     }
-    #endif
+
+    var boolValue: Bool? {
+        switch self {
+        case .inherit: return nil
+        case .enabled: return true
+        case .disabled: return false
+        }
+    }
 }
 
 private struct ModelSidecarEditorSheet: View {
@@ -586,31 +803,56 @@ private struct ModelSidecarEditorSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var loadedBaseSidecar: ModelSidecarConfig = ModelSidecarConfig()
-    @State private var pinned: Bool = false
-    @State private var computePlacement: ComputePlacement = .mlxGPU
-    @State private var ctxSize: Int = 8192
-    @State private var flashAttn: Bool = true
-    @State private var supportsVision: Bool = false
-    @State private var supportsThinking: Bool = true
+    @State private var sidecarExistsOnDisk: Bool = false
+
+    @State private var pinnedState: TriStateOverride = .inherit
+    @State private var computePlacementTag: String = "__inherit__"
+    @State private var ctxSizeText: String = ""
+    @State private var flashAttnState: TriStateOverride = .inherit
+    @State private var supportsVisionState: TriStateOverride = .inherit
+    @State private var supportsThinkingState: TriStateOverride = .inherit
     @State private var imageMaxTokensText: String = ""
     @State private var draftModelText: String = ""
-    @State private var temperature: Double = 0.7
-    @State private var topP: Double = 0.95
-    @State private var thinkingBudget: Int = 4096
+    @State private var specTypeText: String = ""
+
+    @State private var temperatureText: String = ""
+    @State private var topPText: String = ""
+    @State private var topKText: String = ""
+    @State private var minPText: String = ""
+    @State private var repetitionPenaltyText: String = ""
+    @State private var presencePenaltyText: String = ""
+    @State private var maxTokensText: String = ""
+    @State private var thinkingBudgetText: String = ""
     @State private var tagsText: String = ""
     @State private var unsetText: String = ""
+
     @State private var templateSourceLabel: String = "default_chatml"
     @State private var hasTemplateOverride: Bool = false
+    @State private var isAuthoringTemplateOverride: Bool = false
     @State private var chatTemplateText: String = ""
+    @State private var templateState: HeylookConfig.ChatTemplateState? = nil
+    @State private var templateSyntaxError: String? = nil
+    @State private var validationError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Edit model.heylook.toml Sidecar & Chat Template")
-                        .font(.headline)
-                    Text(model.modelID)
-                        .font(.caption.monospaced())
+                    HStack(spacing: 8) {
+                        Text("Override-Only Sidecar (model.heylook.toml) & Chat Template")
+                            .font(.headline)
+                        Text(sidecarExistsOnDisk ? "On Disk" : "Derived Only (No Sidecar)")
+                            .font(.caption2.monospaced().weight(.semibold))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(
+                                (sidecarExistsOnDisk ? Color.orange : Color.secondary).opacity(0.15),
+                                in: Capsule()
+                            )
+                            .foregroundStyle(sidecarExistsOnDisk ? .orange : .secondary)
+                    }
+                    Text("\(model.modelID) — Leave fields blank or 'Inherit' so untouched vendor/derived values are never frozen.")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -627,160 +869,483 @@ private struct ModelSidecarEditorSheet: View {
 
             Divider()
 
-            Toggle("Pin Model in Unified Memory (Exempt from GPU LRU Eviction)", isOn: $pinned)
-            HStack(spacing: 16) {
-                Picker("Compute Placement (compute_unit)", selection: $computePlacement) {
-                    ForEach(ComputePlacement.allCases, id: \.self) { placement in
-                        Text(placement.label).tag(placement)
-                    }
-                }
-                .pickerStyle(.menu)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    // Load & Capability Overrides
+                    GroupBox("Load-Time & Capability Overrides (Effect: reload)") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 14) {
+                                Picker("Memory Pin (pinned)", selection: $pinnedState) {
+                                    Text("Inherit (\(model.isPinned ? "true" : "false"))").tag(TriStateOverride.inherit)
+                                    Text("Pinned (true)").tag(TriStateOverride.enabled)
+                                    Text("LRU Evictable (false)").tag(TriStateOverride.disabled)
+                                }
+                                .pickerStyle(.menu)
 
-                Stepper("Context Size (ctx_size): \(ctxSize)", value: $ctxSize, in: 2048...1_048_576, step: 4096)
-                    .font(.subheadline.monospacedDigit())
-            }
-            HStack(spacing: 16) {
-                Toggle("Flash Attention (flash_attn)", isOn: $flashAttn)
-                Toggle("Supports Vision (vision)", isOn: $supportsVision)
-                Toggle("Supports Thinking (thinking_capable)", isOn: $supportsThinking)
-            }
-            HStack(spacing: 10) {
-                TextField("Image Max Tokens (image_max_tokens, optional)", text: $imageMaxTokensText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption.monospaced())
-                TextField("Speculative Drafter Path (draft_model, optional)", text: $draftModelText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption.monospaced())
-            }
+                                Picker("Compute Unit", selection: $computePlacementTag) {
+                                    Text("Inherit (\(model.computePlacement.value.label))").tag("__inherit__")
+                                    ForEach(ComputePlacement.allCases, id: \.rawValue) { placement in
+                                        Text(placement.label).tag(placement.rawValue)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                            }
 
-            Divider()
+                            HStack(spacing: 12) {
+                                SidecarOptionalField(
+                                    title: "Context Window (ctx_size)",
+                                    placeholder: "Inherit (\(model.contextSize.value))",
+                                    text: $ctxSizeText
+                                )
+                                SidecarOptionalField(
+                                    title: "Image Max Tokens",
+                                    placeholder: "Inherit (auto)",
+                                    text: $imageMaxTokensText
+                                )
+                            }
 
-            HStack {
-                Text("Default Temperature: \(String(format: "%.2f", temperature))")
-                    .font(.subheadline.monospacedDigit())
-                Slider(value: $temperature, in: 0...2.0)
-            }
-            HStack {
-                Text("Default Top-P: \(String(format: "%.2f", topP))")
-                    .font(.subheadline.monospacedDigit())
-                Slider(value: $topP, in: 0.05...1.0)
-            }
-            Stepper("Default Thinking Budget: \(thinkingBudget)", value: $thinkingBudget, in: 256...65536, step: 512)
-                .font(.subheadline.monospacedDigit())
+                            let previewCtx = Int(ctxSizeText.trimmingCharacters(in: .whitespacesAndNewlines))
+                            let fit = viewModel.assessModelRAMFit(
+                                model,
+                                ctxSizeOverride: previewCtx,
+                                sidecarOverride: loadedBaseSidecar
+                            )
+                            HStack(spacing: 8) {
+                                Image(systemName: fit.fitsInMemory ? "memorychip" : "exclamationmark.triangle.fill")
+                                    .foregroundStyle(fit.fitsInMemory ? (fit.remainingHeadroomGB < 2.0 ? .orange : .green) : .red)
+                                    .font(.caption)
+                                Text(
+                                    String(
+                                        format: "RAM Fit Preview: %.1f GB weights + %.2f GB KV vs %.1f GB working set (%+.1f GB headroom • recommended ctx %dk)",
+                                        fit.modelWeightGB + fit.mmprojWeightGB + fit.drafterWeightGB,
+                                        fit.estimatedKVGB,
+                                        fit.availableWorkingSetGB,
+                                        fit.remainingHeadroomGB,
+                                        max(1, fit.recommendedCtxSize / 1024)
+                                    )
+                                )
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                            }
 
-            TextField("Tags (comma-separated, e.g. chat, vision, mtp)", text: $tagsText)
-                .textFieldStyle(.roundedBorder)
-                .font(.caption.monospaced())
+                            HStack(spacing: 12) {
+                                Picker("Flash Attn", selection: $flashAttnState) {
+                                    Text("Inherit (\(model.flashAttention.value ? "true" : "false"))").tag(TriStateOverride.inherit)
+                                    Text("true").tag(TriStateOverride.enabled)
+                                    Text("false").tag(TriStateOverride.disabled)
+                                }
+                                .pickerStyle(.menu)
 
-            TextField("Unset Keys (comma-separated, e.g. draft_model_path, spec_type)", text: $unsetText)
-                .textFieldStyle(.roundedBorder)
-                .font(.caption.monospaced())
+                                Picker("Vision", selection: $supportsVisionState) {
+                                    Text("Inherit (\(model.supportsVision.value ? "true" : "false"))").tag(TriStateOverride.inherit)
+                                    Text("true").tag(TriStateOverride.enabled)
+                                    Text("false").tag(TriStateOverride.disabled)
+                                }
+                                .pickerStyle(.menu)
 
-            Divider()
+                                Picker("Thinking", selection: $supportsThinkingState) {
+                                    Text("Inherit (\(model.supportsThinking.value ? "true" : "false"))").tag(TriStateOverride.inherit)
+                                    Text("true").tag(TriStateOverride.enabled)
+                                    Text("false").tag(TriStateOverride.disabled)
+                                }
+                                .pickerStyle(.menu)
+                            }
 
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("4-Rung Chat Template Override (chat_template.heylook.jinja)")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if hasTemplateOverride {
-                        Button("Revert Override", role: .destructive) {
-                            Task {
-                                let reverted = await viewModel.revertChatTemplateOverride(for: model)
-                                templateSourceLabel = reverted.source
-                                hasTemplateOverride = reverted.hasOverride
-                                chatTemplateText = reverted.template
+                            HStack(spacing: 12) {
+                                SidecarOptionalField(
+                                    title: "Speculative Drafter (draft_model)",
+                                    placeholder: model.speculativeDrafter.value ?? "Inherit (none)",
+                                    text: $draftModelText
+                                )
+                                SidecarOptionalField(
+                                    title: "Spec Type (spec_type)",
+                                    placeholder: "Inherit (none)",
+                                    text: $specTypeText
+                                )
                             }
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.mini)
+                        .padding(6)
                     }
-                    Button("Save Template Override") {
-                        Task {
-                            let saved = await viewModel.saveChatTemplateOverride(chatTemplateText, for: model)
-                            templateSourceLabel = saved.source
-                            hasTemplateOverride = saved.hasOverride
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                    .disabled(chatTemplateText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
 
-                TextEditor(text: $chatTemplateText)
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(minHeight: 100, maxHeight: 140)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(Color.secondary.opacity(0.22), lineWidth: 1)
+                    // Default Sampler Overrides
+                    GroupBox("Model-Level Sampler Overrides (Effect: next_turn)") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 10) {
+                                SidecarOptionalField(title: "temperature", placeholder: "Inherit", text: $temperatureText)
+                                SidecarOptionalField(title: "top_p", placeholder: "Inherit", text: $topPText)
+                                SidecarOptionalField(title: "top_k", placeholder: "Inherit", text: $topKText)
+                                SidecarOptionalField(title: "min_p", placeholder: "Inherit", text: $minPText)
+                            }
+                            HStack(spacing: 10) {
+                                SidecarOptionalField(title: "repetition_penalty", placeholder: "Inherit", text: $repetitionPenaltyText)
+                                SidecarOptionalField(title: "presence_penalty", placeholder: "Inherit", text: $presencePenaltyText)
+                                SidecarOptionalField(title: "max_tokens", placeholder: "Inherit", text: $maxTokensText)
+                                SidecarOptionalField(
+                                    title: "thinking_budget",
+                                    placeholder: model.thinkingBudget.value.map { "Inherit (\($0))" } ?? "Inherit",
+                                    text: $thinkingBudgetText
+                                )
+                            }
+                            HStack(spacing: 10) {
+                                SidecarOptionalField(
+                                    title: "Tags Override (comma-separated)",
+                                    placeholder: model.tags.isEmpty ? "Inherit (none)" : "Inherit (\(model.tags.joined(separator: ", ")))",
+                                    text: $tagsText
+                                )
+                                SidecarOptionalField(
+                                    title: "Unset Keys (unset = [...])",
+                                    placeholder: "e.g. draft_model, spec_type",
+                                    text: $unsetText
+                                )
+                            }
+                        }
+                        .padding(6)
                     }
+
+                    // 4-Rung Chat Template Override
+                    GroupBox("4-Rung Chat Template Override (chat_template.heylook.jinja)") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) {
+                                Text(
+                                    hasTemplateOverride
+                                        ? "Active local override: chat_template.heylook.jinja"
+                                        : "Read-only preview from \(templateSourceLabel)"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                                if let state = templateState {
+                                    if !state.writable {
+                                        Text("READ-ONLY")
+                                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Capsule().fill(Color.orange.opacity(0.15)))
+                                            .foregroundStyle(.orange)
+                                    }
+                                    if state.modifiedSinceDownload == true {
+                                        Text("MODIFIED SINCE DOWNLOAD")
+                                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Capsule().fill(Color.yellow.opacity(0.2)))
+                                            .foregroundStyle(.orange)
+                                    }
+                                }
+
+                                Spacer()
+
+                                if !hasTemplateOverride && !isAuthoringTemplateOverride {
+                                    Button("Start Override from This") {
+                                        isAuthoringTemplateOverride = true
+                                        templateSyntaxError = viewModel.validateJinjaTemplateSyntax(chatTemplateText)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                    .disabled(templateState?.writable == false)
+                                }
+
+                                if hasTemplateOverride {
+                                    Button("Revert Override", role: .destructive) {
+                                        Task {
+                                            let reverted = await viewModel.revertChatTemplateOverride(for: model)
+                                            templateState = reverted
+                                            templateSourceLabel = reverted.source
+                                            hasTemplateOverride = reverted.hasOverride
+                                            isAuthoringTemplateOverride = false
+                                            chatTemplateText = reverted.template
+                                            templateSyntaxError = nil
+                                        }
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                    .disabled(templateState?.writable == false)
+                                }
+
+                                if hasTemplateOverride || isAuthoringTemplateOverride {
+                                    Button("Save Template Override") {
+                                        Task {
+                                            do {
+                                                let saved = try await viewModel.saveChatTemplateOverride(chatTemplateText, for: model)
+                                                templateState = saved
+                                                templateSourceLabel = saved.source
+                                                hasTemplateOverride = saved.hasOverride
+                                                isAuthoringTemplateOverride = true
+                                                templateSyntaxError = nil
+                                            } catch {
+                                                templateSyntaxError = error.localizedDescription
+                                            }
+                                        }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.mini)
+                                    .disabled(
+                                        chatTemplateText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                            || templateState?.writable == false
+                                            || templateSyntaxError != nil
+                                    )
+                                }
+                            }
+
+                            if let state = templateState {
+                                if let inert = state.inertReason, !inert.isEmpty {
+                                    Label("Template Inert: \(inert)", systemImage: "info.circle.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.orange)
+                                }
+                                if state.stale == true {
+                                    Label("Local override may be stale relative to updated checkpoint tokenizer_config.json.", systemImage: "exclamationmark.triangle.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.orange)
+                                }
+                                if state.prefixStable == false {
+                                    Label(
+                                        "Prefix Unstable (KV cache invalidated across turns): \(state.prefixNote ?? "template mutates history prefix")",
+                                        systemImage: "bolt.trianglebadge.exclamationmark.fill"
+                                    )
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                }
+                                TemplateCapabilitiesStripView(caps: state.caps)
+                            }
+
+                            TextEditor(text: $chatTemplateText)
+                                .font(.system(.caption, design: .monospaced))
+                                .disabled(!hasTemplateOverride && !isAuthoringTemplateOverride)
+                                .opacity((hasTemplateOverride || isAuthoringTemplateOverride) ? 1.0 : 0.78)
+                                .frame(minHeight: 110, maxHeight: 165)
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .strokeBorder(
+                                            templateSyntaxError != nil
+                                                ? Color.red.opacity(0.6)
+                                                : Color.secondary.opacity(0.22),
+                                            lineWidth: 1
+                                        )
+                                }
+                                .onChange(of: chatTemplateText) { _, newValue in
+                                    if hasTemplateOverride || isAuthoringTemplateOverride {
+                                        templateSyntaxError = viewModel.validateJinjaTemplateSyntax(newValue)
+                                    }
+                                }
+
+                            if let syntaxErr = templateSyntaxError {
+                                Label(syntaxErr, systemImage: "xmark.octagon.fill")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.red)
+                            }
+                        }
+                        .padding(6)
+                    }
+                }
+            }
+
+            if let validationError {
+                Text(validationError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
             }
 
             HStack {
                 Button("Cancel") { dismiss() }
                     .buttonStyle(.bordered)
-                Spacer()
-                Button("Save model.heylook.toml") {
-                    let parsedTags = tagsText
-                        .split(separator: ",")
-                        .map { $0.trimmingCharacters(in: .whitespaces) }
-                        .filter { !$0.isEmpty }
-                    let parsedUnset = unsetText
-                        .split(separator: ",")
-                        .map { $0.trimmingCharacters(in: .whitespaces) }
-                        .filter { !$0.isEmpty }
-                    let parsedImageMaxTokens = Int(imageMaxTokensText.trimmingCharacters(in: .whitespacesAndNewlines))
-                    let trimmedDraft = draftModelText.trimmingCharacters(in: .whitespacesAndNewlines)
 
-                    var updatedSidecar = loadedBaseSidecar
-                    updatedSidecar.id = model.modelID
-                    updatedSidecar.provider = model.provider
-                    updatedSidecar.pinned = pinned
-                    updatedSidecar.computePlacement = computePlacement
-                    updatedSidecar.ctxSize = ctxSize
-                    updatedSidecar.flashAttn = flashAttn
-                    updatedSidecar.supportsVision = supportsVision
-                    updatedSidecar.supportsThinking = supportsThinking
-                    updatedSidecar.imageMaxTokens = parsedImageMaxTokens
-                    updatedSidecar.draftModel = trimmedDraft.isEmpty ? nil : trimmedDraft
-                    updatedSidecar.unsetKeys = parsedUnset
-                    updatedSidecar.sampling.temperature = temperature
-                    updatedSidecar.sampling.topP = topP
-                    updatedSidecar.sampling.thinkingBudget = thinkingBudget
-                    updatedSidecar.tags = parsedTags
-
-                    Task {
-                        await viewModel.saveModelSidecar(updatedSidecar, for: model)
-                        dismiss()
+                if sidecarExistsOnDisk {
+                    Button("Remove All Sidecar Overrides", role: .destructive) {
+                        Task {
+                            await viewModel.saveModelSidecar(ModelSidecarConfig(), for: model)
+                            dismiss()
+                        }
                     }
+                    .buttonStyle(.bordered)
+                }
+
+                Spacer()
+
+                Button("Save model.heylook.toml") {
+                    saveSidecarOverrides()
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
-        .frame(minWidth: 580)
+        .frame(minWidth: 660, idealWidth: 720, minHeight: 580)
         .onAppear {
+            sidecarExistsOnDisk = viewModel.hasSidecarFileOnDisk(for: model)
             let loaded = viewModel.loadSidecarConfig(for: model)
             loadedBaseSidecar = loaded
-            pinned = loaded.pinned ?? model.isPinned
-            computePlacement = loaded.computePlacement ?? model.computePlacement.value
-            ctxSize = loaded.ctxSize ?? model.contextSize.value
-            flashAttn = loaded.flashAttn ?? model.flashAttention.value
-            supportsVision = loaded.supportsVision ?? model.supportsVision.value
-            supportsThinking = loaded.supportsThinking ?? model.supportsThinking.value
+
+            pinnedState = TriStateOverride(boolValue: loaded.pinned)
+            computePlacementTag = loaded.computePlacement?.rawValue ?? "__inherit__"
+            ctxSizeText = loaded.ctxSize.map(String.init) ?? ""
+            flashAttnState = TriStateOverride(boolValue: loaded.flashAttn)
+            supportsVisionState = TriStateOverride(boolValue: loaded.supportsVision)
+            supportsThinkingState = TriStateOverride(boolValue: loaded.supportsThinking)
             imageMaxTokensText = loaded.imageMaxTokens.map(String.init) ?? ""
-            draftModelText = loaded.draftModel ?? (model.speculativeDrafter.value ?? "")
-            temperature = loaded.sampling.temperature ?? 0.7
-            topP = loaded.sampling.topP ?? 0.95
-            thinkingBudget = loaded.sampling.thinkingBudget ?? (model.thinkingBudget.value ?? 4096)
-            tagsText = (loaded.tags.isEmpty ? model.tags : loaded.tags).joined(separator: ", ")
+            draftModelText = loaded.draftModel ?? ""
+            specTypeText = loaded.specType ?? ""
+
+            temperatureText = loaded.sampling.temperature.map { String($0) } ?? ""
+            topPText = loaded.sampling.topP.map { String($0) } ?? ""
+            topKText = loaded.sampling.topK.map(String.init) ?? ""
+            minPText = loaded.sampling.minP.map { String($0) } ?? ""
+            repetitionPenaltyText = loaded.sampling.repetitionPenalty.map { String($0) } ?? ""
+            presencePenaltyText = loaded.sampling.presencePenalty.map { String($0) } ?? ""
+            maxTokensText = loaded.sampling.maxTokens.map(String.init) ?? ""
+            thinkingBudgetText = loaded.sampling.thinkingBudget.map(String.init) ?? ""
+            tagsText = loaded.tags.joined(separator: ", ")
             unsetText = loaded.unsetKeys.joined(separator: ", ")
+
             let tmplState = viewModel.loadChatTemplateState(for: model)
+            templateState = tmplState
             templateSourceLabel = tmplState.source
             hasTemplateOverride = tmplState.hasOverride
+            isAuthoringTemplateOverride = tmplState.hasOverride
             chatTemplateText = tmplState.template
+            templateSyntaxError = nil
+        }
+    }
+
+    private func parseOptionalInt(_ raw: String, fieldName: String) throws -> Int? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let v = Int(trimmed) else {
+            throw SidecarValidationError(message: "Invalid integer for \(fieldName): '\(trimmed)'")
+        }
+        return v
+    }
+
+    private func parseOptionalDouble(_ raw: String, fieldName: String) throws -> Double? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let v = Double(trimmed), v.isFinite else {
+            throw SidecarValidationError(message: "Invalid number for \(fieldName): '\(trimmed)'")
+        }
+        return v
+    }
+
+    private func saveSidecarOverrides() {
+        validationError = nil
+        do {
+            var updated = loadedBaseSidecar
+            // Preserve explicit id/provider ONLY if already authored in model.heylook.toml!
+            updated.id = loadedBaseSidecar.id
+            updated.provider = loadedBaseSidecar.provider
+            updated.pinned = pinnedState.boolValue
+            updated.computePlacement = computePlacementTag == "__inherit__" ? nil : ComputePlacement(rawValue: computePlacementTag)
+            updated.ctxSize = try parseOptionalInt(ctxSizeText, fieldName: "ctx_size")
+            updated.flashAttn = flashAttnState.boolValue
+            updated.supportsVision = supportsVisionState.boolValue
+            updated.supportsThinking = supportsThinkingState.boolValue
+            updated.imageMaxTokens = try parseOptionalInt(imageMaxTokensText, fieldName: "image_max_tokens")
+
+            let trimmedDraft = draftModelText.trimmingCharacters(in: .whitespacesAndNewlines)
+            updated.draftModel = trimmedDraft.isEmpty ? nil : trimmedDraft
+            let trimmedSpec = specTypeText.trimmingCharacters(in: .whitespacesAndNewlines)
+            updated.specType = trimmedSpec.isEmpty ? nil : trimmedSpec
+
+            updated.sampling.temperature = try parseOptionalDouble(temperatureText, fieldName: "temperature")
+            updated.sampling.topP = try parseOptionalDouble(topPText, fieldName: "top_p")
+            updated.sampling.topK = try parseOptionalInt(topKText, fieldName: "top_k")
+            updated.sampling.minP = try parseOptionalDouble(minPText, fieldName: "min_p")
+            updated.sampling.repetitionPenalty = try parseOptionalDouble(repetitionPenaltyText, fieldName: "repetition_penalty")
+            updated.sampling.presencePenalty = try parseOptionalDouble(presencePenaltyText, fieldName: "presence_penalty")
+            updated.sampling.maxTokens = try parseOptionalInt(maxTokensText, fieldName: "max_tokens")
+            updated.sampling.thinkingBudget = try parseOptionalInt(thinkingBudgetText, fieldName: "thinking_budget")
+
+            updated.tags = tagsText
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            updated.unsetKeys = unsetText
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+
+            Task {
+                await viewModel.saveModelSidecar(updated, for: model)
+                dismiss()
+            }
+        } catch let err as SidecarValidationError {
+            validationError = err.message
+        } catch {
+            validationError = error.localizedDescription
+        }
+    }
+}
+
+private struct SidecarValidationError: Error {
+    let message: String
+}
+
+private struct SidecarOptionalField: View {
+    let title: String
+    let placeholder: String
+    @Binding var text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Text(title)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button {
+                        text = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear override (revert to Inherit)")
+                }
+            }
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption.monospaced())
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct TemplateCapabilitiesStripView: View {
+    let caps: TemplateCapabilities
+
+    private var badges: [(label: String, active: Bool)] {
+        [
+            ("system", caps.supportsSystemRole),
+            ("tools", caps.supportsTools),
+            ("vision", caps.supportsVision),
+            ("audio", caps.supportsAudio),
+            ("thinking", caps.supportsThinking),
+            ("alternating", caps.requiresAlternatingRoles),
+            ("typed_content", caps.requiresTypedContent)
+        ]
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 5) {
+                Text("caps:")
+                    .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                ForEach(badges, id: \.label) { item in
+                    Text(item.label)
+                        .font(.system(size: 9, weight: item.active ? .bold : .regular, design: .monospaced))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule().fill(
+                                item.active
+                                    ? Color.teal.opacity(0.16)
+                                    : Color.secondary.opacity(0.08)
+                            )
+                        )
+                        .foregroundStyle(item.active ? .teal : .secondary)
+                }
+            }
         }
     }
 }
@@ -794,12 +1359,16 @@ struct PerfServerSurface: View {
         Form {
             Section("Unified Memory & Dual-Lane Compute Residency (\(viewModel.memorySnapshot.deviceName))") {
                 LabeledContent("Physical Unified RAM") {
-                    Text(String(format: "%.1f GB", viewModel.memorySnapshot.totalPhysicalRAMGB))
-                        .font(.subheadline.monospaced().weight(.semibold))
+                    Text(String(format: "%.1f GB total • %.1f GB used • %.1f GB avail", viewModel.memorySnapshot.totalPhysicalRAMGB, viewModel.memorySnapshot.ramUsedGB, viewModel.memorySnapshot.ramAvailableGB))
+                        .font(.caption.monospaced().weight(.semibold))
                 }
                 LabeledContent("Metal Recommended Max Working Set") {
                     Text(String(format: "%.1f GB", viewModel.memorySnapshot.metalRecommendedMaxWorkingSetGB))
                         .font(.subheadline.monospaced().weight(.semibold))
+                }
+                LabeledContent("Metal Allocated / Process RSS / Host CPU") {
+                    Text(String(format: "%d MB Metal • %d MB RSS • %.1f%% CPU", viewModel.memorySnapshot.metalCurrentAllocatedMB, viewModel.memorySnapshot.processResidentMB, viewModel.memorySnapshot.cpuPercent))
+                        .font(.caption.monospaced().weight(.semibold))
                 }
                 LabeledContent("Resident GPU / ANE Models") {
                     HStack(spacing: 10) {
@@ -1009,8 +1578,238 @@ struct PerfServerSurface: View {
                     }
                 }
             }
+
+            // Persisted Performance Profile (`1h / 6h / 24h / 7d`)
+            Section {
+                HStack {
+                    Picker("Time Window", selection: $viewModel.selectedPerfWindow) {
+                        ForEach(PerfTimeWindow.allCases) { window in
+                            Text(window.label).tag(window)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 260)
+
+                    Spacer()
+
+                    Button {
+                        viewModel.refreshPerfAndObservability()
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                if let profile = viewModel.perfProfileSummary, profile.sampleCount > 0 {
+                    let cacheRatio = profile.totalPromptTokens > 0
+                        ? (Double(profile.totalCachedTokens) / Double(profile.totalPromptTokens)) * 100.0
+                        : 0.0
+                    HStack(spacing: 16) {
+                        PerfStatBadge(title: "Samples", value: "\(profile.sampleCount)")
+                        PerfStatBadge(title: "Avg Gen", value: String(format: "%.1f tok/s", profile.averageGenerationTPS))
+                        PerfStatBadge(title: "Avg Prompt", value: String(format: "%.0f tok/s", profile.averagePromptTPS))
+                        PerfStatBadge(title: "Avg TTFT", value: String(format: "%.0f ms", profile.averageTTFTMs))
+                        PerfStatBadge(title: "Output Tok", value: "\(profile.totalOutputTokens)")
+                        PerfStatBadge(title: "KV Cache Hit", value: String(format: "%.0f%%", cacheRatio))
+                    }
+
+                    ForEach(profile.byModel) { row in
+                        HStack(spacing: 10) {
+                            Text(row.modelID)
+                                .font(.caption.monospaced().weight(.semibold))
+                                .lineLimit(1)
+                            Text("\(row.sampleCount) turns")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(String(format: "Gen %.1f tok/s • Prompt %.0f tok/s • TTFT %.0f ms", row.averageGenerationTPS, row.averagePromptTPS, row.averageTTFTMs))
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } else {
+                    Text("No persisted turn statistics recorded in SQLite within the \(viewModel.selectedPerfWindow.label) window yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Persisted Performance Profile (/v1/performance/profile)")
+            }
+
+            // Structured JSONL Observability Event Log (`HeylookObservabilityLog`)
+            Section {
+                HStack(spacing: 10) {
+                    Picker("Record Threshold", selection: $viewModel.boundObservabilityLoggerLevel) {
+                        Text("Record: DEBUG+").tag("DEBUG")
+                        Text("Record: INFO+").tag("INFO")
+                        Text("Record: WARN+").tag("WARN")
+                        Text("Record: ERROR").tag("ERROR")
+                    }
+                    .controlSize(.small)
+                    .frame(maxWidth: 175)
+
+                    Picker(
+                        "Filter",
+                        selection: Binding(
+                            get: { viewModel.observabilityMinLevelFilter ?? "__all__" },
+                            set: { viewModel.observabilityMinLevelFilter = ($0 == "__all__") ? nil : $0 }
+                        )
+                    ) {
+                        Text("View: All").tag("__all__")
+                        Text("INFO+").tag("INFO")
+                        Text("WARN+").tag("WARN")
+                        Text("ERROR").tag("ERROR")
+                    }
+                    .controlSize(.small)
+                    .frame(maxWidth: 140)
+
+                    TextField("Search message, category, or request ID…", text: $viewModel.observabilitySearchQuery)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption.monospaced())
+
+                    Button {
+                        copyTextToPasteboard(viewModel.exportObservabilityJSONL())
+                        viewModel.statusBanner = "Copied \(viewModel.observabilityEntries.count) observability events as JSONL."
+                    } label: {
+                        Label("Copy JSONL", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(viewModel.observabilityEntries.isEmpty)
+
+                    Button("Clear") {
+                        viewModel.clearObservabilityEntries()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(viewModel.observabilityEntries.isEmpty)
+                }
+
+                if viewModel.observabilityEntries.isEmpty {
+                    Text("No structured observability events match the active filter.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(viewModel.observabilityEntries.prefix(80))) { entry in
+                                ObservabilityLogRowView(entry: entry)
+                            }
+                        }
+                        .padding(4)
+                    }
+                    .frame(maxHeight: 240)
+                }
+            } header: {
+                Text("Structured Observability Event Log (JSONL Ring)")
+            }
+
+            // Data Maintenance & Store Reset
+            Section("SQLite Data Maintenance") {
+                LabeledContent("Persisted Store Records") {
+                    HStack(spacing: 12) {
+                        Text("\(viewModel.conversations.count) conversations • \(viewModel.notebooks.count) notebooks • \(viewModel.presets.count) presets")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                        Button("Clear All Conversations & Notebooks…", role: .destructive) {
+                            viewModel.pendingConfirmation = .clearAllConversationsAndNotebooks
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            viewModel.refreshPerfAndObservability()
+        }
+    }
+
+    private func copyTextToPasteboard(_ text: String) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #elseif canImport(UIKit)
+        UIPasteboard.general.string = text
+        #endif
+    }
+}
+
+private struct PerfStatBadge: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.09)))
+    }
+}
+
+private struct ObservabilityLogRowView: View {
+    let entry: HeylookObservabilityLog.Entry
+
+    private static let timeFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss.SSS"
+        return df
+    }()
+
+    private var levelColor: Color {
+        switch entry.level {
+        case "ERROR": return .red
+        case "WARN": return .orange
+        case "DEBUG": return .secondary
+        default: return .blue
+        }
+    }
+
+    var body: some View {
+        let date = Date(timeIntervalSince1970: Double(entry.timestampMs) / 1000.0)
+        let metaSummary = entry.metadata
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
+
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(Self.timeFormatter.string(from: date))
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.tertiary)
+
+            Text(entry.level)
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(levelColor.opacity(0.15)))
+                .foregroundStyle(levelColor)
+
+            Text("[\(entry.category)]")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+
+            Text(entry.message)
+                .font(.system(size: 10.5, design: .monospaced))
+                .lineLimit(2)
+
+            if !metaSummary.isEmpty {
+                Text(metaSummary)
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
     }
 }

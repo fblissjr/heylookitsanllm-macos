@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build, test, or run heylookitsanllm-macos with full remote SwiftPM native packages enabled
-# (mlx-swift, mlx-swift-lm, coreai-models, argmax-oss-swift, hummingbird) and Xcode Metal shader compilation.
+# Build, test, or run heylookitsanllm-macos with remote SwiftPM native packages enabled
+# (mlx-swift, mlx-swift-lm, swift-transformers / swift-jinja, optional coreai-models) and Xcode Metal shader compilation.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACTION="${1:-build}"
@@ -10,8 +10,6 @@ shift || true
 
 export HEYLOOK_ENABLE_NATIVE_MLX="${HEYLOOK_ENABLE_NATIVE_MLX:-1}"
 export HEYLOOK_ENABLE_COREAI="${HEYLOOK_ENABLE_COREAI:-0}"
-export HEYLOOK_ENABLE_ARGMAX="${HEYLOOK_ENABLE_ARGMAX:-0}"
-export HEYLOOK_ENABLE_HUMMINGBIRD="${HEYLOOK_ENABLE_HUMMINGBIRD:-0}"
 
 cd "${REPO_ROOT}"
 

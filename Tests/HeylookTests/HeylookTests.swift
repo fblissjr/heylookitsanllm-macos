@@ -1,4 +1,7 @@
+import CryptoKit
+import Darwin
 import Foundation
+import SQLite3
 import Testing
 @testable import HeylookCore
 @testable import HeylookEmbeddings
@@ -6,7 +9,7 @@ import Testing
 @testable import HeylookServer
 @testable import HeylookUI
 
-@Suite("Heylook Core, Embeddings, Engines & Server Verification Suite")
+@Suite("Heylook Core, Embeddings, Engines & Server Verification Suite", .serialized)
 struct HeylookTests {
 
     @Test("SamplerCascade resolves 4-layer precedence and records provenance")
@@ -680,7 +683,21 @@ struct HeylookTests {
             supportsThinking: ProvenanceField(value: true, provenance: .derived)
         )
         await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
-        let router = HeylookRouter(store: store, scheduler: scheduler)
+        let strictRouter = HeylookRouter(store: store, scheduler: scheduler)
+        let router = HeylookRouter(
+            store: store,
+            scheduler: scheduler,
+            embeddingEngine: DeterministicHashEmbeddingEngine()
+        )
+
+        // Truthful default: router without compiled .mlmodelc towers returns 503 on /v1/embeddings
+        let strictEmbResp = await strictRouter.handle(
+            method: "POST",
+            path: "/v1/embeddings",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: Data(#"{"model":"embedding-gemma2","input":"test"}"#.utf8)
+        )
+        #expect(strictEmbResp.status == 503)
 
         // 1. GET /v1/capabilities
         let capResp = await router.handle(method: "GET", path: "/v1/capabilities", headers: ["Host": "127.0.0.1:8000"])
@@ -957,7 +974,18 @@ struct HeylookTests {
         defer { try? FileManager.default.removeItem(at: dbURL) }
         let store = try SQLiteStore(databaseURL: dbURL)
         let scheduler = ComputeScheduler()
-        await scheduler.register(provider: GGUFSubprocessProvider(description: vlmDesc), description: vlmDesc)
+        let syntheticSpawn = GGUFSpawnConfig(
+            binaryPath: "/nonexistent/llama-server",
+            modelPath: primaryGGUF.path
+        )
+        await scheduler.register(
+            provider: GGUFSubprocessProvider(
+                description: vlmDesc,
+                spawnConfig: syntheticSpawn,
+                allowSyntheticFallback: true
+            ),
+            description: vlmDesc
+        )
         let router = HeylookRouter(store: store, scheduler: scheduler)
 
         let sidecarPatch = ModelSidecarConfig(
@@ -1085,7 +1113,21 @@ struct HeylookTests {
             templateSource: ProvenanceField(value: "chat_template.jinja", provenance: .derived)
         )
         await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
-        let router = HeylookRouter(store: store, scheduler: scheduler)
+        let strictRouter = HeylookRouter(store: store, scheduler: scheduler)
+        let router = HeylookRouter(
+            store: store,
+            scheduler: scheduler,
+            embeddingEngine: DeterministicHashEmbeddingEngine()
+        )
+
+        // Truthful default: router without compiled .mlmodelc towers returns 503 on /v1/embeddings
+        let strictEmbResp = await strictRouter.handle(
+            method: "POST",
+            path: "/v1/embeddings",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: Data(#"{"model":"embedding-gemma2","input":"test"}"#.utf8)
+        )
+        #expect(strictEmbResp.status == 503)
 
         let putResp = await router.handle(
             method: "PUT",
@@ -1450,8 +1492,8 @@ struct HeylookTests {
         }
         #expect(turn1Final.cacheReport?.outcome == .miss)
         #expect(turn1Final.cacheReport?.cause == "cold")
-        #expect(turn1Final.speculativeReport?.mode == "draft-mtp")
-        #expect((turn1Final.speculativeReport?.acceptedTokens ?? 0) > 0)
+        // Truthful runtime: never fabricate SpeculativeReport when no real drafter executed
+        #expect(turn1Final.speculativeReport == nil)
 
         var turn2Final = GenerationChunk()
         for try await chunk in await provider.generate(
@@ -1631,13 +1673,23 @@ struct HeylookTests {
             isLoaded: true
         )
         await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
-        let router = HeylookRouter(store: store, scheduler: scheduler)
+        let strictVoiceRouter = HeylookRouter(store: store, scheduler: scheduler)
+        let router = HeylookRouter(store: store, scheduler: scheduler, allowSyntheticFallback: true)
 
         let voiceReq = ConversationVoiceGenerateRequest(
             model: "voice-chat-mlx",
             audioBase64: wav.base64EncodedString(),
             languageHint: "en"
         )
+        // Truthful default: even if WAV contains TEXT: bytes, production router (allowSyntheticFallback: false) rejects without real ASR
+        let strictVoiceResp = await strictVoiceRouter.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_voice_strict/voice-generate",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(voiceReq)
+        )
+        #expect(strictVoiceResp.status == 503)
+
         let resp = await router.handle(
             method: "POST",
             path: "/v1/conversations/conv_voice_1/voice-generate",
@@ -1655,8 +1707,12 @@ struct HeylookTests {
         #expect(savedMsgs.first?.content == "Summarize dual-lane ANE scheduling")
         #expect(savedMsgs.last?.role == "assistant")
 
-        // Run full EvalLabSuite
-        let evalReport = try await EvalLabSuite.runAll()
+        // Truthful default: EvalLabSuite.runAll() fails honestly when no real weights/towers are discovered
+        let strictEvalReport = try await EvalLabSuite.runAll(allowSyntheticSelfTest: false)
+        #expect(strictEvalReport.allPassed == false)
+
+        // Offline pipeline contract self-test (allowSyntheticSelfTest: true)
+        let evalReport = try await EvalLabSuite.runAll(allowSyntheticSelfTest: true)
         #expect(evalReport.allPassed == true)
         #expect(evalReport.probes.count == 3)
         #expect(evalReport.matryoshkaBenchmarks.count == 4)
@@ -2006,7 +2062,23 @@ struct HeylookTests {
         let harmonyDir = tempRoot.appendingPathComponent("gpt-oss-harmony", isDirectory: true)
         try FileManager.default.createDirectory(at: harmonyDir, withIntermediateDirectories: true)
         #expect(ModelTemplateInfo.hasVisionConfiguration(in: harmonyDir) == false)
-        try "{% if reasoning_effort in ['low', 'medium', 'high'] %}<|channel|>analysis<|message|>...<|end|>{% endif %}".write(
+        let harmonyTemplate = """
+        {%- for message in messages %}
+        {%- if message['role'] == 'system' %}
+        {{- '<|start|>system<|message|>' + message['content'] + '\\n# reasoning_effort = ' + (reasoning_effort | default('medium')) + '<|end|>' }}
+        {%- else %}
+        {{- '<|start|>' + message['role'] + '<|message|>' + message['content'] + '<|end|>' }}
+        {%- endif %}
+        {%- endfor %}
+        {%- if add_generation_prompt %}
+        {%- if reasoning_effort in ['low', 'medium', 'high'] %}
+        {{- '<|start|>assistant<|channel|>analysis<|message|>' }}
+        {%- else %}
+        {{- '<|start|>assistant<|channel|>final<|message|>' }}
+        {%- endif %}
+        {%- endif %}
+        """
+        try harmonyTemplate.write(
             to: harmonyDir.appendingPathComponent("chat_template.jinja"),
             atomically: true,
             encoding: .utf8
@@ -2149,7 +2221,11 @@ struct HeylookTests {
         defer { try? FileManager.default.removeItem(at: dbURL) }
         let store = try SQLiteStore(databaseURL: dbURL)
         let scheduler = ComputeScheduler()
-        let router = HeylookRouter(store: store, scheduler: scheduler)
+        let router = HeylookRouter(
+            store: store,
+            scheduler: scheduler,
+            embeddingEngine: DeterministicHashEmbeddingEngine()
+        )
 
         // 1. Structured HeylookMLXEngine wire payload with prompt_name and windowed video block
         let fakeVideoB64 = Data("fake_mp4_payload_bytes".utf8).base64EncodedString()
@@ -2277,7 +2353,11 @@ struct HeylookTests {
             .appendingPathComponent("missing_emb_\(UUID().uuidString)", isDirectory: true)
         let hybridFallback = HybridLocalEmbeddingEngine(checkpointURL: missingEmbDir, computeOptions: .hybridANETowers)
         #expect(hybridFallback.hasCompiledANETowers == false)
-        #expect(hybridFallback.modelID == "deterministic-hash-768d")
+        #expect(hybridFallback.modelID == missingEmbDir.lastPathComponent)
+        #expect(hybridFallback.modelID != "deterministic-hash-768d")
+        await #expect(throws: EmbeddingEngineError.self) {
+            _ = try await hybridFallback.embedBatch([.text("truthful check", task: .query)], dimensions: 768)
+        }
 
         // 2. ProviderFactory routes .remote to RemoteHeylookProvider and defaults allowSyntheticFallback to false
         let remoteDesc = EngineDescription(
@@ -2474,5 +2554,1544 @@ struct HeylookTests {
         #expect(resolvedGGUFDir.path == "/tmp/models/gguf")
         let resolvedMLXDir = HeylookConfig.resolveModelDirectoryURL(from: "/tmp/models/mlx/Qwen3.5-8B-MLX")
         #expect(resolvedMLXDir.path == "/tmp/models/mlx/Qwen3.5-8B-MLX")
+    }
+
+    // MARK: - 30. Real Jinja2 AST Evaluation, Syntax Validation, Prefix-Stability Lint & HF Download ETag Check
+
+    @Test("HeylookJinjaRenderer evaluates loops, namespaces, macros, slices, syntax errors, prefix stability, and HF modifiedSinceDownload")
+    func testHeylookJinjaRendererASTLoopsNamespacesMacrosSyntaxAndPrefixStability() async throws {
+        // 1. Loops (`loop.index0`, `loop.last`), `namespace` cross-scope mutation, `macro`, `tojson`, and Python `[::-1]` slice
+        let complexTemplate = """
+        {%- macro render_tool(tool) -%}{{ tool.name }}:{{ tool.schema | tojson }}{%- endmacro -%}
+        {%- set ns = namespace(last_user_idx=-1, count=0) -%}
+        {%- for m in messages -%}
+        {%- set ns.count = ns.count + 1 -%}
+        {%- if m.role == 'user' -%}{%- set ns.last_user_idx = loop.index0 -%}{%- endif -%}
+        {%- endfor -%}
+        count={{ ns.count }},last_user={{ ns.last_user_idx }},rev={{ 'abc'[-1::-1] }}
+        {%- if tools %}
+        tools=[{%- for t in tools -%}{{ render_tool(t) }}{%- if not loop.last -%}|{%- endif -%}{%- endfor -%}]
+        {%- endif %}
+        {%- for m in messages %}
+        <{{ m.role }}>{{ m.content | trim }}</{{ m.role }}>
+        {%- endfor %}
+        """
+        let rendered = try HeylookJinjaRenderer.render(
+            template: complexTemplate,
+            context: [
+                "messages": .array([
+                    .object(["role": .string("system"), "content": .string(" Sys ")]),
+                    .object(["role": .string("user"), "content": .string(" First ")]),
+                    .object(["role": .string("assistant"), "content": .string(" Reply ")]),
+                    .object(["role": .string("user"), "content": .string(" Second ")]),
+                ]),
+                "tools": .array([
+                    .object(["name": .string("search"), "schema": .object(["q": .string("str")])]),
+                ]),
+            ]
+        )
+        #expect(rendered.contains("count=4,last_user=3,rev=cba"))
+        #expect(rendered.contains(#"tools=[search:{"q": "str"}]"#))
+        #expect(rendered.contains("<user>Second</user>"))
+
+        // 2. raise_exception surfaces JinjaTemplateError.templateRaisedException
+        #expect(throws: JinjaTemplateError.self) {
+            _ = try HeylookJinjaRenderer.render(
+                template: "{{ raise_exception('System role must come first') }}",
+                context: [:]
+            )
+        }
+
+        // 3. Syntax validation rejects empty, unclosed `{{`, and mismatched `{% if %}` blocks
+        #expect(throws: JinjaTemplateError.self) {
+            try HeylookJinjaRenderer.validateSyntax("   ")
+        }
+        #expect(throws: JinjaTemplateError.self) {
+            try HeylookJinjaRenderer.validateSyntax("{% if enable_thinking %}<think>")
+        }
+        #expect(throws: JinjaTemplateError.self) {
+            try HeylookJinjaRenderer.validateSyntax("{{ unclosed_expr ")
+        }
+
+        // 4. Prefix-stability lint flags `strftime_now` and Qwen3-style prior-reasoning-stripping templates
+        let unstableDateTpl = "Today: {{ strftime_now('%Y-%m-%d %H:%M:%S') }}\n{% for m in messages %}{{ m.content }}{% endfor %}"
+        let dateCheck = HeylookJinjaRenderer.checkPrefixStability(template: unstableDateTpl)
+        #expect(dateCheck.stable == false)
+        #expect(dateCheck.note != nil)
+
+        let qwenStripPriorThinkingTpl = """
+        {%- set ns = namespace(last_query_index = messages|length - 1) -%}
+        {%- for m in messages -%}
+        {%- if m.role == 'user' -%}{%- set ns.last_query_index = loop.index0 -%}{%- endif -%}
+        {%- endfor -%}
+        {%- for m in messages -%}
+        {%- if m.role == 'assistant' and loop.index0 > ns.last_query_index and m.reasoning_content -%}
+        <think>{{ m.reasoning_content }}</think>{{ m.content }}
+        {%- elif m.role == 'assistant' and loop.index0 == messages|length - 1 and m.reasoning_content -%}
+        <think>{{ m.reasoning_content }}</think>{{ m.content }}
+        {%- else -%}
+        <{{ m.role }}>{{ m.content }}</{{ m.role }}>
+        {%- endif -%}
+        {%- endfor -%}
+        """
+        let qwenStability = HeylookJinjaRenderer.checkPrefixStability(template: qwenStripPriorThinkingTpl)
+        #expect(qwenStability.stable == false)
+
+        let stableChatML = HeylookJinjaRenderer.defaultChatMLTemplate
+        let stableCheck = HeylookJinjaRenderer.checkPrefixStability(template: stableChatML)
+        #expect(stableCheck.stable == true)
+
+        // 5. HF `.cache/huggingface/download/<file>.metadata` git-blob SHA-1 modifiedSinceDownload + HTTP 422/404 template routes
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_jinja_hf_\(UUID().uuidString)", isDirectory: true)
+        let metaDir = tmpDir
+            .appendingPathComponent(".cache", isDirectory: true)
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("download", isDirectory: true)
+        try FileManager.default.createDirectory(at: metaDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let originalTpl = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+        let tplURL = tmpDir.appendingPathComponent("chat_template.jinja")
+        let tplBytes = Data(originalTpl.utf8)
+        try tplBytes.write(to: tplURL)
+
+        var gitBlob = Data("blob \(tplBytes.count)\0".utf8)
+        gitBlob.append(tplBytes)
+        let sha1Hex = Insecure.SHA1.hash(data: gitBlob).map { String(format: "%02x", $0) }.joined()
+        try "0123456789abcdef\n\(sha1Hex)\n1700000000.0\n".write(
+            to: metaDir.appendingPathComponent("chat_template.jinja.metadata"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let cleanState = HeylookConfig.inspectChatTemplate(in: tmpDir, fallbackSource: "chat_template.jinja")
+        #expect(cleanState.modifiedSinceDownload == false)
+        #expect(cleanState.origin == "vendor_sidecar")
+
+        try (originalTpl + "\n{# locally edited #}").write(to: tplURL, atomically: true, encoding: .utf8)
+        let dirtyState = HeylookConfig.inspectChatTemplate(in: tmpDir, fallbackSource: "chat_template.jinja")
+        #expect(dirtyState.modifiedSinceDownload == true)
+
+        // Verify PUT /v1/admin/models/{id}/chat-template returns 422 on invalid Jinja2 and DELETE returns 404 when no override exists
+        let store = try SQLiteStore(databaseURL: tmpDir.appendingPathComponent("tpl.sqlite"))
+        let scheduler = ComputeScheduler()
+        let desc = EngineDescription(modelID: "tpl-check-mlx", provider: .mlx, modelPath: tmpDir.path)
+        await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
+        let router = HeylookRouter(store: store, scheduler: scheduler)
+
+        let delMissing = await router.handle(
+            method: "DELETE",
+            path: "/v1/admin/models/tpl-check-mlx/chat-template",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(delMissing.status == 404)
+
+        let putInvalid = await router.handle(
+            method: "PUT",
+            path: "/v1/admin/models/tpl-check-mlx/chat-template",
+            headers: ["Host": "127.0.0.1:8000", "Content-Type": "application/json"],
+            body: Data(#"{"template":"{% if broken "}"#.utf8)
+        )
+        #expect(putInvalid.status == 422)
+    }
+
+    // MARK: - 31. GGUF Large Vocab Header Reader, OS-Bound Port Pool Probe, RAM Fit & Fast Child Exit
+
+    @Test("GGUFHeaderReader parses past large vocab arrays, GGUFPortPool skips OS-bound sockets, GGUFSpawnConfig assesses RAM fit & media-blind sidecar, and launchSubprocess rejects fast exit")
+    func testGGUFHeaderLargeVocabArrayPortPoolOSBindProbeRAMFitAndFastExit() async throws {
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_gguf_p2_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        // 1. Build a GGUF v3 file with a 10,000-entry `tokenizer.ggml.tokens` array (>140 KB, exceeding legacy 64 KB & 4,096-elem caps)
+        let largeVocab = (0..<10_000).map { "tok_piece_\(String(format: "%05d", $0))" }
+        let ggufData = GGUFHeaderReader.buildMinimalGGUF(
+            version: 3,
+            tensorCount: 128,
+            stringMetadata: [
+                "general.architecture": "qwen3_5",
+                "tokenizer.chat_template": "{% for m in messages %}{% if m.content is not string %}<__media__>{% endif %}{{ m.content }}{% endfor %}",
+            ],
+            stringArrayMetadata: ["a.tokenizer.ggml.tokens": largeVocab],
+            uint32Metadata: [
+                "qwen3_5.context_length": 131072,
+                "qwen3_5.ssm.conv_kernel": 4,
+            ]
+        )
+        #expect(ggufData.count > 120_000)
+        let mainGGUF = tmpDir.appendingPathComponent("Qwen3.5-VL-Q4_K_M.gguf")
+        try ggufData.write(to: mainGGUF)
+
+        let header = try #require(GGUFHeaderReader.readFileHeader(at: mainGGUF))
+        #expect(header.architecture == "qwen3_5")
+        #expect(header.contextLength == 131072)
+        #expect(header.isHybridRecurrent == true)
+        #expect(header.embeddedChatTemplate?.contains("<__media__>") == true)
+
+        // 2. Bind an actual OS TCP socket on loopback and verify `GGUFPortPool` detects and skips it
+        let sockFD = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        #expect(sockFD >= 0)
+        defer { if sockFD >= 0 { Darwin.close(sockFD) } }
+
+        var reuse: Int32 = 1
+        _ = setsockopt(sockFD, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        let testBasePort = 28190
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(testBasePort).bigEndian)
+        addr.sin_addr.s_addr = CFSwapInt32HostToBig(INADDR_LOOPBACK)
+        let bindRC = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.bind(sockFD, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if bindRC == 0 {
+            _ = Darwin.listen(sockFD, 4)
+            #expect(GGUFPortPool.isPortAvailable(testBasePort) == false)
+            let localPool = GGUFPortPool(basePort: testBasePort)
+            let acquired = localPool.acquirePort(for: "probe-model")
+            #expect(acquired > testBasePort)
+            localPool.releaseAll()
+        }
+
+        // 3. Media-blind `chat_template.jinja` sidecar fallback to `gguf_embedded` when `--mmproj` is present + RAM-fit drafter drop
+        let mmprojURL = tmpDir.appendingPathComponent("mmproj-Qwen3.5-f16.gguf")
+        try Data("GGUF".utf8).write(to: mmprojURL)
+        let drafterURL = tmpDir.appendingPathComponent("mtp-qwen3.5-draft.gguf")
+        try Data(repeating: 0xAB, count: 1024).write(to: drafterURL)
+
+        // Write a text-only vendor sidecar (`chat_template.jinja`) that has NO image/media handling
+        try "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}".write(
+            to: tmpDir.appendingPathComponent("chat_template.jinja"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let vlmDesc = EngineDescription(
+            modelID: "qwen3.5-vl-gguf",
+            provider: .gguf,
+            modelPath: tmpDir.path,
+            contextSize: ProvenanceField(value: 32768, provenance: .derived),
+            supportsVision: ProvenanceField(value: true, provenance: .derived)
+        )
+        // Tight headroom (1.0 GB): drops external drafter AND skips media-blind `chat_template.jinja` in favor of embedded GGUF template
+        let tightSpawn = GGUFSpawnConfig.autoSized(for: vlmDesc, headroomGB: 1.0)
+        #expect(tightSpawn.mmprojPath == mmprojURL.standardizedFileURL.path)
+        #expect(tightSpawn.draftModelPath == nil)
+        #expect(tightSpawn.chatTemplateFile == nil) // fell back to `gguf_embedded`!
+        #expect(tightSpawn.cacheReuse == nil)
+        #expect(tightSpawn.ctxCheckpoints == 8)
+        #expect(tightSpawn.cacheRAMMiB == 8192)
+        GGUFPortPool.shared.releasePort(for: vlmDesc.modelID)
+
+        // Plenty of headroom (48.0 GB): keeps external drafter
+        let roomySpawn = GGUFSpawnConfig.autoSized(for: vlmDesc, headroomGB: 48.0)
+        #expect(roomySpawn.draftModelPath == drafterURL.standardizedFileURL.path)
+        GGUFPortPool.shared.releasePort(for: vlmDesc.modelID)
+
+        // 4. `launchSubprocess` against `/usr/bin/false` fails fast with `ProviderExecutionError.runtimeUnavailable`
+        #if os(macOS)
+        let failingSpawn = GGUFSpawnConfig(
+            binaryPath: "/usr/bin/false",
+            modelPath: mainGGUF.path,
+            port: 28991
+        )
+        let failingProvider = GGUFSubprocessProvider(description: vlmDesc, spawnConfig: failingSpawn)
+        await #expect(throws: ProviderExecutionError.self) {
+            _ = try await failingProvider.launchSubprocess(customArguments: [], checkHealth: true)
+        }
+        #expect(await failingProvider.describe().isLoaded == false)
+        await failingProvider.unload()
+        #endif
+    }
+
+    // MARK: - 32. StopSequenceFilter Multi-Chunk Holdback, ThinkingBudget & Immediate Cancellation
+
+    @Test("StopSequenceFilter holds back split stop sequences, StreamingPipeline enforces thinkingBudget, and RequestRegistry cancels immediately")
+    func testStopSequenceFilterMultiChunkHoldbackImmediateAbortAndThinkingBudget() async throws {
+        // 1. Multi-chunk stop sequence holdback: never leaks stop string or trailing text
+        var filter = StopSequenceFilter(stopSequences: ["<|end|>", "STOP_NOW"])
+        var collected = ""
+        let r1 = filter.feed("Hello ")
+        collected += r1.emitted
+        #expect(r1.matchedStop == nil)
+
+        let r2 = filter.feed("world <|e")
+        collected += r2.emitted
+        #expect(collected == "Hello world ")
+        #expect(r2.matchedStop == nil)
+
+        let r3 = filter.feed("nd|>EXTRA_GARBAGE")
+        collected += r3.emitted
+        #expect(r3.matchedStop == "<|end|>")
+        #expect(collected == "Hello world ")
+        #expect(filter.flush().isEmpty)
+
+        // Partial false-alarm prefix flushes cleanly at EOS
+        var safeFilter = StopSequenceFilter(stopSequences: ["<|end|>"])
+        var safeOut = safeFilter.feed("Engine <|en").emitted
+        safeOut += safeFilter.feed("gine").emitted
+        safeOut += safeFilter.flush()
+        #expect(safeOut == "Engine <|engine")
+
+        // 2. StreamingPipeline thinkingBudget forces reasoning end + suppresses late `.splitReasoning` + stops on `stopSequences`
+        actor HookFlag {
+            var didFire = false
+            func mark() { didFire = true }
+        }
+        let hookFlag = HookFlag()
+        let reg = RequestRegistry()
+        reg.register(id: "req_budget_stop")
+        let budgetStream = StreamingPipeline.transformEventStream(
+            requestID: "req_budget_stop",
+            cacheReport: CacheReport(promptTokens: 16, cachedTokens: 8, processedTokens: 8, outcome: .reused),
+            thinkingEnabled: true,
+            stopSequences: ["</answer>"],
+            thinkingBudget: 2,
+            computePlacement: .mlxGPU,
+            registry: reg,
+            onReasoningEndHook: { await hookFlag.mark() }
+        ) { cont in
+            cont.yield(.splitReasoning("step1 "))
+            cont.yield(.splitReasoning("step2 "))
+            cont.yield(.splitReasoning("step3_suppressed "))
+            cont.yield(.splitContent("Final output</ans"))
+            cont.yield(.splitContent("wer>trailing_ignored"))
+        }
+
+        var visible = ""
+        var thinking = ""
+        var finalChunk = GenerationChunk()
+        for try await c in budgetStream {
+            visible += c.text
+            thinking += c.thinking
+            finalChunk = c
+        }
+        reg.unregister(id: "req_budget_stop")
+
+        #expect(await hookFlag.didFire == true)
+        #expect(thinking == "step1 step2 ")
+        #expect(!thinking.contains("step3_suppressed"))
+        #expect(visible == "Final output")
+        #expect(finalChunk.stopReason == .stopSequence)
+        #expect(finalChunk.thinkingTokens == 2)
+
+        // 3. Immediate cancellation via `RequestRegistry.cancel(id:)` wakes a blocked 30s prefill producer in < 500ms
+        let cancelReg = RequestRegistry()
+        cancelReg.register(id: "req_block_prefill")
+        let startWall = ContinuousClock.now
+        let slowStream = StreamingPipeline.transformEventStream(
+            requestID: "req_block_prefill",
+            cacheReport: CacheReport(promptTokens: 32, cachedTokens: 0, processedTokens: 32, outcome: .miss, cause: "cold"),
+            computePlacement: .mlxGPU,
+            registry: cancelReg
+        ) { _ in
+            try await Task.sleep(for: .seconds(30))
+        }
+
+        Task {
+            try? await Task.sleep(for: .milliseconds(30))
+            _ = cancelReg.cancel(id: "req_block_prefill")
+        }
+
+        var cancelChunk = GenerationChunk()
+        for try await c in slowStream {
+            cancelChunk = c
+        }
+        cancelReg.unregister(id: "req_block_prefill")
+        let elapsed = ContinuousClock.now - startWall
+        #expect(elapsed < .seconds(2))
+        #expect(cancelChunk.stopReason == .cancelled)
+    }
+
+    // MARK: - 33. Real 48 kHz Stereo WAV Resampling to 16 kHz Mono & Unigram Viterbi Piece Tokenizer
+
+    @Test("ArtifactProcessor resamples 48 kHz stereo WAV to 16 kHz mono and CheckpointPieceTokenizer segments Unigram pieces via Viterbi")
+    func testRealStereo48kHzWAVResamplingTo16kHzMonoAndCheckpointPieceTokenizer() async throws {
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_audio_tok_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        // 1. Synthesize a 0.5-second 48,000 Hz 2-channel stereo 16-bit PCM WAV file (24,000 stereo frames = 96,000 PCM bytes)
+        let srcSampleRate: UInt32 = 48_000
+        let channels: UInt16 = 2
+        let frameCount = 24_000 // 0.50s
+        var pcmBytes = Data(capacity: frameCount * Int(channels) * 2)
+        for frame in 0..<frameCount {
+            let t = Double(frame) / Double(srcSampleRate)
+            let left = Int16((sin(2.0 * .pi * 440.0 * t) * 14_000.0).rounded()).littleEndian
+            let right = Int16((sin(2.0 * .pi * 880.0 * t) * 14_000.0).rounded()).littleEndian
+            withUnsafeBytes(of: left) { pcmBytes.append(contentsOf: $0) }
+            withUnsafeBytes(of: right) { pcmBytes.append(contentsOf: $0) }
+        }
+
+        var wav = Data("RIFF".utf8)
+        var chunkSize = UInt32(36 + pcmBytes.count).littleEndian
+        withUnsafeBytes(of: &chunkSize) { wav.append(contentsOf: $0) }
+        wav.append(Data("WAVEfmt ".utf8))
+        var fmtLen = UInt32(16).littleEndian
+        var audioFmt = UInt16(1).littleEndian
+        var chLE = channels.littleEndian
+        var srLE = srcSampleRate.littleEndian
+        var byteRate = (srcSampleRate * UInt32(channels) * 2).littleEndian
+        var blockAlign = (channels * 2).littleEndian
+        var bitsPerSample = UInt16(16).littleEndian
+        withUnsafeBytes(of: &fmtLen) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &audioFmt) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &chLE) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &srLE) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &byteRate) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &blockAlign) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &bitsPerSample) { wav.append(contentsOf: $0) }
+        wav.append(Data("data".utf8))
+        var dataLen = UInt32(pcmBytes.count).littleEndian
+        withUnsafeBytes(of: &dataLen) { wav.append(contentsOf: $0) }
+        wav.append(pcmBytes)
+
+        let stereoURL = tmpDir.appendingPathComponent("stereo_48k.wav")
+        try wav.write(to: stereoURL)
+
+        let mono16k = try await ArtifactProcessor.decodeMonoPCM(for: stereoURL, sampleRate: 16_000)
+        // 0.50s @ 16,000 Hz = ~8,000 mono samples (whereas un-resampled 48k stereo would have been 48,000 samples!)
+        #expect(abs(mono16k.count - 8_000) <= 64)
+        let peakAbs = mono16k.map { abs($0) }.max() ?? 0
+        #expect(peakAbs > 0.05)
+
+        // 2. Real Unigram SentencePiece `tokenizer.json` Viterbi segmentation
+        let tokenizerJSON = """
+        {
+          "model": {
+            "type": "Unigram",
+            "vocab": [
+              ["<pad>", 0.0],
+              ["<eos>", 0.0],
+              ["<bos>", 0.0],
+              ["<unk>", 0.0],
+              ["▁apple", -2.1],
+              ["▁neural", -2.3],
+              ["▁engine", -2.2],
+              ["▁", -4.0],
+              ["a", -6.0],
+              ["p", -6.0],
+              ["l", -6.0],
+              ["e", -6.0]
+            ]
+          }
+        }
+        """
+        try tokenizerJSON.write(
+            to: tmpDir.appendingPathComponent("tokenizer.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let pieceTok = try #require(CheckpointPieceTokenizer.load(from: tmpDir))
+        #expect(pieceTok.bosTokenID == 2)
+        #expect(pieceTok.eosTokenID == 1)
+        let encoded = pieceTok.encode(" apple neural engine")
+        #expect(encoded == [4, 5, 6])
+    }
+
+    // MARK: - 34. SQLiteStore Clean Schema Recreation, Content-Addressed Media Blobs GC & Preset Seed-Once
+
+    @Test("SQLiteStore recreates outdated tables cleanly, deduplicates & GCs SHA-256 media_blobs, and seeds presets once")
+    func testSQLiteStoreCleanSchemaRecreationMediaBlobsGCAndPresetSeedOnce() async throws {
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_store_p3_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let dbURL = tmpDir.appendingPathComponent("legacy_to_clean.sqlite")
+
+        // 1. Pre-create an outdated `conversations` table missing `default_model_id` / `params_json`
+        var rawDB: OpaquePointer?
+        #expect(sqlite3_open(dbURL.path, &rawDB) == SQLITE_OK)
+        if let rawDB {
+            _ = sqlite3_exec(rawDB, "CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL);", nil, nil, nil)
+            sqlite3_close(rawDB)
+        }
+
+        // Opening SQLiteStore drops & recreates outdated schema cleanly (no migration sprawl, zero crashes)
+        do {
+            let store = try SQLiteStore(databaseURL: dbURL)
+            try store.upsertConversation(
+                ConversationRecord(
+                    id: "conv_media",
+                    title: "Media Dedup Test",
+                    systemPrompt: "Sys",
+                    defaultModelID: "vlm-1",
+                    params: SamplerSettings(temperature: 0.3)
+                )
+            )
+            let loadedConv = try #require(try store.getConversation(id: "conv_media"))
+            #expect(loadedConv.defaultModelID == "vlm-1")
+            #expect(loadedConv.params?.temperature == 0.3)
+
+            // 2. Append two messages referencing the exact same PNG bytes -> 1 deduplicated `media_blobs` row
+            let pngBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xAA, 0xBB, 0xCC])
+            let att = MessagesRequest.MediaAttachment(
+                kind: "image",
+                mediaType: "image/png",
+                dataBase64: pngBytes.base64EncodedString(),
+                filename: "test.png"
+            )
+            _ = try store.appendMessage(
+                MessageRecord(
+                    id: "m1",
+                    conversationID: "conv_media",
+                    position: 0,
+                    role: "user",
+                    content: "First image",
+                    contentBlocks: [.media(att), .text("First image")]
+                )
+            )
+            _ = try store.appendMessage(
+                MessageRecord(
+                    id: "m2",
+                    conversationID: "conv_media",
+                    position: 1,
+                    role: "user",
+                    content: "Same image again",
+                    contentBlocks: [.media(att), .text("Same image again")]
+                )
+            )
+            #expect(try store.mediaBlobCount() == 1)
+
+            // Stored JSON externalized base64 (`dataBase64 == ""`, `mediaID != nil`)
+            let unhydrated = try store.listMessages(conversationID: "conv_media", hydrateMedia: false)
+            var extractedMediaID: String?
+            if let firstBlock = unhydrated.first?.contentBlocks?.first,
+               case .media(let storedAtt) = firstBlock {
+                #expect(storedAtt.dataBase64.isEmpty)
+                extractedMediaID = storedAtt.mediaID
+            }
+            let mediaID = try #require(extractedMediaID)
+
+            // Hydrated read restores exact base64 bytes
+            let hydrated = try store.listMessages(conversationID: "conv_media", hydrateMedia: true)
+            if let firstBlock = hydrated.first?.contentBlocks?.first,
+               case .media(let hydAtt) = firstBlock {
+                #expect(Data(base64Encoded: hydAtt.dataBase64) == pngBytes)
+            } else {
+                Issue.record("Expected hydrated media attachment")
+            }
+
+            // Serve binary blob via GET /v1/conversations/{id}/media/{media_id}
+            let router = HeylookRouter(store: store, scheduler: ComputeScheduler())
+            let mediaResp = await router.handle(
+                method: "GET",
+                path: "/v1/conversations/conv_media/media/\(mediaID)",
+                headers: ["Host": "127.0.0.1:8000"]
+            )
+            #expect(mediaResp.status == 200)
+            #expect(mediaResp.headers["Content-Type"] == "image/png")
+            #expect(mediaResp.body == pngBytes)
+
+            // Deleting the conversation garbage-collects orphaned `media_blobs`
+            try store.deleteConversation(id: "conv_media")
+            #expect(try store.mediaBlobCount() == 0)
+
+            // 3. Presets seed-once guard + HTTP 409 conflict on duplicate name
+            let initialPresets = try store.listPresets()
+            #expect(!initialPresets.isEmpty)
+            let dupPreset = PresetRecord(name: initialPresets[0].name, settings: SamplerSettings(temperature: 0.5))
+            let conflictResp = await router.handle(
+                method: "POST",
+                path: "/v1/presets",
+                headers: ["Host": "127.0.0.1:8000", "Content-Type": "application/json"],
+                body: try JSONEncoder().encode(dupPreset)
+            )
+            #expect(conflictResp.status == 409)
+
+            // Delete all presets and reopen store -> stays empty (never re-seeds!)
+            for p in initialPresets {
+                try store.deletePreset(id: p.id)
+            }
+            #expect(try store.listPresets().isEmpty)
+        }
+
+        let reopenedStore = try SQLiteStore(databaseURL: dbURL)
+        #expect(try reopenedStore.listPresets().isEmpty)
+    }
+
+    // MARK: - 35. ConversationGenerationCoordinator Modes, Dropped Media, 409 Lock & Performance Profile
+
+    @Test("ConversationGenerationCoordinator supports append/regenerate/continue, dropped_media, 409 lock, Anthropic SSE blocks, and /v1/performance/profile")
+    func testConversationGenerationCoordinatorModesDroppedMediaLockAndAnthropicSSE() async throws {
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_saga_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let store = try SQLiteStore(databaseURL: tmpDir.appendingPathComponent("saga.sqlite"))
+        let scheduler = ComputeScheduler()
+        let vlmDesc = EngineDescription(
+            modelID: "vlm-saga",
+            provider: .mlx,
+            modelPath: tmpDir.path,
+            isLoaded: true,
+            supportsVision: ProvenanceField(value: true, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived)
+        )
+        let textOnlyDesc = EngineDescription(
+            modelID: "txt-saga",
+            provider: .mlx,
+            modelPath: tmpDir.path,
+            isLoaded: true,
+            supportsVision: ProvenanceField(value: false, provenance: .derived),
+            supportsThinking: ProvenanceField(value: false, provenance: .derived)
+        )
+        await scheduler.register(provider: MLXSwiftProvider(description: vlmDesc, allowSyntheticFallback: true), description: vlmDesc)
+        await scheduler.register(provider: MLXSwiftProvider(description: textOnlyDesc, allowSyntheticFallback: true), description: textOnlyDesc)
+        let registry = RequestRegistry()
+        let router = HeylookRouter(store: store, scheduler: scheduler, registry: registry)
+
+        // 1. Append mode with image attachment + full Anthropic SSE framing (`content_block_start` / `content_block_stop` / `heylook_saved`)
+        let imgPart = MessagesRequest.MessageTurn.ContentPart.media(
+            .init(kind: "image", mediaType: "image/png", dataBase64: Data([0x89, 0x50, 0x4E, 0x47]).base64EncodedString())
+        )
+        let appendReq = ConversationGenerateRequest(
+            model: "vlm-saga",
+            content: "Inspect chart",
+            mode: .append,
+            userParts: [imgPart, .text("Inspect chart")],
+            thinking: true
+        )
+        let appendResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_saga/generate",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(appendReq)
+        )
+        #expect(appendResp.status == 200)
+        let appendSSE = String(decoding: appendResp.body, as: UTF8.self)
+        #expect(appendSSE.contains("event: message_start"))
+        #expect(appendSSE.contains("event: content_block_start"))
+        #expect(appendSSE.contains("event: content_block_delta"))
+        #expect(appendSSE.contains("event: content_block_stop"))
+        #expect(appendSSE.contains("event: message_delta"))
+        #expect(appendSSE.contains("event: message_stop"))
+        #expect(appendSSE.contains("event: heylook_saved"))
+        #expect(appendSSE.contains("\"dropped_media\":0"))
+
+        // 2. Regenerate mode switching from VLM to text-only model strips history image & reports `dropped_media: 1`
+        let regenReq = ConversationGenerateRequest(
+            model: "txt-saga",
+            mode: .regenerate
+        )
+        let regenResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_saga/generate",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(regenReq)
+        )
+        #expect(regenResp.status == 200)
+        let regenSSE = String(decoding: regenResp.body, as: UTF8.self)
+        #expect(regenSSE.contains("\"mode\":\"regenerate\""))
+        #expect(regenSSE.contains("\"dropped_media\":1"))
+
+        let msgsAfterRegen = try store.listMessages(conversationID: "conv_saga")
+        #expect(msgsAfterRegen.count == 2)
+        let beforeContinueLen = msgsAfterRegen[1].content.count
+
+        // 3. Continue mode appends to existing assistant message in-place at position 1
+        let contReq = ConversationGenerateRequest(
+            model: "txt-saga",
+            mode: .continue,
+            messageID: msgsAfterRegen[1].id
+        )
+        let contResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_saga/generate",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(contReq)
+        )
+        #expect(contResp.status == 200)
+        let msgsAfterContinue = try store.listMessages(conversationID: "conv_saga")
+        #expect(msgsAfterContinue.count == 2)
+        #expect(msgsAfterContinue[1].id == msgsAfterRegen[1].id)
+        #expect(msgsAfterContinue[1].content.count > beforeContinueLen)
+
+        // 4. Per-conversation concurrent generation lock returns HTTP 409 (`generation_in_progress`)
+        _ = registry.tryAcquireConversationLock(conversationID: "conv_saga", requestID: "req_active_lock", modelID: "txt-saga")
+        let lockedResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_saga/generate",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(regenReq)
+        )
+        #expect(lockedResp.status == 409)
+        registry.finish(requestID: "req_active_lock")
+
+        // 5. Append a second turn and verify GET /v1/performance/profile/24h aggregates persisted `message_stats`
+        let followUpReq = ConversationGenerateRequest(
+            model: "txt-saga",
+            content: "Summarize findings",
+            mode: .append
+        )
+        let followUpResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_saga/generate",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: try JSONEncoder().encode(followUpReq)
+        )
+        #expect(followUpResp.status == 200)
+
+        let perfResp = await router.handle(
+            method: "GET",
+            path: "/v1/performance/profile/24h",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(perfResp.status == 200)
+        let perfJSON = try JSONSerialization.jsonObject(with: perfResp.body) as? [String: Any]
+        #expect(((perfJSON?["sample_count"] as? Int) ?? 0) == 2)
+    }
+
+    // MARK: - 36. Security Gates: DNS-Rebinding Host Header on 0.0.0.0, Admin Token, Read-Only Config & X-Request-ID
+
+    @Test("HeylookRouter enforces DNS-rebinding Host checks on 0.0.0.0, X-Heylook-Admin-Token 401/403, read-only config 409, and X-Request-ID 422")
+    func testRouterHostHeaderSecurityAdminTokenReadOnlyConfigAndRequestIDValidation() async throws {
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_sec_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let store = try SQLiteStore(databaseURL: tmpDir.appendingPathComponent("sec.sqlite"))
+        let scheduler = ComputeScheduler()
+
+        // 1. `bindHost: "0.0.0.0"` MUST reject arbitrary DNS names (`Host: evil.attacker.example` -> 403) while allowing LAN IPv4 / loopback / .local
+        let lanRouter = HeylookRouter(
+            store: store,
+            scheduler: scheduler,
+            bindHost: "0.0.0.0",
+            allowedHosts: ["studio.tailnet.ts.net"],
+            adminToken: "topsecret_admin_token"
+        )
+
+        let evilResp = await lanRouter.handle(
+            method: "GET",
+            path: "/v1/models",
+            headers: ["Host": "evil.attacker.example:8000"]
+        )
+        #expect(evilResp.status == 403)
+
+        let lanIPResp = await lanRouter.handle(
+            method: "GET",
+            path: "/v1/models",
+            headers: ["Host": "192.168.1.50:8000"]
+        )
+        #expect(lanIPResp.status == 200)
+
+        let allowlistResp = await lanRouter.handle(
+            method: "GET",
+            path: "/v1/models",
+            headers: ["Host": "studio.tailnet.ts.net:8000"]
+        )
+        #expect(allowlistResp.status == 200)
+
+        // 2. `X-Heylook-Admin-Token` enforces 401 (missing), 403 (mismatch), and 200 (valid) on `/v1/admin/*` and `/v1/data/clear`
+        let noAuthResp = await lanRouter.handle(
+            method: "GET",
+            path: "/v1/admin/config",
+            headers: ["Host": "127.0.0.1:8000"]
+        )
+        #expect(noAuthResp.status == 401)
+
+        let badAuthResp = await lanRouter.handle(
+            method: "GET",
+            path: "/v1/admin/config",
+            headers: ["Host": "127.0.0.1:8000", "X-Heylook-Admin-Token": "wrong_token"]
+        )
+        #expect(badAuthResp.status == 403)
+
+        let okAuthResp = await lanRouter.handle(
+            method: "GET",
+            path: "/v1/admin/config",
+            headers: ["Host": "127.0.0.1:8000", "X-Heylook-Admin-Token": "topsecret_admin_token"]
+        )
+        #expect(okAuthResp.status == 200)
+
+        // 3. `X-Request-ID` validation rejects illegal characters with 422 and echoes valid IDs
+        let badReqIDResp = await lanRouter.handle(
+            method: "GET",
+            path: "/v1/models",
+            headers: ["Host": "127.0.0.1:8000", "X-Request-ID": "bad id with spaces!"]
+        )
+        #expect(badReqIDResp.status == 422)
+
+        let validReqIDResp = await lanRouter.handle(
+            method: "GET",
+            path: "/v1/models",
+            headers: ["Host": "127.0.0.1:8000", "X-Request-ID": "trace_req-2026.01:ok"]
+        )
+        #expect(validReqIDResp.status == 200)
+        #expect(validReqIDResp.headers["X-Request-ID"] == "trace_req-2026.01:ok")
+
+        // 4. `isReadOnlyConfig: true` blocks config/sidecar writes with 409
+        let roRouter = HeylookRouter(store: store, scheduler: scheduler, isReadOnlyConfig: true)
+        let roPatch = await roRouter.handle(
+            method: "PATCH",
+            path: "/v1/admin/config",
+            headers: ["Host": "127.0.0.1:8000"],
+            body: Data(#"{"max_loaded_models":2}"#.utf8)
+        )
+        #expect(roPatch.status == 409)
+
+        // 5. HTTP status reason phrases
+        #expect(HeylookHTTPResponse.statusReasonPhrase(for: 201) == "Created")
+        #expect(HeylookHTTPResponse.statusReasonPhrase(for: 409) == "Conflict")
+        #expect(HeylookHTTPResponse.statusReasonPhrase(for: 422) == "Unprocessable Entity")
+        #expect(HeylookHTTPResponse.statusReasonPhrase(for: 503) == "Service Unavailable")
+    }
+
+    // MARK: - 37. Full CRUD Route Parity: Clone, Message Compaction, Notebooks, Presets, Admin Fit/Validate & Telemetry
+
+    @Test("HeylookRouter serves conversation clone, single-message delete compaction, notebooks CRUD+generate, presets CRUD, admin validate/fit, cache/data clear, and telemetry logs")
+    func testConversationsNotebooksPresetsAndAdminRoutesFullCRUDParity() async throws {
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_crud_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let store = try SQLiteStore(databaseURL: tmpDir.appendingPathComponent("crud.sqlite"))
+        let scheduler = ComputeScheduler()
+        let desc = EngineDescription(
+            modelID: "crud-mlx",
+            provider: .mlx,
+            modelPath: tmpDir.path,
+            isLoaded: true
+        )
+        await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
+        let router = HeylookRouter(store: store, scheduler: scheduler, allowSyntheticFallback: true)
+        let hostHdr = ["Host": "127.0.0.1:8000", "Content-Type": "application/json"]
+
+        // 1. Conversation messages + single-message DELETE position compaction + POST /clone
+        _ = await router.handle(
+            method: "POST",
+            path: "/v1/conversations",
+            headers: hostHdr,
+            body: try JSONEncoder().encode(ConversationRecord(id: "c_orig", title: "Original"))
+        )
+        for idx in 0..<3 {
+            _ = await router.handle(
+                method: "POST",
+                path: "/v1/conversations/c_orig/messages",
+                headers: hostHdr,
+                body: try JSONEncoder().encode(
+                    MessageRecord(id: "msg_\(idx)", conversationID: "c_orig", position: idx, role: "user", content: "Turn \(idx)")
+                )
+            )
+        }
+        // Delete middle message `msg_1` -> remaining positions compact to `[0, 1]`
+        let delMiddle = await router.handle(
+            method: "DELETE",
+            path: "/v1/conversations/c_orig/messages/msg_1",
+            headers: hostHdr
+        )
+        #expect(delMiddle.status == 200)
+        let compacted = try store.listMessages(conversationID: "c_orig")
+        #expect(compacted.map(\.id) == ["msg_0", "msg_2"])
+        #expect(compacted.map(\.position) == [0, 1])
+
+        // Clone conversation
+        let cloneResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/c_orig/clone",
+            headers: hostHdr,
+            body: Data(#"{"title":"Branch Clone"}"#.utf8)
+        )
+        #expect(cloneResp.status == 201)
+        let clonedConv = try JSONDecoder().decode(ConversationRecord.self, from: cloneResp.body)
+        #expect(clonedConv.title == "Branch Clone")
+        #expect(try store.listMessages(conversationID: clonedConv.id).count == 2)
+
+        // 2. Notebooks CRUD + `/generate`
+        let nbCreate = await router.handle(
+            method: "POST",
+            path: "/v1/notebooks",
+            headers: hostHdr,
+            body: try JSONEncoder().encode(NotebookRecord(id: "nb_1", title: "Draft", body: "Outline kernel architecture", modelID: "crud-mlx"))
+        )
+        #expect(nbCreate.status == 201)
+
+        let nbPatch = await router.handle(
+            method: "PATCH",
+            path: "/v1/notebooks/nb_1",
+            headers: hostHdr,
+            body: Data(#"{"title":"Updated Draft"}"#.utf8)
+        )
+        #expect(nbPatch.status == 200)
+        let updatedNB = try JSONDecoder().decode(NotebookRecord.self, from: nbPatch.body)
+        #expect(updatedNB.title == "Updated Draft")
+
+        let nbGen = await router.handle(
+            method: "POST",
+            path: "/v1/notebooks/nb_1/generate",
+            headers: hostHdr,
+            body: Data("{}".utf8)
+        )
+        #expect(nbGen.status == 200)
+
+        let nbDel = await router.handle(method: "DELETE", path: "/v1/notebooks/nb_1", headers: hostHdr)
+        #expect(nbDel.status == 200)
+        let nbGet404 = await router.handle(method: "GET", path: "/v1/notebooks/nb_1", headers: hostHdr)
+        #expect(nbGet404.status == 404)
+
+        // 3. Presets individual GET / PATCH / DELETE
+        let presetCreate = await router.handle(
+            method: "POST",
+            path: "/v1/presets",
+            headers: hostHdr,
+            body: try JSONEncoder().encode(PresetRecord(id: "p_custom", name: "Precise Deterministic", settings: SamplerSettings(temperature: 0.0)))
+        )
+        #expect(presetCreate.status == 201)
+        let presetPatch = await router.handle(
+            method: "PATCH",
+            path: "/v1/presets/p_custom",
+            headers: hostHdr,
+            body: Data(#"{"description":"Zero-temp deterministic"}"#.utf8)
+        )
+        #expect(presetPatch.status == 200)
+        #expect(try store.getPreset(id: "p_custom")?.description == "Zero-temp deterministic")
+        let presetDel = await router.handle(method: "DELETE", path: "/v1/presets/p_custom", headers: hostHdr)
+        #expect(presetDel.status == 200)
+
+        // 4. Admin validate, fit, model-options, cache/clear, telemetry/events, admin/config/logs, and data/clear
+        let fitResp = await router.handle(
+            method: "POST",
+            path: "/v1/admin/models/fit",
+            headers: hostHdr,
+            body: Data(#"{"model_id":"crud-mlx","ctx_size":16384}"#.utf8)
+        )
+        #expect(fitResp.status == 200)
+
+        let optsResp = await router.handle(method: "GET", path: "/v1/admin/models/model-options", headers: hostHdr)
+        #expect(optsResp.status == 200)
+
+        let cacheClearResp = await router.handle(method: "POST", path: "/v1/cache/clear", headers: hostHdr)
+        #expect(cacheClearResp.status == 200)
+
+        let telemResp = await router.handle(
+            method: "POST",
+            path: "/v1/telemetry/events",
+            headers: hostHdr,
+            body: Data(#"{"event":"ui_surface_open"}"#.utf8)
+        )
+        #expect(telemResp.status == 202)
+
+        let logsResp = await router.handle(method: "GET", path: "/v1/admin/config/logs", headers: hostHdr)
+        #expect(logsResp.status == 200)
+
+        let clearDataResp = await router.handle(method: "POST", path: "/v1/data/clear", headers: hostHdr)
+        #expect(clearDataResp.status == 200)
+        #expect(try store.listConversations().isEmpty)
+    }
+
+    // MARK: - 38. Multimodal Message PATCH Block Sync, Schema PATCH/Generate Fields, 400 Depth on Generate, 6h Profile, SSE X-Request-ID & Case-Insensitive Presets
+
+    @Test("HeylookRouter syncs multimodal contentBlocks on PATCH, preserves Wave 1/2 PATCH & notebook generate fields, validates 400 thinking_depth on conversation generate, filters 6h profile, emits fallback SSE X-Request-ID, and enforces NOCASE presets")
+    func testMultimodalPatchSyncSchemaFieldsGenerateDepth6hProfileSSERequestIDAndNocasePresets() async throws {
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_wave1_rev_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let dbURL = tmpDir.appendingPathComponent("rev.sqlite")
+        let store = try SQLiteStore(databaseURL: dbURL)
+        let scheduler = ComputeScheduler()
+        let desc = EngineDescription(
+            modelID: "harmony-vlm",
+            provider: .mlx,
+            modelPath: tmpDir.path,
+            isLoaded: true,
+            supportsVision: ProvenanceField(value: true, provenance: .derived),
+            supportsThinking: ProvenanceField(value: true, provenance: .derived),
+            thinkingControls: ThinkingControls(
+                supportsThinking: true,
+                canDisableThinking: true,
+                defaultEnabled: true,
+                depthVariable: "reasoning_effort",
+                depthValues: ["low", "medium", "high"]
+            )
+        )
+        await scheduler.register(provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true), description: desc)
+        let router = HeylookRouter(store: store, scheduler: scheduler, allowSyntheticFallback: true)
+        let hostHdr = ["Host": "127.0.0.1:8000", "Content-Type": "application/json"]
+
+        // 1. PATCH /v1/conversations/{id}/messages/{msgID} updates `.text(...)` inside multimodal `contentBlocks` while preserving `.media(...)`
+        try store.upsertConversation(ConversationRecord(id: "conv_mm_patch", title: "MM Edit", defaultModelID: "harmony-vlm"))
+        let pngAtt = MessagesRequest.MediaAttachment(
+            kind: "image",
+            mediaType: "image/png",
+            dataBase64: Data([0x89, 0x50, 0x4E, 0x47, 0x01, 0x02]).base64EncodedString(),
+            filename: "diagram.png"
+        )
+        let savedMM = try store.appendMessage(
+            MessageRecord(
+                id: "m_mm_0",
+                conversationID: "conv_mm_patch",
+                position: 0,
+                role: "user",
+                content: "Old pre-edit text",
+                contentBlocks: [.media(pngAtt), .text("Old pre-edit text")]
+            )
+        )
+        let patchMsgResp = await router.handle(
+            method: "PATCH",
+            path: "/v1/conversations/conv_mm_patch/messages/\(savedMM.id)",
+            headers: hostHdr,
+            body: Data(#"{"content":"Updated post-edit text"}"#.utf8)
+        )
+        #expect(patchMsgResp.status == 200)
+        let reloadedMM = try #require(try store.getMessage(id: savedMM.id, hydrateMedia: true))
+        #expect(reloadedMM.content == "Updated post-edit text")
+        #expect(reloadedMM.contentBlocks?.count == 2)
+        if let blocks = reloadedMM.contentBlocks {
+            if case .media(let keptAtt) = blocks[0] {
+                #expect(keptAtt.kind == "image")
+                #expect(!keptAtt.dataBase64.isEmpty)
+            } else {
+                Issue.record("Expected preserved .media block at index 0")
+            }
+            #expect(blocks[1] == .text("Updated post-edit text"))
+        }
+        let promptInspect = await router.handle(
+            method: "GET",
+            path: "/v1/conversations/conv_mm_patch/prompt",
+            queryItems: [URLQueryItem(name: "model", value: "harmony-vlm")],
+            headers: hostHdr
+        )
+        #expect(promptInspect.status == 200)
+        let promptBody = String(decoding: promptInspect.body, as: UTF8.self)
+        #expect(promptBody.contains("Updated post-edit text"))
+        #expect(!promptBody.contains("Old pre-edit text"))
+
+        // 2 & 6. Case-insensitive preset uniqueness (`"creative"` vs `"Creative"` -> 409) + PATCH /v1/presets/{id} updating & clearing `system_prompt` and `scope`
+        let p1 = PresetRecord(
+            id: "preset_creative_1",
+            name: "creative",
+            scope: "sampler",
+            settings: SamplerSettings(temperature: 0.9),
+            systemPrompt: "Initial system prompt"
+        )
+        let p1Resp = await router.handle(method: "POST", path: "/v1/presets", headers: hostHdr, body: try JSONEncoder().encode(p1))
+        #expect(p1Resp.status == 201)
+
+        let pDupCase = PresetRecord(
+            id: "preset_creative_2",
+            name: "Creative",
+            scope: "sampler",
+            settings: SamplerSettings(temperature: 0.8)
+        )
+        let pDupResp = await router.handle(method: "POST", path: "/v1/presets", headers: hostHdr, body: try JSONEncoder().encode(pDupCase))
+        #expect(pDupResp.status == 409)
+
+        let pUpdateScopeAndSys = await router.handle(
+            method: "PATCH",
+            path: "/v1/presets/preset_creative_1",
+            headers: hostHdr,
+            body: Data(#"{"scope":"full","system_prompt":"Revised system prompt"}"#.utf8)
+        )
+        #expect(pUpdateScopeAndSys.status == 200)
+        let afterSet = try #require(try store.getPreset(id: "preset_creative_1"))
+        #expect(afterSet.scope == "full")
+        #expect(afterSet.systemPrompt == "Revised system prompt")
+
+        let pClearSys = await router.handle(
+            method: "PATCH",
+            path: "/v1/presets/preset_creative_1",
+            headers: hostHdr,
+            body: Data(#"{"system_prompt":""}"#.utf8)
+        )
+        #expect(pClearSys.status == 200)
+        #expect(try store.getPreset(id: "preset_creative_1")?.systemPrompt == nil)
+
+        // Conversation PATCH `params` + `applied_preset_id` (and clearing)
+        let convPatchSet = await router.handle(
+            method: "PATCH",
+            path: "/v1/conversations/conv_mm_patch",
+            headers: hostHdr,
+            body: Data(#"{"params":{"temperature":0.25,"top_k":16},"applied_preset_id":"preset_creative_1"}"#.utf8)
+        )
+        #expect(convPatchSet.status == 200)
+        let patchedConv = try #require(try store.getConversation(id: "conv_mm_patch"))
+        #expect(patchedConv.params?.temperature == 0.25)
+        #expect(patchedConv.params?.topK == 16)
+        #expect(patchedConv.appliedPresetID == "preset_creative_1")
+
+        let convPatchClear = await router.handle(
+            method: "PATCH",
+            path: "/v1/conversations/conv_mm_patch",
+            headers: hostHdr,
+            body: Data(#"{"params":null,"applied_preset_id":""}"#.utf8)
+        )
+        #expect(convPatchClear.status == 200)
+        let clearedConv = try #require(try store.getConversation(id: "conv_mm_patch"))
+        #expect(clearedConv.params == nil)
+        #expect(clearedConv.appliedPresetID == nil)
+
+        // Notebook PATCH `params` + `applied_preset_id` AND `POST /v1/notebooks/{id}/generate` forwarding `nb.params` (verified via thinking_depth validation)
+        _ = await router.handle(
+            method: "POST",
+            path: "/v1/notebooks",
+            headers: hostHdr,
+            body: try JSONEncoder().encode(NotebookRecord(id: "nb_params", title: "NB", body: "Draft", modelID: "harmony-vlm"))
+        )
+        let nbPatch = await router.handle(
+            method: "PATCH",
+            path: "/v1/notebooks/nb_params",
+            headers: hostHdr,
+            body: Data(#"{"params":{"temperature":0.12,"thinking_depth":"ultra_invalid"},"applied_preset_id":"preset_creative_1"}"#.utf8)
+        )
+        #expect(nbPatch.status == 200)
+        let patchedNB = try #require(try store.getNotebook(id: "nb_params"))
+        #expect(patchedNB.params?.temperature == 0.12)
+        #expect(patchedNB.appliedPresetID == "preset_creative_1")
+
+        // Calling `/v1/notebooks/nb_params/generate` forwards `nb.params.thinkingDepth == "ultra_invalid"` into `MessagesRequest` -> HTTP 400!
+        let nbBadDepthGen = await router.handle(
+            method: "POST",
+            path: "/v1/notebooks/nb_params/generate",
+            headers: hostHdr,
+            body: Data("{}".utf8)
+        )
+        #expect(nbBadDepthGen.status == 400)
+
+        // Overriding `thinking_depth` in the `/generate` body to `"high"` succeeds (200)
+        let nbValidOverrideGen = await router.handle(
+            method: "POST",
+            path: "/v1/notebooks/nb_params/generate",
+            headers: hostHdr,
+            body: Data(#"{"thinking_depth":"high"}"#.utf8)
+        )
+        #expect(nbValidOverrideGen.status == 200)
+
+        // 3. POST /v1/conversations/{id}/generate validates `thinking_depth` with HTTP 400 BEFORE mutating the store
+        let badConvGen = ConversationGenerateRequest(
+            model: "harmony-vlm",
+            content: "Should not persist on 400",
+            mode: .append,
+            thinkingDepth: "bogus_depth"
+        )
+        let badConvResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_never_created/generate",
+            headers: hostHdr,
+            body: try JSONEncoder().encode(badConvGen)
+        )
+        #expect(badConvResp.status == 400)
+        #expect(try store.getConversation(id: "conv_never_created") == nil)
+
+        // 4. GET /v1/performance/profile/6h includes 1h-old stats and excludes 12h-old stats
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        _ = try store.appendMessage(
+            MessageRecord(id: "m_stat_old", conversationID: "conv_mm_patch", position: 1, role: "assistant", content: "Old")
+        )
+        _ = try store.appendMessage(
+            MessageRecord(id: "m_stat_recent", conversationID: "conv_mm_patch", position: 2, role: "assistant", content: "Recent")
+        )
+        try store.upsertMessageStats(
+            MessageStatsRecord(
+                messageID: "m_stat_old",
+                conversationID: "conv_mm_patch",
+                modelID: "harmony-vlm",
+                promptTokens: 20,
+                outputTokens: 10,
+                generationTPS: 50.0,
+                createdUnixMs: nowMs - 12 * 3_600_000
+            )
+        )
+        try store.upsertMessageStats(
+            MessageStatsRecord(
+                messageID: "m_stat_recent",
+                conversationID: "conv_mm_patch",
+                modelID: "harmony-vlm",
+                promptTokens: 30,
+                outputTokens: 15,
+                generationTPS: 80.0,
+                createdUnixMs: nowMs - 1 * 3_600_000
+            )
+        )
+        let prof6hResp = await router.handle(method: "GET", path: "/v1/performance/profile/6h", headers: hostHdr)
+        #expect(prof6hResp.status == 200)
+        let prof6hObj = try JSONSerialization.jsonObject(with: prof6hResp.body) as? [String: Any]
+        #expect((prof6hObj?["sample_count"] as? Int) == 1)
+
+        let prof24hResp = await router.handle(method: "GET", path: "/v1/performance/profile/24h", headers: hostHdr)
+        let prof24hObj = try JSONSerialization.jsonObject(with: prof24hResp.body) as? [String: Any]
+        #expect((prof24hObj?["sample_count"] as? Int) == 2)
+
+        // 5. Live chunked SSE wire dispatcher (`dispatchRawHTTPBuffer`) emits generated `X-Request-ID: req_...` when client omits header
+        actor WireCapture {
+            var data = Data()
+            var didClose = false
+            func append(_ d: Data) { data.append(d) }
+            func markClosed() { didClose = true }
+        }
+        let wireCapture = WireCapture()
+        let streamPayload = #"{"model":"harmony-vlm","messages":[{"role":"user","content":"Ping"}],"stream":true}"#
+        let rawHTTP = "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:8000\r\nContent-Type: application/json\r\nContent-Length: \(streamPayload.utf8.count)\r\n\r\n\(streamPayload)"
+        await HeylookHTTPServer.dispatchRawHTTPBuffer(
+            Data(rawHTTP.utf8),
+            router: router,
+            sendBytes: { chunk in await wireCapture.append(chunk) },
+            closeConnection: { Task { await wireCapture.markClosed() } }
+        )
+        let capturedWire = String(decoding: await wireCapture.data, as: UTF8.self)
+        #expect(capturedWire.contains("HTTP/1.1 200 OK\r\n"))
+        #expect(capturedWire.contains("Transfer-Encoding: chunked\r\n"))
+        #expect(capturedWire.contains("X-Request-ID: req_"))
+        #expect(capturedWire.hasSuffix("0\r\n\r\n"))
+
+        // 7. `model.heylook.toml` `chat_template` sidecar key sets `origin == "sidecar"` in `inspectChatTemplate`
+        let sidecarTplDir = tmpDir.appendingPathComponent("sidecar_tpl_model", isDirectory: true)
+        try FileManager.default.createDirectory(at: sidecarTplDir, withIntermediateDirectories: true)
+        var scTpl = ModelSidecarConfig()
+        scTpl.chatTemplate = "{% for m in messages %}[SC:{{ m.role }}]{{ m.content }}{% endfor %}"
+        try scTpl.toTOML().write(to: sidecarTplDir.appendingPathComponent("model.heylook.toml"), atomically: true, encoding: .utf8)
+        let scState = HeylookConfig.inspectChatTemplate(in: sidecarTplDir)
+        #expect(scState.origin == "sidecar")
+        let scRendered = try HeylookConfig.renderPromptDetailed(
+            in: sidecarTplDir,
+            system: nil,
+            turns: [.init(role: "user", content: "Hello")]
+        )
+        #expect(scRendered.prompt == "[SC:user]Hello")
+    }
+
+    @Test("Wave 2 public seams: non-destructive [scan] folders TOML editing, ChatTemplateInspection + validateSyntax, assessRAMFit, and HeylookObservabilityLog")
+    func testWave2ConfigTemplateRAMFitAndObservabilitySeams() throws {
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_wave2_seams_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        // 1. Non-destructive `[scan] folders` round-trip preserving `[[models]]`, `admin_token`, and `allowed_hosts`
+        let cfgURL = tmpDir.appendingPathComponent("heylook.toml")
+        let initialTOML = """
+        default_model = "qwen3.5-9b-mlx"
+        max_loaded_models = 4
+        max_queue_depth = 3
+        admin_token = "test_fixture_token"
+        allowed_hosts = ["example.local", "127.0.0.1"]
+
+        [scan]
+        folders = ["~/.heylook/models/primary"]
+
+        [[models]]
+        id = "qwen3.5-9b-mlx"
+        path = "~/.heylook/models/primary/Qwen3.5-9B-MLX-4bit"
+        provider = "mlx"
+        pinned = true
+        ctx_size = 32768
+        tags = ["chat", "thinking"]
+
+        [[models]]
+        id = "gemma4-gguf"
+        path = "~/.heylook/models/gguf/gemma-4.gguf"
+        provider = "gguf"
+        image_max_tokens = 560
+        """
+        try initialTOML.write(to: cfgURL, atomically: true, encoding: .utf8)
+
+        let afterAdd = try HeylookConfig.addScanFolder("~/.heylook/models/secondary", configURL: cfgURL)
+        #expect(afterAdd.scanFolders == ["~/.heylook/models/primary", "~/.heylook/models/secondary"])
+        // Duplicate normalized path with trailing slash is ignored
+        let afterDup = try HeylookConfig.addScanFolder("~/.heylook/models/secondary/", configURL: cfgURL)
+        #expect(afterDup.scanFolders == ["~/.heylook/models/primary", "~/.heylook/models/secondary"])
+
+        let reparsedAfterAdd = HeylookConfig.parseTOML(try String(contentsOf: cfgURL, encoding: .utf8))
+        #expect(reparsedAfterAdd.defaultModel == "qwen3.5-9b-mlx")
+        #expect(reparsedAfterAdd.maxLoadedModels == 4)
+        #expect(reparsedAfterAdd.maxQueueDepth == 3)
+        #expect(reparsedAfterAdd.adminToken == "test_fixture_token")
+        #expect(reparsedAfterAdd.allowedHosts == ["example.local", "127.0.0.1"])
+        #expect(reparsedAfterAdd.explicitModels.count == 2)
+        #expect(reparsedAfterAdd.explicitModels[0].sidecar.pinned == true)
+        #expect(reparsedAfterAdd.explicitModels[0].sidecar.ctxSize == 32768)
+        #expect(reparsedAfterAdd.explicitModels[0].sidecar.tags == ["chat", "thinking"])
+        #expect(reparsedAfterAdd.explicitModels[1].sidecar.imageMaxTokens == 560)
+
+        let afterRemove = try HeylookConfig.removeScanFolder("~/.heylook/models/primary", configURL: cfgURL)
+        #expect(afterRemove.scanFolders == ["~/.heylook/models/secondary"])
+        let reparsedAfterRemove = HeylookConfig.parseTOML(try String(contentsOf: cfgURL, encoding: .utf8))
+        #expect(reparsedAfterRemove.scanFolders == ["~/.heylook/models/secondary"])
+        #expect(reparsedAfterRemove.explicitModels.count == 2)
+        #expect(reparsedAfterRemove.adminToken == "test_fixture_token")
+
+        // 2. `ChatTemplateInspection` (`origin`, `writable`, `inertReason`, `stale`, `prefixStable`, `modifiedSinceDownload`, `detectedCapabilities`) + `validateSyntax`
+        let tplModelDir = tmpDir.appendingPathComponent("tpl_inspect_model", isDirectory: true)
+        let hfMetaDir = tplModelDir
+            .appendingPathComponent(".cache", isDirectory: true)
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("download", isDirectory: true)
+        try FileManager.default.createDirectory(at: hfMetaDir, withIntermediateDirectories: true)
+
+        let vendorTpl = "{% for m in messages %}<|im_start|>{{ m.role }}\n{% if m.content is string %}{{ m.content }}{% else %}<|vision_start|>{% endif %}<|im_end|>\n{% endfor %}{% if add_generation_prompt and enable_thinking %}<think>{% endif %}"
+        let vendorURL = tplModelDir.appendingPathComponent("chat_template.jinja")
+        try vendorTpl.write(to: vendorURL, atomically: true, encoding: .utf8)
+
+        let vendorBytes = Data(vendorTpl.utf8)
+        var gitBlob = Data("blob \(vendorBytes.count)\0".utf8)
+        gitBlob.append(vendorBytes)
+        let vendorGitSHA1 = Insecure.SHA1.hash(data: gitBlob).map { String(format: "%02x", $0) }.joined()
+        try "https://huggingface.co/example/resolve/main/chat_template.jinja\n\(vendorGitSHA1)\n"
+            .write(to: hfMetaDir.appendingPathComponent("chat_template.jinja.metadata"), atomically: true, encoding: .utf8)
+
+        let cleanInspect: ChatTemplateInspection = HeylookConfig.inspectChatTemplate(in: tplModelDir)
+        #expect(cleanInspect.origin == "vendor_sidecar")
+        #expect(cleanInspect.writable == true)
+        #expect(cleanInspect.modifiedSinceDownload == false)
+        #expect(cleanInspect.prefixStable == true)
+        #expect(cleanInspect.detectedCapabilities.supportsThinking == true)
+        #expect(cleanInspect.detectedCapabilities.supportsVision == true)
+        #expect(cleanInspect.stale == false)
+
+        // Mutate vendor file on disk -> modifiedSinceDownload flips to true, stale flips when loadedTemplateText differs
+        try (vendorTpl + "\n{# local edit #}").write(to: vendorURL, atomically: true, encoding: .utf8)
+        let dirtyInspect = HeylookConfig.inspectChatTemplate(in: tplModelDir, loadedTemplateText: vendorTpl)
+        #expect(dirtyInspect.modifiedSinceDownload == true)
+        #expect(dirtyInspect.stale == true)
+
+        // Sidecar `chat_template_path` sets `inertReason` when operator override is also present
+        let customURL = tplModelDir.appendingPathComponent("custom.jinja")
+        try "{% for m in messages %}{{ strftime_now('%H:%M') }} {{ m.content }}{% endfor %}".write(to: customURL, atomically: true, encoding: .utf8)
+        var scInert = ModelSidecarConfig()
+        scInert.chatTemplatePath = "custom.jinja"
+        try HeylookConfig.writeSidecar(scInert, in: tplModelDir)
+        try vendorTpl.write(to: tplModelDir.appendingPathComponent("chat_template.heylook.jinja"), atomically: true, encoding: .utf8)
+        let inertInspect = HeylookConfig.inspectChatTemplate(in: tplModelDir)
+        #expect(inertInspect.inertReason != nil)
+        #expect(inertInspect.prefixStable == false)
+        #expect(inertInspect.prefixStabilityNote != nil)
+
+        try HeylookJinjaRenderer.validateSyntax(vendorTpl)
+        #expect(throws: JinjaTemplateError.self) {
+            try HeylookJinjaRenderer.validateSyntax("   ")
+        }
+        #expect(throws: JinjaTemplateError.self) {
+            try HeylookJinjaRenderer.validateSyntax("{% if enable_thinking %}{{ message.content }")
+        }
+        #expect(throws: JinjaTemplateError.self) {
+            try HeylookJinjaRenderer.validateSyntax("{% if enable_thinking %}hi{% endfor %}")
+        }
+
+        // 3. `GGUFSpawnConfig.assessRAMFit` & `HeylookConfig.estimateModelMemoryMB`
+        let ggufDir = tmpDir.appendingPathComponent("gguf_fit_model", isDirectory: true)
+        try FileManager.default.createDirectory(at: ggufDir, withIntermediateDirectories: true)
+        let mainGGUF = ggufDir.appendingPathComponent("model-q4_k_m.gguf")
+        let drafterGGUF = ggufDir.appendingPathComponent("mtp-drafter.gguf")
+        let mmprojGGUF = ggufDir.appendingPathComponent("mmproj-f16.gguf")
+        var mainPayload = GGUFHeaderReader.buildMinimalGGUF(
+            stringMetadata: ["general.architecture": "qwen35"],
+            uint32Metadata: [
+                "qwen35.block_count": 32,
+                "qwen35.attention.head_count_kv": 8,
+                "qwen35.embedding_length": 4096,
+            ]
+        )
+        mainPayload.append(Data(count: 4 * 1_048_576))
+        try mainPayload.write(to: mainGGUF)
+        try Data(count: 3 * 1_048_576).write(to: drafterGGUF)
+        try Data(count: 2 * 1_048_576).write(to: mmprojGGUF)
+
+        let estMB = HeylookConfig.estimateModelMemoryMB(
+            in: ggufDir,
+            primaryGGUFURL: mainGGUF,
+            drafterPath: drafterGGUF.path,
+            mmprojPath: mmprojGGUF.path
+        )
+        #expect(estMB >= 9)
+
+        let ggufDesc = EngineDescription(
+            modelID: "qwen35-fit",
+            provider: .gguf,
+            modelPath: mainGGUF.path,
+            contextSize: .init(value: 32768, provenance: .derived, effect: .reload),
+            estimatedMemoryMB: 12 * 1024 // 12 GB main model
+        )
+        let generousFit = GGUFSpawnConfig.assessRAMFit(for: ggufDesc, ctxSize: 8192, headroomOverrideGB: 64.0)
+        #expect(generousFit.fitsInMemory == true)
+        #expect(generousFit.droppedDrafterForMemory == false)
+
+        let tinyFit = GGUFSpawnConfig.assessRAMFit(for: ggufDesc, ctxSize: 32768, headroomOverrideGB: 1.0)
+        #expect(tinyFit.fitsInMemory == false)
+        #expect(tinyFit.droppedDrafterForMemory == true)
+        #expect(tinyFit.recommendedCtxSize < 32768)
+
+        // 4. `HeylookObservabilityLog` level filtering, retention pruning, category/search query, and clear
+        let logFile = tmpDir.appendingPathComponent("events_wave2.jsonl")
+        let obsLog = HeylookObservabilityLog(maxEntries: 32, level: "WARN", logFileURL: logFile)
+        #expect(obsLog.level == "WARN")
+        obsLog.record(level: "DEBUG", category: "mlx", message: "debug ignored")
+        obsLog.record(level: "INFO", category: "router", message: "info ignored")
+        obsLog.record(level: "WARN", category: "mlx", message: "kv_trim fallback triggered", requestID: "req_w1")
+        obsLog.record(level: "ERROR", category: "gguf", message: "drafter rejected", requestID: "req_e1")
+        #expect(obsLog.recentEvents.count == 2)
+        #expect(FileManager.default.fileExists(atPath: logFile.path))
+
+        obsLog.level = "DEBUG"
+        for idx in 0..<24 {
+            obsLog.record(
+                level: idx % 2 == 0 ? "DEBUG" : "INFO",
+                category: idx % 3 == 0 ? "mlx" : "router",
+                message: "event_\(idx) kv_trim=\(idx % 3 == 0)"
+            )
+        }
+        obsLog.retentionLimit = 16
+        #expect(obsLog.retentionLimit == 16)
+        #expect(obsLog.recentEvents.count == 16)
+
+        let mlxFiltered = obsLog.recentEntries(limit: 16, level: "INFO", category: "mlx", search: "kv_trim=true")
+        #expect(!mlxFiltered.isEmpty)
+        #expect(mlxFiltered.allSatisfy { $0.category == "mlx" && $0.level != "DEBUG" })
+
+        obsLog.clear()
+        #expect(obsLog.recentEvents.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: logFile.path))
+    }
+
+    @Test("Wave 2 store & lock integration: cloneConversation(upToPosition:), clearAllData(), queryPerformanceProfile(1h/6h/24h/7d), mutationStream(), and shared RequestRegistry 409 lock")
+    func testWave2StoreForkProfileClearAndSharedLockIntegration() async throws {
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_wave2_store_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let store = try SQLiteStore(databaseURL: tmpDir.appendingPathComponent("store.sqlite"))
+        let scheduler = ComputeScheduler(maxLoadedGPUModels: 2, maxQueueDepth: 2)
+        let desc = EngineDescription(
+            modelID: "wave2-mlx",
+            provider: .mlx,
+            modelPath: tmpDir.path,
+            supportsVision: .init(value: true, provenance: .derived, effect: .reload),
+            supportsThinking: .init(value: true, provenance: .derived, effect: .reload)
+        )
+        await scheduler.register(
+            provider: MLXSwiftProvider(description: desc, allowSyntheticFallback: true),
+            description: desc
+        )
+        let sharedRegistry = RequestRegistry()
+        let router = HeylookRouter(
+            store: store,
+            scheduler: scheduler,
+            registry: sharedRegistry,
+            allowSyntheticFallback: true
+        )
+
+        actor MutationRecorder {
+            var events: [StoreMutationEvent] = []
+            func append(_ e: StoreMutationEvent) { events.append(e) }
+            func snapshot() -> [StoreMutationEvent] { events }
+        }
+        let recorder = MutationRecorder()
+        let stream = store.mutationStream()
+        let listenerTask = Task {
+            for await ev in stream {
+                await recorder.append(ev)
+            }
+        }
+        defer { listenerTask.cancel() }
+
+        // 1. Seed 4-turn multimodal conversation & fork at position 1 (`upToPosition: 1`)
+        let conv = ConversationRecord(id: "conv_fork_src", title: "Root Thread", systemPrompt: "System A", defaultModelID: "wave2-mlx")
+        try store.upsertConversation(conv)
+        let imgBase64 = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).base64EncodedString()
+        let mmBlocks: [MessagesRequest.MessageTurn.ContentPart] = [
+            .media(.init(kind: "image", mediaType: "image/png", dataBase64: imgBase64)),
+            .text("Describe diagram"),
+        ]
+        try store.appendMessage(MessageRecord(id: "m0", conversationID: conv.id, position: 0, role: "user", content: "Describe diagram", contentBlocks: mmBlocks))
+        try store.appendMessage(MessageRecord(id: "m1", conversationID: conv.id, position: 1, role: "assistant", content: "Diagram shows Dual-Lane ANE.", thinking: "Inspecting nodes"))
+        try store.appendMessage(MessageRecord(id: "m2", conversationID: conv.id, position: 2, role: "user", content: "Turn 2 question"))
+        try store.appendMessage(MessageRecord(id: "m3", conversationID: conv.id, position: 3, role: "assistant", content: "Turn 2 answer"))
+
+        let forked = try store.cloneConversation(id: conv.id, upToPosition: 1, newTitle: "Fork @ Turn 1")
+        #expect(forked.id != conv.id)
+        #expect(forked.title == "Fork @ Turn 1")
+        let forkedMsgs = try store.listMessages(conversationID: forked.id, hydrateMedia: true)
+        #expect(forkedMsgs.map(\.position) == [0, 1])
+        #expect(forkedMsgs.map(\.content) == ["Describe diagram", "Diagram shows Dual-Lane ANE."])
+        let hydratedMedia = forkedMsgs[0].contentBlocks?.compactMap { part -> String? in
+            if case .media(let att) = part { return att.dataBase64 }
+            return nil
+        }.first
+        #expect(hydratedMedia == imgBase64)
+        #expect(try store.listMessages(conversationID: conv.id).count == 4)
+
+        // 2. `queryPerformanceProfile` across `1h` / `6h` / `24h` / `7d` + per-model breakdown
+        let nowMs = SQLiteStore.nowMillis()
+        let statRows: [MessageStatsRecord] = [
+            MessageStatsRecord(messageID: "m0", conversationID: conv.id, modelID: "wave2-mlx", promptTokens: 100, outputTokens: 50, cachedTokens: 60, promptTPS: 400, generationTPS: 80, ttftMs: 120, createdUnixMs: nowMs - 30 * 60_000),
+            MessageStatsRecord(messageID: "m1", conversationID: conv.id, modelID: "wave2-mlx", promptTokens: 200, outputTokens: 100, cachedTokens: 150, promptTPS: 500, generationTPS: 100, ttftMs: 100, createdUnixMs: nowMs - 3 * 3_600_000),
+            MessageStatsRecord(messageID: "m2", conversationID: conv.id, modelID: "gemma4-gguf", promptTokens: 80, outputTokens: 40, cachedTokens: 20, promptTPS: 250, generationTPS: 60, ttftMs: 180, createdUnixMs: nowMs - 18 * 3_600_000),
+            MessageStatsRecord(messageID: "m3", conversationID: conv.id, modelID: "gemma4-gguf", promptTokens: 120, outputTokens: 60, cachedTokens: 40, promptTPS: 300, generationTPS: 70, ttftMs: 160, createdUnixMs: nowMs - 3 * 86_400_000),
+        ]
+        for row in statRows {
+            try store.upsertMessageStats(row)
+        }
+        #expect(try store.queryPerformanceProfile(window: "1h", nowUnixMs: nowMs).sampleCount == 1)
+        #expect(try store.queryPerformanceProfile(window: "6h", nowUnixMs: nowMs).sampleCount == 2)
+        #expect(try store.queryPerformanceProfile(window: "24h", nowUnixMs: nowMs).sampleCount == 3)
+        let p7d = try store.queryPerformanceProfile(window: "7d", nowUnixMs: nowMs)
+        #expect(p7d.sampleCount == 4)
+        #expect(p7d.totalOutputTokens == 250)
+        #expect(p7d.totalCachedTokens == 270)
+        #expect(p7d.byModel.count == 2)
+        #expect(p7d.byModel.first(where: { $0.modelID == "wave2-mlx" })?.averageGenerationTPS == 90.0)
+
+        let hostHdr = ["Host": "127.0.0.1:8000"]
+        let routeProf = await router.handle(method: "GET", path: "/v1/performance/profile/7d", headers: hostHdr)
+        #expect(routeProf.status == 200)
+        let routeProfObj = try JSONSerialization.jsonObject(with: routeProf.body) as? [String: Any]
+        #expect((routeProfObj?["by_model"] as? [[String: Any]])?.count == 2)
+
+        // 3. Shared `RequestRegistry` lock contention (`tryAcquireConversationLock` -> HTTP `409` -> `releaseConversationLock` -> HTTP `200`)
+        let lockExec = sharedRegistry.tryAcquireConversationLock(
+            conversationID: conv.id,
+            requestID: "ui_chat_req_1",
+            modelID: "wave2-mlx"
+        )
+        #expect(lockExec != nil)
+        #expect(sharedRegistry.isConversationGenerating(conv.id) == true)
+
+        let genBody = try JSONSerialization.data(withJSONObject: ["model": "wave2-mlx", "content": "Concurrent HTTP turn"])
+        let conflictResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/\(conv.id)/generate",
+            headers: hostHdr,
+            body: genBody
+        )
+        #expect(conflictResp.status == 409)
+
+        sharedRegistry.releaseConversationLock(conversationID: conv.id, requestID: "ui_chat_req_1", executionID: lockExec)
+        #expect(sharedRegistry.isConversationGenerating(conv.id) == false)
+
+        let okResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/\(conv.id)/generate",
+            headers: hostHdr,
+            body: genBody
+        )
+        #expect(okResp.status == 200)
+
+        // 4. `clearAllData()` wipes conversations, messages, stats, media_blobs, and notebooks while preserving presets
+        _ = try store.createPreset(PresetRecord(id: "p_custom_w2", name: "Wave2 Custom", settings: SamplerSettings(temperature: 0.3)))
+        try store.upsertNotebook(NotebookRecord(id: "nb_w2", title: "Scratch", body: "Draft"))
+        let presetCountBefore = try store.listPresets().count
+        try store.clearAllData()
+
+        #expect(try store.listConversations().isEmpty)
+        #expect(try store.listMessages(conversationID: conv.id).isEmpty)
+        #expect(try store.listMessageStats(sinceUnixMs: 0).isEmpty)
+        #expect(try store.listNotebooks().isEmpty)
+        #expect(try store.listPresets().count == presetCountBefore)
+
+        try await Task.sleep(for: .milliseconds(20))
+        let recordedEvents = await recorder.snapshot()
+        #expect(recordedEvents.contains(.dataCleared))
     }
 }

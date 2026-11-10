@@ -125,9 +125,8 @@ public struct CoreAIBundleManifest: Codable, Sendable, Equatable {
     }
 }
 
-/// Tier 2 Provider: In-process Apple Core AI (`coreai-models` `.aimodel` bundles) & CoreML / Argmax
-/// executing on the Apple Neural Engine (`.ane`) or GPU, with `.aimodel` `metadata.json` inspection
-/// and speculative decoding telemetry (`SpeculativeReport`).
+/// Tier 2 Provider: In-process Apple Core AI (`coreai-models` `.aimodel` bundles) & CoreML
+/// executing on the Apple Neural Engine (`.ane`) or GPU, with `.aimodel` `metadata.json` inspection.
 public actor CoreAIProvider: InferenceProvider {
     public nonisolated let modelID: String
     public nonisolated let providerKind: EngineProviderKind = .coreai
@@ -142,6 +141,7 @@ public actor CoreAIProvider: InferenceProvider {
     private var loadedCoreAIBundle: LanguageModelBundle?
     private var loadedCoreAITokenizer: (any Tokenizers.Tokenizer)?
     private var loadedCoreAIEngine: (any InferenceEngine)?
+    private var engineCachedTokenIDs: [Int] = []
     #endif
 
     public init(description: EngineDescription, allowSyntheticFallback: Bool = false) {
@@ -204,14 +204,48 @@ public actor CoreAIProvider: InferenceProvider {
         bundleManifest
     }
 
-    public func unload() async {
-        unloadCount += 1
-        prefixCache.reset()
-        descriptionState.isLoaded = false
+    public func preload() async throws {
         #if canImport(CoreAILanguageModels)
+        if let mainComp = bundleManifest?.mainComponent,
+           FileManager.default.fileExists(
+               atPath: URL(fileURLWithPath: descriptionState.modelPath).appendingPathComponent(mainComp).path
+           ) {
+            _ = try await ensureCoreAILoaded()
+            return
+        }
+        #endif
+        if allowSyntheticFallback {
+            descriptionState.isLoaded = true
+            return
+        }
+        if bundleManifest == nil {
+            throw ProviderExecutionError.checkpointNotFound(
+                modelID: modelID,
+                path: descriptionState.modelPath
+            )
+        }
+        throw ProviderExecutionError.runtimeUnavailable(
+            modelID: modelID,
+            detail: "Compiled .mlmodelc component or CoreAILanguageModels runtime unavailable at \(descriptionState.modelPath)"
+        )
+    }
+
+    public func clearCache() async -> Bool {
+        prefixCache.reset()
+        #if canImport(CoreAILanguageModels)
+        engineCachedTokenIDs.removeAll()
         if let engine = loadedCoreAIEngine {
             try? await engine.reset()
         }
+        #endif
+        return true
+    }
+
+    public func unload() async {
+        unloadCount += 1
+        _ = await clearCache()
+        descriptionState.isLoaded = false
+        #if canImport(CoreAILanguageModels)
         loadedCoreAIEngine = nil
         loadedCoreAITokenizer = nil
         loadedCoreAIBundle = nil
@@ -227,6 +261,7 @@ public actor CoreAIProvider: InferenceProvider {
         let placement = descriptionState.computePlacement.value
         let cacheReport = prefixCache.evaluate(system: request.system, messages: request.messages)
         let enableThinking = (effectiveSampling.thinking ?? true) && descriptionState.supportsThinking.value
+        let resolvedStops = effectiveSampling.stopSequences ?? request.stopSequences ?? []
 
         #if canImport(CoreAILanguageModels)
         if let mainComp = bundleManifest?.mainComponent,
@@ -239,6 +274,7 @@ public actor CoreAIProvider: InferenceProvider {
                 effectiveSampling: effectiveSampling,
                 cacheReport: cacheReport,
                 enableThinking: enableThinking,
+                stopSequences: resolvedStops,
                 placement: placement,
                 registry: registry
             )
@@ -284,6 +320,9 @@ public actor CoreAIProvider: InferenceProvider {
             reasoningFormat: templateInfo.reasoningFormat,
             thinkingEnabled: enableThinking,
             strippableSpecialTokens: Array(templateInfo.strippableSpecialTokens),
+            stopSequences: resolvedStops,
+            maxTokens: effectiveSampling.maxTokens,
+            thinkingBudget: effectiveSampling.thinkingBudget,
             computePlacement: placement,
             registry: registry,
             onComplete: { [weak self] reply in
@@ -309,6 +348,7 @@ public actor CoreAIProvider: InferenceProvider {
         loadedCoreAIBundle = bundle
         loadedCoreAITokenizer = tokenizer
         loadedCoreAIEngine = engine
+        engineCachedTokenIDs.removeAll()
         descriptionState.isLoaded = true
         return (bundle, tokenizer, engine)
     }
@@ -317,12 +357,35 @@ public actor CoreAIProvider: InferenceProvider {
         try? await loadedCoreAIEngine?.cancel()
     }
 
+    private func prepareEngineTokens(
+        engine: any InferenceEngine,
+        fullPromptTokens: [Int]
+    ) async throws -> (deltaTokens: [Int], cachedCount: Int) {
+        // Only extend stateful InferenceEngine when the prior cached sequence is an exact prefix
+        // of `fullPromptTokens` with at least 1 new token to evaluate; otherwise reset cleanly!
+        if !engineCachedTokenIDs.isEmpty,
+           fullPromptTokens.count > engineCachedTokenIDs.count,
+           Array(fullPromptTokens.prefix(engineCachedTokenIDs.count)) == engineCachedTokenIDs {
+            let delta = Array(fullPromptTokens.dropFirst(engineCachedTokenIDs.count))
+            engineCachedTokenIDs = fullPromptTokens
+            return (delta, fullPromptTokens.count - delta.count)
+        }
+        try await engine.reset()
+        engineCachedTokenIDs = fullPromptTokens
+        return (fullPromptTokens, 0)
+    }
+
+    private func appendGeneratedEngineTokenID(_ tokenID: Int) {
+        engineCachedTokenIDs.append(tokenID)
+    }
+
     private func generateWithCoreAIEngine(
         requestID: String,
         request: MessagesRequest,
         effectiveSampling: SamplerSettings,
         cacheReport: CacheReport,
         enableThinking: Bool,
+        stopSequences: [String],
         placement: ComputePlacement,
         registry: RequestRegistry
     ) -> AsyncThrowingStream<GenerationChunk, Error> {
@@ -337,6 +400,9 @@ public actor CoreAIProvider: InferenceProvider {
             reasoningFormat: activeTemplate.reasoningFormat,
             thinkingEnabled: enableThinking,
             strippableSpecialTokens: Array(activeTemplate.strippableSpecialTokens),
+            stopSequences: stopSequences,
+            maxTokens: effectiveSampling.maxTokens,
+            thinkingBudget: effectiveSampling.thinkingBudget,
             computePlacement: placement,
             registry: registry,
             onAbortHook: { [weak self] in
@@ -348,14 +414,18 @@ public actor CoreAIProvider: InferenceProvider {
         ) { [weak self] eventCont in
             guard let self else { return }
             let (_, tokenizer, engine) = try await self.ensureCoreAILoaded()
-            let rendered = HeylookConfig.renderPromptPreview(
+            let rendered = HeylookConfig.renderPromptDetailed(
                 in: URL(fileURLWithPath: modelPath),
                 system: request.system,
-                messages: request.messages.map { ($0.role, $0.content, $0.thinking) },
+                turns: request.messages,
                 thinkingEnabled: enableThinking,
                 thinkingDepth: effectiveSampling.thinkingDepth ?? request.thinkingDepth
             )
             let promptTokenIds = tokenizer.encode(text: rendered.prompt)
+            let (inputTokens, reusedCount) = try await self.prepareEngineTokens(
+                engine: engine,
+                fullPromptTokens: promptTokenIds
+            )
             let samplingCfg = SamplingConfiguration(
                 temperature: effectiveSampling.temperature ?? 0.7,
                 topK: effectiveSampling.topK,
@@ -372,11 +442,12 @@ public actor CoreAIProvider: InferenceProvider {
             var generatedCount = 0
 
             let tokenStream = try await engine.generate(
-                with: promptTokenIds.map(Int32.init),
+                with: inputTokens.map(Int32.init),
                 samplingConfiguration: samplingCfg,
                 inferenceOptions: .extend(maxTokens: maxTokens)
             )
             for try await step in tokenStream {
+                try Task.checkCancellation()
                 let tokenInt = Int(step.tokenId)
                 if tokenInt == tokenizer.eosTokenId || eosSet.contains(tokenInt) {
                     break
@@ -385,6 +456,7 @@ public actor CoreAIProvider: InferenceProvider {
                     firstTokenTime = Date.timeIntervalSinceReferenceDate
                 }
                 generatedCount += 1
+                await self.appendGeneratedEngineTokenID(tokenInt)
                 let piece = tokenizer.decode(tokens: [tokenInt], skipSpecialTokens: false)
                 eventCont.yield(.rawToken(piece))
             }
@@ -395,7 +467,8 @@ public actor CoreAIProvider: InferenceProvider {
             eventCont.yield(
                 .telemetry(
                     promptTokens: promptTokenIds.count,
-                    promptTPS: Double(promptTokenIds.count) / prefillDur,
+                    cachedTokens: reusedCount,
+                    promptTPS: Double(max(1, inputTokens.count)) / prefillDur,
                     generationTPS: Double(generatedCount) / decodeDur
                 )
             )
@@ -403,7 +476,7 @@ public actor CoreAIProvider: InferenceProvider {
     }
     #endif
 
-    // MARK: - ANE Speech / Audio Frontend (`CoreAISpeech` / `WhisperKit` / 16 kHz PCM + Log-Mel)
+    // MARK: - ANE Speech / Audio Frontend (16 kHz PCM + Log-Mel; truthful runtime gate)
 
     public struct ANESpeechTranscriptionResult: Sendable, Equatable, Codable {
         public let text: String
@@ -430,12 +503,27 @@ public actor CoreAIProvider: InferenceProvider {
         }
     }
 
-    /// Transcribes `wavData` on the ANE lane (`WhisperKit` / `CoreAISpeech` / 16 kHz log-mel frontend)
-    /// without acquiring the GPU `GenerationGate`.
+    /// Transcribes `wavData` on the ANE lane when a speech ASR runtime is loaded.
+    /// In production (`allowSyntheticFallback == false`), ALWAYS throws `ProviderExecutionError`
+    /// when no speech ASR runtime is present — never fabricates or echoes WAV marker bytes.
     public func transcribeAudio(
         wavData: Data,
         languageHint: String = "en"
     ) async throws -> ANESpeechTranscriptionResult {
+        // Strict production gate FIRST: never allow WAV marker bytes or synthetic text in production!
+        guard allowSyntheticFallback else {
+            if bundleManifest == nil {
+                throw ProviderExecutionError.checkpointNotFound(
+                    modelID: modelID,
+                    path: descriptionState.modelPath
+                )
+            }
+            throw ProviderExecutionError.runtimeUnavailable(
+                modelID: modelID,
+                detail: "Speech ASR model runtime is not loaded at \(descriptionState.modelPath)"
+            )
+        }
+
         let samples = Self.decodeMonoPCM16k(from: wavData)
         let sampleRate = 16_000
         let duration = Double(samples.count) / Double(sampleRate)
@@ -446,7 +534,7 @@ public actor CoreAIProvider: InferenceProvider {
         let rms = samples.isEmpty ? 0 : (sumSq / Float(samples.count)).squareRoot()
         let melFramesCount = samples.isEmpty ? 0 : ANECoreMLRuntime.computeAudioLogMel(samples: samples).count
 
-        // 1. Honor explicit test/metadata transcript chunk (`TEXT:...`)
+        // Synthetic test-fixture mode (`allowSyntheticFallback == true` ONLY):
         if let markerRange = wavData.range(of: Data("TEXT:".utf8)),
            markerRange.upperBound < wavData.endIndex {
             let tail = wavData.subdata(in: markerRange.upperBound..<wavData.endIndex)
@@ -459,20 +547,6 @@ public actor CoreAIProvider: InferenceProvider {
                 rmsEnergy: rms,
                 melFrames: melFramesCount,
                 computePlacement: descriptionState.computePlacement.value
-            )
-        }
-
-        // 2. In strict production mode (`allowSyntheticFallback == false`), never fabricate a transcript
-        guard allowSyntheticFallback else {
-            if bundleManifest == nil {
-                throw ProviderExecutionError.checkpointNotFound(
-                    modelID: modelID,
-                    path: descriptionState.modelPath
-                )
-            }
-            throw ProviderExecutionError.runtimeUnavailable(
-                modelID: modelID,
-                detail: "Speech ASR model weights not loaded at \(descriptionState.modelPath)"
             )
         }
 

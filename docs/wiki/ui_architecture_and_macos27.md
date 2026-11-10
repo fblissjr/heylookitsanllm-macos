@@ -49,7 +49,7 @@ When a macOS executable is launched from a CLI build directory (`.build/debug/he
    - In `applicationDidFinishLaunching`, call `NSApplication.shared.activate()` and ensure every `NSWindow` includes `.resizable` in `window.styleMask` and calls `makeKeyAndOrderFront(nil)`.
 2. **Scene Modifiers on `WindowGroup`**:
    - Always configure `.defaultSize(width: 1360, height: 860)` and `.windowResizability(.contentMinSize)`.
-   - Include standard macOS menu commands: `SidebarCommands()`, `InspectorCommands()`, and surface shortcuts (`⌘1`–`⌘5`, `⌘N`, `⇧⌘N`).
+   - Include standard macOS menu commands: `SidebarCommands()`, `InspectorCommands()`, and surface shortcuts (`⌘1`–`⌘6`, `⌘N`, `⇧⌘N`).
 3. **`.app` Bundle Assembly (`scripts/build_native.sh`)**:
    - `./scripts/build_native.sh build` and `./scripts/build_native.sh app` assemble `HeylookWorkbench.app` with `Contents/Info.plist` (`CFBundlePackageType = APPL`, `LSMinimumSystemVersion = 27.2`) alongside `mlx-swift_Cmlx.bundle` (`default.metallib`).
 
@@ -66,21 +66,22 @@ Placing an AppKit-backed `HSplitView` inside the `detail:` column of a `Navigati
 ```text
 NavigationSplitView(columnVisibility: $columnVisibility)
 ├── Sidebar: HeylookSidebarView (.listStyle(.sidebar), min: 250, ideal: 280, max: 340)
-│   ├── Section("Workbench") — 5 primary surfaces (Chat, Notebook, Embeddings, Models, Perf & Server)
+│   ├── Section("Workbench") — 6 primary surfaces (Chat, Notebook, Embeddings, Presets, Models, Perf & Server)
 │   ├── Contextual Surface Sections:
 │   │   ├── .chat       -> Conversations list + New Conversation (⌘N)
 │   │   ├── .notebook   -> Saved Notebooks list + New Notebook (⇧⌘N)
 │   │   ├── .embeddings -> Modality Filter, Index & Watched Folders, EmbeddingGemma 2, ANE/GPU Placement
+│   │   ├── .presets    -> PresetsSidebarSection (Scope filter, Search, New Preset)
 │   │   ├── .models     -> Provider Filter (All, MLX, CoreAI, GGUF, Remote) + Model Actions
 │   │   └── .perf       -> Telemetry & Server quick actions
 │   └── Bottom Safe-Area Bar -> Server status (:8000) + GPU/ANE loaded model counts
 │
 └── Detail: Active Surface View (.frame(maxWidth: .infinity, maxHeight: .infinity))
     ├── Dismissible Status / Discovery Banners
-    ├── Surface Content (ChatWorkbenchSurface | NotebookSurface | EmbeddingsStudioSurface | ModelsInspectorSurface | PerfServerSurface)
+    ├── Surface Content (ChatWorkbenchSurface | NotebookSurface | EmbeddingsStudioSurface | PresetsSurface | ModelsInspectorSurface | PerfServerSurface)
     └── .inspector(isPresented: $viewModel.showInspector) (.inspectorColumnWidth(min: 300, ideal: 340, max: 430))
         ├── .embeddings -> EmbeddingsInspectorView (AVPlayerView, Matryoshka 768d/512d/256d/128d bars, frame seek pills)
-        └── .chat / .notebook / .models / .perf -> LoadAndSamplerInspectorView (5-layer Sampler Cascade + System Prompt)
+        └── .chat / .notebook / .presets / .models / .perf -> LoadAndSamplerInspectorView (5-layer Sampler Cascade + System Prompt)
 ```
 
 ---
@@ -125,9 +126,10 @@ Per Apple's exported `swiftui-specialist` and `swiftui-whats-new-27` skills:
 
 1. **Separate `View` Structs Over `@ViewBuilder` Computed Properties (`structure.md`)**:
    - A `View` struct is SwiftUI's unit of invalidation. Multi-section layouts must be separate `View` structs rather than monolithic `body` closures or `private func` helpers on the parent view:
-     - `HeylookWorkbenchView`: `StatusBannerBar`, `EmptyModelsDiscoveryBanner`, `ChatConversationsSidebarSection`, `NotebooksSidebarSection`, `EmbeddingsSidebarSections`, `ModelsFilterSidebarSection`, `PerfQuickActionsSidebarSection`.
-     - `ChatWorkbenchSurface`: `ChatTopControlBar`, `ChatPromptPreviewDrawer`, `ChatComposerBar`, `ChatAttachmentPillView`, `MessageBubbleView`, `StreamingAssistantView`.
-     - `EmbeddingsStudioSurface`: `EmbeddingsSearchHeaderBar`, `EmbeddingsStatusToolbar`, `EmbeddingsEvalLabDrawer`, `ModalityFilterRow`, `EmbeddingsInspectorView`, `ScoredFeatureBreakdownCard`.
+     - `HeylookWorkbenchView`: `StatusBannerBar`, `EmptyModelsDiscoveryBanner`, `ChatConversationsSidebarSection`, `NotebooksSidebarSection`, `EmbeddingsSidebarSections`, `PresetsSidebarSection`, `ModelsFilterSidebarSection`, `PerfQuickActionsSidebarSection`.
+     - `ChatWorkbenchSurface` & `MarkdownMessageView`: `ChatTopControlBar`, `ChatPromptPreviewDrawer`, `ChatComposerBar`, `ChatAttachmentPillView`, `MessageBubbleView`, `StreamingAssistantView`, `MarkdownMessageView`.
+     - `NotebookAndEmbeddingsSurfaces` & `CursorAwareTextEditor`: `EmbeddingsSearchHeaderBar`, `EmbeddingsStatusToolbar`, `EmbeddingsEvalLabDrawer`, `ModalityFilterRow`, `EmbeddingsInspectorView`, `ScoredFeatureBreakdownCard`, `CursorAwareTextEditor`.
+     - `PresetsSurface`: Responsive master-detail `sampler` / `full` scope Preset editor and per-document preset applicator.
      - `ModelsInspectorSurface`: `ModelsTopActionBar`, `ModelRegistryRowView`.
 2. **Cached `@Observable` Stored Projections & `@Bindable` KeyPaths (`dataflow.md` & `foreach.md`)**:
    - Pass `@Observable` models into child views via `@Bindable var viewModel: HeylookWorkbenchViewModel` (never `@Binding var viewModel: HeylookWorkbenchViewModel`).

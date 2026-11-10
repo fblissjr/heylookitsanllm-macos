@@ -11,13 +11,15 @@ import HeylookServer
 
 #if os(macOS)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
 #endif
 
 // MARK: - 2. Notebook Surface
 
 struct NotebookSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
-    @FocusState private var isBodyFocused: Bool
+    @State private var showNotebookSystemPrompt: Bool = false
 
     private var wordCount: Int {
         viewModel.notebookBody
@@ -26,12 +28,92 @@ struct NotebookSurface: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let hasNotebookSysPrompt = !viewModel.notebookSystemPrompt
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 TextField("Notebook Title", text: $viewModel.notebookTitle)
                     .font(.title3.weight(.semibold))
                     .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 320)
+                    .frame(maxWidth: 300)
+
+                Text(viewModel.isNotebookDirty ? "Saving…" : "Saved")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(viewModel.isNotebookDirty ? .orange : .secondary)
+
+                Menu {
+                    Button {
+                        viewModel.clearPresetSelection()
+                    } label: {
+                        HStack {
+                            Text("Model Defaults (No Preset)")
+                            if viewModel.selectedPresetName == nil {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                    Divider()
+                    ForEach(viewModel.presets) { preset in
+                        Button {
+                            viewModel.applyPreset(preset)
+                        } label: {
+                            HStack {
+                                Text(preset.name)
+                                if viewModel.selectedPresetName == preset.name {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                    Button {
+                        viewModel.activeSurface = .presets
+                    } label: {
+                        Label("Manage Presets…", systemImage: "slider.horizontal.3")
+                            .labelStyle(.titleAndIcon)
+                    }
+                } label: {
+                    let labelText: String = {
+                        if let name = viewModel.selectedPresetName {
+                            return viewModel.isPresetModified ? "\(name) (modified)" : name
+                        }
+                        return viewModel.hasAnyManualSamplerOverride ? "Custom Samplers" : "Model Defaults"
+                    }()
+                    HStack(spacing: 4) {
+                        Image(systemName: "dial.medium")
+                            .font(.system(size: 10))
+                        Text(labelText)
+                            .font(.caption2.weight(.medium))
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(
+                            viewModel.selectedPresetName != nil
+                                ? Color.indigo.opacity(0.15)
+                                : Color.secondary.opacity(0.12)
+                        )
+                    )
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        showNotebookSystemPrompt.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: hasNotebookSysPrompt ? "terminal.fill" : "terminal")
+                        Text(hasNotebookSysPrompt ? "System ●" : "System")
+                    }
+                    .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .tint(hasNotebookSysPrompt ? .accentColor : nil)
+                .controlSize(.small)
 
                 Spacer()
 
@@ -52,23 +134,36 @@ struct NotebookSurface: View {
                         .disabled(viewModel.isNotebookGenerating || viewModel.notebookBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                         Button {
-                            Task { await viewModel.analyzeNotebook() }
+                            Task { await viewModel.analyzeNotebookSelection() }
                         } label: {
                             Label("Analyze Selection", systemImage: "wand.and.stars")
                         }
                         .buttonStyle(.glass)
                         .controlSize(.small)
-                        .disabled(viewModel.isNotebookGenerating || viewModel.notebookBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(viewModel.isNotebookGenerating || !viewModel.hasNotebookSelection)
+                        .help(viewModel.hasNotebookSelection ? "Critique highlighted selection" : "Highlight a passage in the editor to enable Analyze Selection")
 
-                        Button {
-                            Task { await viewModel.continueNotebookGeneration() }
-                        } label: {
-                            Label("Continue Writing", systemImage: "sparkles")
+                        if viewModel.isNotebookGenerating {
+                            Button(role: .destructive) {
+                                viewModel.cancelNotebookGeneration()
+                            } label: {
+                                Label("Stop", systemImage: "stop.fill")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                            .controlSize(.small)
+                            .help("Stop inline generation and keep partial text (Esc)")
+                        } else {
+                            Button {
+                                Task { await viewModel.continueNotebookGeneration() }
+                            } label: {
+                                Label("Continue at Cursor", systemImage: "sparkles")
+                            }
+                            .buttonStyle(.glassProminent)
+                            .controlSize(.small)
+                            .keyboardShortcut(.return, modifiers: [.command])
+                            .disabled(viewModel.notebookBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
-                        .buttonStyle(.glassProminent)
-                        .controlSize(.small)
-                        .keyboardShortcut(.return, modifiers: [.command])
-                        .disabled(viewModel.isNotebookGenerating)
 
                         Button {
                             viewModel.saveNotebook()
@@ -90,20 +185,58 @@ struct NotebookSurface: View {
                 }
             }
 
-            TextEditor(text: $viewModel.notebookBody)
-                .font(.system(.body, design: .monospaced))
-                .focused($isBodyFocused)
-                .defaultFocus($isBodyFocused, true)
-                .padding(8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10)
-                        .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+            if showNotebookSystemPrompt {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Label("Notebook System Prompt (persisted per notebook)", systemImage: "terminal")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if !viewModel.notebookSystemPrompt.isEmpty {
+                            Button("Clear") {
+                                viewModel.notebookSystemPrompt = ""
+                            }
+                            .font(.caption2)
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                    TextEditor(text: $viewModel.notebookSystemPrompt)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(minHeight: 56, maxHeight: 110)
+                        .padding(6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.secondary.opacity(0.08))
+                        )
                 }
+            }
+
+            CursorAwareTextEditor(
+                text: $viewModel.notebookBody,
+                selectedRange: $viewModel.notebookSelectedRange,
+                isEditable: !viewModel.isNotebookGenerating,
+                onUserEdit: {
+                    viewModel.noteNotebookUserEdited()
+                }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(
+                        viewModel.isNotebookGenerating
+                            ? Color.accentColor.opacity(0.45)
+                            : Color.secondary.opacity(0.18),
+                        lineWidth: 1
+                    )
+            }
 
             HStack {
-                Text("\(wordCount) words • \(viewModel.notebookBody.count) characters")
+                let cursorSummary = viewModel.hasNotebookSelection
+                    ? "Sel \(viewModel.notebookSelectedRange.length) chars at \(viewModel.notebookSelectedRange.location)"
+                    : "Cursor \(viewModel.notebookSelectedRange.location)"
+                Text("\(wordCount) words • \(viewModel.notebookBody.count) chars • \(cursorSummary)")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -116,9 +249,6 @@ struct NotebookSurface: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            isBodyFocused = true
-        }
     }
 }
 
@@ -131,75 +261,126 @@ struct EmbeddingsStudioSurface: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            EmbeddingsSearchHeaderBar(
-                viewModel: viewModel,
-                isSearchFocused: $isSearchFocused
-            )
-
-            Divider()
-
-            EmbeddingsStatusToolbar(
-                viewModel: viewModel,
-                onAddFilesOrFolders: triggerIndexingPicker
-            )
-
-            Divider()
-
-            // Results List or Empty State
-            if viewModel.searchHits.isEmpty {
-                ContentUnavailableView {
-                    Label("No Matching Artifacts", systemImage: "doc.text.magnifyingglass")
-                } description: {
-                    Text("Type a search query above, attach an image or audio clip, or index local folders from the sidebar.")
-                } actions: {
-                    GlassEffectContainer(spacing: 10) {
-                        HStack(spacing: 10) {
-                            Button {
-                                triggerIndexingPicker()
-                            } label: {
-                                Label("Add Files or Folders…", systemImage: "plus.rectangle.on.folder")
-                            }
-                            .buttonStyle(.glassProminent)
-                            .controlSize(.small)
-
-                            Button {
-                                Task { await viewModel.seedSampleCorpusIfNeeded() }
-                            } label: {
-                                Label("Load Sample Demo Corpus", systemImage: "sparkles")
-                            }
-                            .buttonStyle(.glass)
-                            .controlSize(.small)
-                        }
+            // Top Mode Switcher Bar (Media Search | N×N Compare | Embedding Lab)
+            HStack(spacing: 12) {
+                Picker("Embeddings Mode", selection: $viewModel.embeddingsSubMode) {
+                    ForEach(EmbeddingsSubMode.allCases) { mode in
+                        Label(mode.rawValue, systemImage: mode.icon)
+                            .tag(mode)
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List(selection: $viewModel.selectedHit) {
-                    ForEach(viewModel.searchHits) { hit in
-                        HitRowView(hit: hit)
-                            .tag(hit)
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 440)
+
+                Spacer()
+
+                if viewModel.isActiveEmbeddingEngineSynthetic {
+                    HStack(spacing: 5) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("No real embedding checkpoint loaded — synthetic fallback blocked")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.orange)
                     }
-                }
-                .listStyle(.inset)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .onChange(of: viewModel.selectedHit) { _, newHit in
-                    if newHit != nil {
-                        viewModel.showInspector = true
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Color.orange.opacity(0.14)))
+                } else {
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 7, height: 7)
+                        Text(viewModel.activeQueryTowersLabel)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(.bar)
 
-            // Optional Pairwise & Retrieval Lab Bottom Drawer
-            if viewModel.showEvalLabDrawer {
+            Divider()
+
+            switch viewModel.embeddingsSubMode {
+            case .search:
+                EmbeddingsSearchHeaderBar(
+                    viewModel: viewModel,
+                    isSearchFocused: $isSearchFocused
+                )
+
                 Divider()
-                EmbeddingsEvalLabDrawer(viewModel: viewModel)
+
+                EmbeddingsStatusToolbar(
+                    viewModel: viewModel,
+                    onAddFilesOrFolders: triggerIndexingPicker
+                )
+
+                Divider()
+
+                // Results List or Empty State
+                if viewModel.searchHits.isEmpty {
+                    ContentUnavailableView {
+                        Label("No Matching Artifacts", systemImage: "doc.text.magnifyingglass")
+                    } description: {
+                        Text("Type a search query above, attach an image or audio clip, or index local folders from the sidebar.")
+                    } actions: {
+                        GlassEffectContainer(spacing: 10) {
+                            HStack(spacing: 10) {
+                                Button {
+                                    triggerIndexingPicker()
+                                } label: {
+                                    Label("Add Files or Folders…", systemImage: "plus.rectangle.on.folder")
+                                }
+                                .buttonStyle(.glassProminent)
+                                .controlSize(.small)
+
+                                Button {
+                                    Task { await viewModel.seedSampleCorpusIfNeeded() }
+                                } label: {
+                                    Label("Load Sample Demo Corpus", systemImage: "sparkles")
+                                }
+                                .buttonStyle(.glass)
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List(selection: $viewModel.selectedHit) {
+                        ForEach(viewModel.searchHits) { hit in
+                            HitRowView(hit: hit)
+                                .tag(hit)
+                        }
+                    }
+                    .listStyle(.inset)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onChange(of: viewModel.selectedHit) { _, newHit in
+                        if newHit != nil {
+                            viewModel.showInspector = true
+                        }
+                    }
+                }
+
+                // Optional Pairwise & Retrieval Lab Bottom Drawer
+                if viewModel.showEvalLabDrawer {
+                    Divider()
+                    EmbeddingsEvalLabDrawer(viewModel: viewModel)
+                }
+
+            case .compareMatrix:
+                EmbeddingsCompareMatrixView(viewModel: viewModel)
+
+            case .evalLab:
+                EmbeddingsMultiConfigLabView(viewModel: viewModel)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
-            isSearchFocused = true
+            if viewModel.embeddingsSubMode == .search {
+                isSearchFocused = true
+            }
         }
-        #if !os(macOS)
         .fileImporter(
             isPresented: $showIndexingImporter,
             allowedContentTypes: [.item, .folder],
@@ -209,29 +390,11 @@ struct EmbeddingsStudioSurface: View {
                 viewModel.startIndexing(urls)
             }
         }
-        #endif
     }
 
     private func triggerIndexingPicker() {
-        #if os(macOS)
-        openFilePickerForIndexing()
-        #else
         showIndexingImporter = true
-        #endif
     }
-
-    #if os(macOS)
-    private func openFilePickerForIndexing() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = true
-        panel.prompt = "Index"
-        if panel.runModal() == .OK {
-            viewModel.startIndexing(panel.urls)
-        }
-    }
-    #endif
 }
 
 private struct EmbeddingsSearchHeaderBar: View {
@@ -255,15 +418,11 @@ private struct EmbeddingsSearchHeaderBar: View {
                         Task { await viewModel.runEmbeddingSearch() }
                     }
                     .onChange(of: viewModel.embeddingQuery) { _, _ in
-                        Task { await viewModel.runEmbeddingSearch() }
+                        viewModel.scheduleEmbeddingSearchDebounced()
                     }
 
                 Button {
-                    #if os(macOS)
-                    pickQueryAttachment()
-                    #else
                     showQueryMediaImporter = true
-                    #endif
                 } label: {
                     Label("Attach Media", systemImage: "paperclip")
                 }
@@ -330,7 +489,6 @@ private struct EmbeddingsSearchHeaderBar: View {
         }
         .padding(14)
         .background(.bar)
-        #if !os(macOS)
         .fileImporter(
             isPresented: $showQueryMediaImporter,
             allowedContentTypes: [.image, .audiovisualContent, .audio],
@@ -341,23 +499,7 @@ private struct EmbeddingsSearchHeaderBar: View {
                 Task { await viewModel.runEmbeddingSearch() }
             }
         }
-        #endif
     }
-
-    #if os(macOS)
-    private func pickQueryAttachment() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.image, .audiovisualContent, .audio]
-        panel.prompt = "Attach Query Media"
-        if panel.runModal() == .OK, let url = panel.url {
-            viewModel.queryAttachmentURL = url
-            Task { await viewModel.runEmbeddingSearch() }
-        }
-    }
-    #endif
 }
 
 private struct EmbeddingsStatusToolbar: View {
@@ -531,18 +673,13 @@ struct EmbeddingsSidebarSections: View {
 
         Section("Index & Watched Folders") {
             Button {
-                #if os(macOS)
-                openFilePickerForIndexing()
-                #else
                 showIndexingImporter = true
-                #endif
             } label: {
                 Label("Add Files or Folders…", systemImage: "plus.rectangle.on.folder")
                     .fontWeight(.medium)
                     .foregroundStyle(Color.accentColor)
             }
             .buttonStyle(.plain)
-            #if !os(macOS)
             .fileImporter(
                 isPresented: $showIndexingImporter,
                 allowedContentTypes: [.item, .folder],
@@ -552,7 +689,6 @@ struct EmbeddingsSidebarSections: View {
                     viewModel.startIndexing(urls)
                 }
             }
-            #endif
 
             if !viewModel.watchedFolders.isEmpty {
                 Button {
@@ -703,19 +839,6 @@ struct EmbeddingsSidebarSections: View {
                 .padding(.vertical, 4)
         }
     }
-
-    #if os(macOS)
-    private func openFilePickerForIndexing() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = true
-        panel.prompt = "Index"
-        if panel.runModal() == .OK {
-            viewModel.startIndexing(panel.urls)
-        }
-    }
-    #endif
 }
 
 private struct ModalityFilterRow: View {
@@ -1101,8 +1224,8 @@ struct EmbeddingsInspectorView: View {
                                 MacVideoPlayerView(player: player)
                                     .frame(height: hit.artifact.kind == .video ? 240 : 70)
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
-                                #else
-                                VideoPlayer(player: player)
+                                #elseif canImport(UIKit)
+                                IOSVideoPlayerView(player: player)
                                     .frame(height: hit.artifact.kind == .video ? 240 : 70)
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
                                 #endif
@@ -1396,4 +1519,599 @@ private struct MacVideoPlayerView: NSViewRepresentable {
         }
     }
 }
+#elseif canImport(UIKit)
+private struct IOSVideoPlayerView: UIViewControllerRepresentable {
+    let player: AVPlayer
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        controller.showsPlaybackControls = true
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
+        if uiViewController.player !== player {
+            uiViewController.player = player
+        }
+    }
+}
 #endif
+
+// MARK: - N×N Multimodal Cosine Similarity Matrix View (`≤16` Items)
+
+private struct EmbeddingsCompareMatrixView: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    @State private var showMediaImporter: Bool = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // Controls Header
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("N×N Multimodal Cosine Similarity Matrix")
+                            .font(.headline)
+                        Text("Compare up to \(HeylookWorkbenchViewModel.maxCompareMatrixItems) text, code, PDF, image, audio, or video items with live Matryoshka subspace slicing")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Toggle(
+                        viewModel.compareAsymmetricMode ? "Asymmetric (Query→Doc)" : "Symmetric (STS)",
+                        isOn: $viewModel.compareAsymmetricMode
+                    )
+                    .toggleStyle(.button)
+                    .controlSize(.small)
+
+                    Picker("Subspace", selection: $viewModel.compareMatrixDimension) {
+                        Text("768d").tag(768)
+                        Text("512d").tag(512)
+                        Text("256d").tag(256)
+                        Text("128d").tag(128)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 210)
+
+                    Button {
+                        Task { await viewModel.runCompareMatrix() }
+                    } label: {
+                        HStack(spacing: 5) {
+                            if viewModel.isEmbeddingBusy {
+                                ProgressView().controlSize(.mini)
+                            }
+                            Label("Compute Matrix", systemImage: "square.grid.3x3.fill")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(viewModel.isEmbeddingBusy || viewModel.compareItems.count < 2)
+                }
+
+                // Item Staging List (`≤16`)
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("STAGED ITEMS (\(viewModel.compareItems.count) / \(HeylookWorkbenchViewModel.maxCompareMatrixItems))")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button {
+                                viewModel.addCompareTextItem()
+                            } label: {
+                                Label("Add Text", systemImage: "plus.bubble")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(viewModel.compareItems.count >= HeylookWorkbenchViewModel.maxCompareMatrixItems)
+
+                            Button {
+                                showMediaImporter = true
+                            } label: {
+                                Label("Add Media / Files…", systemImage: "plus.rectangle.on.folder")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(viewModel.compareItems.count >= HeylookWorkbenchViewModel.maxCompareMatrixItems)
+                        }
+
+                        ForEach($viewModel.compareItems) { $item in
+                            HStack(spacing: 8) {
+                                Image(systemName: item.kind.systemImage)
+                                    .foregroundStyle(.tint)
+                                    .frame(width: 18)
+
+                                TextField("Label", text: $item.label)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.caption.weight(.semibold))
+                                    .frame(width: 120)
+
+                                if let fileURL = item.fileURL {
+                                    HStack(spacing: 5) {
+                                        Text(item.kind.displayName)
+                                            .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+                                            .foregroundStyle(Color.accentColor)
+                                        Text(fileURL.lastPathComponent)
+                                            .font(.caption.monospaced())
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Spacer()
+                                    }
+                                } else {
+                                    TextField("Enter text or code snippet to embed…", text: $item.textContent)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.caption)
+                                }
+
+                                Button(role: .destructive) {
+                                    viewModel.removeCompareItem(id: item.id)
+                                } label: {
+                                    Image(systemName: "minus.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                        .frame(minWidth: 28, minHeight: 28)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(viewModel.compareItems.count <= 2)
+                                .help("Remove item")
+                            }
+                        }
+                    }
+                    .padding(6)
+                }
+
+                // Heatmap Grid + Selected Pair Attribution
+                if !viewModel.compareMatrixScores.isEmpty,
+                   viewModel.compareMatrixScores.count == viewModel.compareItems.count {
+                    HStack(alignment: .top, spacing: 16) {
+                        CompareMatrixHeatmapGridView(viewModel: viewModel)
+                        CompareSelectedPairProfileCard(
+                            viewModel: viewModel,
+                            onCopyText: copyToPasteboard
+                        )
+                    }
+                } else {
+                    ContentUnavailableView(
+                        "Matrix Not Computed Yet",
+                        systemImage: "square.grid.3x3",
+                        description: Text("Stage 2–16 text or media items above and click Compute Matrix to inspect cross-modal Matryoshka cosine similarity.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 180)
+                }
+            }
+            .padding(16)
+        }
+        .fileImporter(
+            isPresented: $showMediaImporter,
+            allowedContentTypes: [.image, .audiovisualContent, .audio, .pdf, .plainText, .sourceCode, .item],
+            allowsMultipleSelection: true
+        ) { result in
+            if case .success(let urls) = result {
+                viewModel.addCompareMediaFiles(urls)
+            }
+        }
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #elseif canImport(UIKit)
+        UIPasteboard.general.string = text
+        #endif
+    }
+}
+
+private struct CompareMatrixHeatmapGridView: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+
+    var body: some View {
+        let items = viewModel.compareItems
+        let scores = viewModel.compareMatrixScores
+        ScrollView([.horizontal, .vertical]) {
+            Grid(horizontalSpacing: 4, verticalSpacing: 4) {
+                GridRow {
+                    Text(viewModel.compareAsymmetricMode ? "Row (Q) \\ Col (D)" : "Symmetric")
+                        .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 108, alignment: .leading)
+
+                    ForEach(0..<items.count, id: \.self) { cIdx in
+                        let colItem = items[cIdx]
+                        Text(colItem.label)
+                            .font(.system(size: 10, weight: .semibold))
+                            .lineLimit(1)
+                            .frame(width: 66)
+                            .help(colItem.fileURL?.lastPathComponent ?? colItem.textContent)
+                            .foregroundStyle(cIdx == viewModel.selectedCompareCellCol ? Color.accentColor : .secondary)
+                    }
+                }
+
+                ForEach(0..<items.count, id: \.self) { rIdx in
+                    GridRow {
+                        Text(items[rIdx].label)
+                            .font(.system(size: 10, weight: .semibold))
+                            .lineLimit(1)
+                            .frame(width: 108, alignment: .leading)
+                            .foregroundStyle(rIdx == viewModel.selectedCompareCellRow ? Color.accentColor : .primary)
+
+                        ForEach(0..<items.count, id: \.self) { cIdx in
+                            CompareMatrixCellButton(
+                                score: scores[rIdx][cIdx],
+                                isSelected: rIdx == viewModel.selectedCompareCellRow && cIdx == viewModel.selectedCompareCellCol,
+                                onSelect: {
+                                    viewModel.selectedCompareCellRow = rIdx
+                                    viewModel.selectedCompareCellCol = cIdx
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+            .padding(8)
+        }
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.06)))
+    }
+}
+
+private struct CompareMatrixCellButton: View {
+    let score: Float
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    private var cellColor: Color {
+        let clamped = Double(max(-0.2, min(1.0, score)))
+        if clamped >= 0.75 {
+            return Color.teal.opacity(0.88)
+        } else if clamped >= 0.50 {
+            return Color.blue.opacity(0.55)
+        } else if clamped >= 0.25 {
+            return Color.indigo.opacity(0.28)
+        } else {
+            return Color.secondary.opacity(0.14)
+        }
+    }
+
+    var body: some View {
+        Button(action: onSelect) {
+            Text(String(format: "%.3f", score))
+                .font(.system(size: 10.5, weight: isSelected ? .bold : .medium, design: .monospaced))
+                .foregroundStyle(score > 0.65 ? .white : .primary)
+                .frame(width: 66, height: 34)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(cellColor)
+                )
+                .overlay {
+                    if isSelected {
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(Color.primary, lineWidth: 2)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct CompareSelectedPairProfileCard: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    let onCopyText: (String) -> Void
+
+    var body: some View {
+        let count = max(1, viewModel.compareItems.count)
+        let r = min(max(0, viewModel.selectedCompareCellRow), count - 1)
+        let c = min(max(0, viewModel.selectedCompareCellCol), count - 1)
+        let dimScores = viewModel.scoresAcrossDimensionsForCompareCell(row: r, col: c)
+
+        VStack(alignment: .leading, spacing: 10) {
+            Text("SELECTED PAIR SUBSPACE PROFILE")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.secondary)
+
+            Text("\(viewModel.compareItems[r].label) ↔ \(viewModel.compareItems[c].label)")
+                .font(.subheadline.weight(.semibold))
+
+            ForEach(dimScores, id: \.dim) { entry in
+                HStack(spacing: 8) {
+                    Text("\(entry.dim)d")
+                        .font(.system(size: 10.5, weight: entry.dim == viewModel.compareMatrixDimension ? .bold : .regular, design: .monospaced))
+                        .frame(width: 36, alignment: .leading)
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.secondary.opacity(0.15))
+                            Capsule()
+                                .fill(entry.dim == viewModel.compareMatrixDimension ? Color.accentColor : Color.teal)
+                                .frame(width: max(4, geo.size.width * CGFloat(max(0, min(1, entry.score)))))
+                        }
+                    }
+                    .frame(height: 6)
+                    Text(String(format: "%.4f", entry.score))
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .frame(width: 52, alignment: .trailing)
+                }
+            }
+
+            Divider()
+
+            Button {
+                Task { await viewModel.sendComparePairToLab(row: r, col: c) }
+            } label: {
+                Label("Send Pair to Retrieval Lab", systemImage: "chart.bar.doc.horizontal")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+
+            HStack(spacing: 8) {
+                Button {
+                    onCopyText(viewModel.compareMatrixCSV())
+                    viewModel.statusBanner = "Copied \(viewModel.compareMatrixDimension)d similarity matrix as CSV."
+                } label: {
+                    Label("Copy CSV", systemImage: "tablecells")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    onCopyText(viewModel.compareMatrixJSON())
+                    viewModel.statusBanner = "Copied \(viewModel.compareMatrixDimension)d similarity matrix as JSON."
+                } label: {
+                    Label("Copy JSON", systemImage: "curlybraces")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(12)
+        .frame(width: 280)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.07)))
+    }
+}
+
+// MARK: - Multi-Config Embedding Retrieval & ANE/GPU Placement Lab
+
+private struct EmbeddingsMultiConfigLabView: View {
+    @Bindable var viewModel: HeylookWorkbenchViewModel
+    @State private var showSetJSONImporter: Bool = false
+    @State private var newCaseQuery: String = ""
+    @State private var newCaseExpectedID: String = ""
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // Header & Action Bar
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Multi-Config Retrieval & ANE/GPU Placement Lab")
+                            .font(.headline)
+                        Text("Evaluate Recall@1, MRR, Top-1 Cosine Margin, and latency across Matryoshka subspaces and compute placements")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        showSetJSONImporter = true
+                    } label: {
+                        Label("Import set.json…", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button {
+                        Task { await viewModel.evaluateCurrentConfigInLab() }
+                    } label: {
+                        Label("Eval Current Config", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(viewModel.isRunningEvalLab || viewModel.artifactCount == 0)
+
+                    Button {
+                        Task { await viewModel.sweepComputePresetsInLab() }
+                    } label: {
+                        Label("Sweep GPU / Hybrid / ANE", systemImage: "bolt.horizontal.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(viewModel.isRunningEvalLab || viewModel.artifactCount == 0)
+
+                    Button {
+                        Task { await viewModel.runFullEvalLabSuite() }
+                    } label: {
+                        Label("Full Probe Suite", systemImage: "checkmark.shield")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(viewModel.isRunningEvalLab)
+
+                    if !viewModel.labConfigRuns.isEmpty {
+                        Button("Clear Runs") {
+                            viewModel.clearLabConfigRuns()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+
+                if viewModel.artifactCount == 0 {
+                    HStack(spacing: 10) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundStyle(.blue)
+                        Text("VectorStore has 0 indexed artifacts. Load the Sample Demo Corpus or index a folder first to run Retrieval Lab evaluations.")
+                            .font(.caption)
+                        Spacer()
+                        Button("Load Sample Demo Corpus") {
+                            Task { await viewModel.seedSampleCorpusIfNeeded() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.blue.opacity(0.1)))
+                }
+
+                // Multi-Config Comparison Table
+                GroupBox("Config Comparison Matrix (\(viewModel.labConfigRuns.count) run(s))") {
+                    if viewModel.labConfigRuns.isEmpty {
+                        Text("No configuration runs recorded yet. Click 'Eval Current Config' or 'Sweep GPU / Hybrid / ANE' above.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(8)
+                    } else {
+                        ScrollView(.horizontal) {
+                            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
+                                GridRow {
+                                    Text("Config / Checkpoint").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                    Text("Placement").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                    Text("768d R@1").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                    Text("512d R@1").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                    Text("256d R@1").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                    Text("128d R@1").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                    Text("768d MRR").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                    Text("Margin (Mean / Worst)").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                    Text("Latency").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                    Text("Est. ANE / GPU").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                                }
+
+                                Divider()
+
+                                ForEach(viewModel.labConfigRuns) { run in
+                                    GridRow {
+                                        Text(run.label)
+                                            .font(.caption.weight(.semibold))
+                                            .lineLimit(1)
+                                        Text(run.shortPlacementBadge)
+                                            .font(.caption2.monospaced())
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Capsule().fill(Color.purple.opacity(0.14)))
+                                            .foregroundStyle(.purple)
+                                        Text(recallLabel(run, dim: 768)).font(.caption.monospaced())
+                                        Text(recallLabel(run, dim: 512)).font(.caption.monospaced())
+                                        Text(recallLabel(run, dim: 256)).font(.caption.monospaced())
+                                        Text(recallLabel(run, dim: 128)).font(.caption.monospaced())
+                                        Text(mrrLabel(run, dim: 768)).font(.caption.monospaced())
+                                        Text(String(format: "%+.3f / %+.3f", run.meanTop1Margin, run.worstTop1Margin))
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(run.worstTop1Margin >= 0 ? .green : .orange)
+                                        Text(String(format: "%.1f ms", run.evalLatencyMs))
+                                            .font(.caption.monospaced())
+                                        Text("\(run.aneMemoryMB)MB / \(run.gpuMemoryMB)MB")
+                                            .font(.caption2.monospaced())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            .padding(6)
+                        }
+                    }
+                }
+
+                //Probe Suite Summary
+                if let suite = viewModel.evalLabSuiteReport {
+                    GroupBox("Verification Probe Suite") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(suite.probes) { probe in
+                                HStack(spacing: 8) {
+                                    Image(systemName: probe.passed ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                                        .foregroundStyle(probe.passed ? .green : .red)
+                                    Text(probe.name)
+                                        .font(.caption.weight(.semibold))
+                                    Text(probe.detail)
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                }
+                            }
+                        }
+                        .padding(6)
+                    }
+                }
+
+                // Benchmark Cases (`set.json`) Editor
+                GroupBox("Benchmark Ground-Truth Cases (\(viewModel.benchmarkCases.count))") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            TextField("Benchmark query…", text: $newCaseQuery)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.caption)
+                            TextField("Expected artifact ID (e.g. doc-vision)", text: $newCaseExpectedID)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.caption.monospaced())
+                                .frame(maxWidth: 240)
+                            Button("Add Case") {
+                                let q = newCaseQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+                                let exp = newCaseExpectedID.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !q.isEmpty, !exp.isEmpty else { return }
+                                viewModel.benchmarkCases.append(.init(query: q, expectedArtifactID: exp))
+                                newCaseQuery = ""
+                                newCaseExpectedID = ""
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(
+                                newCaseQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                    || newCaseExpectedID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            )
+                        }
+
+                        ForEach(Array(viewModel.benchmarkCases.enumerated()), id: \.offset) { idx, bench in
+                            HStack(spacing: 8) {
+                                Text("#\(idx + 1)")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 28, alignment: .leading)
+                                Text(bench.query)
+                                    .font(.caption)
+                                Spacer()
+                                Text("→ \(bench.expectedArtifactID)")
+                                    .font(.caption2.monospaced())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Capsule().fill(Color.secondary.opacity(0.12)))
+                                Button(role: .destructive) {
+                                    viewModel.benchmarkCases.remove(at: idx)
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .frame(minWidth: 28, minHeight: 28)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .padding(6)
+                }
+            }
+            .padding(16)
+        }
+        .fileImporter(
+            isPresented: $showSetJSONImporter,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false
+        ) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                viewModel.importBenchmarkSetJSON(from: url)
+            }
+        }
+    }
+
+    private func recallLabel(_ run: EmbeddingLabConfigRun, dim: Int) -> String {
+        guard let m = run.metricsByDim.first(where: { $0.dimensions == dim }) else { return "—" }
+        return String(format: "%.0f%%", m.recallAt1 * 100)
+    }
+
+    private func mrrLabel(_ run: EmbeddingLabConfigRun, dim: Int) -> String {
+        guard let m = run.metricsByDim.first(where: { $0.dimensions == dim }) else { return "—" }
+        return String(format: "%.2f", m.mrr)
+    }
+}

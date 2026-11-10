@@ -13,13 +13,12 @@ let enableNativeMLX: Bool = {
     return enableAll || env["HEYLOOK_ENABLE_NATIVE_MLX"] == "1" || isXcode
 }()
 let enableCoreAI = enableAll || env["HEYLOOK_ENABLE_COREAI"] == "1"
-let enableArgmax = enableAll || env["HEYLOOK_ENABLE_ARGMAX"] == "1"
-let enableHummingbird = enableAll || env["HEYLOOK_ENABLE_HUMMINGBIRD"] == "1"
 
 var packageDependencies: [Package.Dependency] = []
+var coreDependencies: [Target.Dependency] = []
 var embeddingsDependencies: [Target.Dependency] = ["HeylookCore"]
 var enginesDependencies: [Target.Dependency] = ["HeylookCore", "HeylookEmbeddings"]
-var serverDependencies: [Target.Dependency] = ["HeylookCore", "HeylookEmbeddings", "HeylookEngines"]
+let serverDependencies: [Target.Dependency] = ["HeylookCore", "HeylookEmbeddings", "HeylookEngines"]
 
 if enableNativeMLX {
     packageDependencies.append(contentsOf: [
@@ -36,6 +35,9 @@ if enableNativeMLX {
             .upToNextMajor(from: "1.1.0")
         ),
     ])
+    coreDependencies.append(
+        .product(name: "Transformers", package: "swift-transformers")
+    )
     let mlxProducts: [Target.Dependency] = [
         .product(name: "MLX", package: "mlx-swift"),
         .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
@@ -54,34 +56,8 @@ if enableCoreAI {
             branch: "main"
         )
     )
-    enginesDependencies.append(contentsOf: [
-        .product(name: "CoreAILM", package: "coreai-models"),
-        .product(name: "CoreAISpeech", package: "coreai-models"),
-    ])
-}
-
-if enableArgmax {
-    packageDependencies.append(
-        .package(
-            url: "https://github.com/argmaxinc/argmax-oss-swift",
-            branch: "main"
-        )
-    )
-    enginesDependencies.append(contentsOf: [
-        .product(name: "WhisperKit", package: "argmax-oss-swift"),
-        .product(name: "TTSKit", package: "argmax-oss-swift"),
-    ])
-}
-
-if enableHummingbird {
-    packageDependencies.append(
-        .package(
-            url: "https://github.com/hummingbird-project/hummingbird",
-            .upToNextMajor(from: "2.22.0")
-        )
-    )
-    serverDependencies.append(
-        .product(name: "Hummingbird", package: "hummingbird")
+    enginesDependencies.append(
+        .product(name: "CoreAILM", package: "coreai-models")
     )
 }
 
@@ -104,6 +80,7 @@ let package = Package(
     targets: [
         .target(
             name: "HeylookCore",
+            dependencies: coreDependencies,
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
                 .linkedFramework("Accelerate"),

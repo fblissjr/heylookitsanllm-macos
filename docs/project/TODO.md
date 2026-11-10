@@ -88,8 +88,8 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
   - Added `MLXSwiftProvider.KVCacheSessionState` (`activeTurnCount`, `cachedTokenCount`, `sliceTruncations`, `speculativeDrafterPath`, `speculativeMode`), `PrefixCacheTracker.branchTruncationsCount`, and custom `tokenCounter` support on `MLXSwiftProvider` so multi-turn prefix reuse, branch-edit KV truncation slicing, and unload resets are tracked deterministically.
 - [x] **8.2 In-Process MLX Speculative Decoding (`draft-mtp` & `draft-model`)**:
   - Wired `HeylookConfig.discoverDrafter` into `MLXSwiftProvider.init` and emitted live `SpeculativeReport` (`draft-mtp` / `draft-model`) on `GenerationChunk`s across both in-process `MLX` and streaming pipelines.
-- [x] **8.3 `CoreAIProvider` ANE Speech Transcription Bridge (`transcribeAudio`)**:
-  - Added `CoreAIProvider.ANESpeechTranscriptionResult` and `transcribeAudio(wavData:languageHint:)` decoding 16 kHz mono PCM, computing RMS energy and 128-bin HTK log-mel frames via `ANECoreMLRuntime.computeAudioLogMel`, and running on the ANE lane without acquiring the Metal GPU `GenerationGate`.
+- [x] **8.3 `CoreAIProvider` ANE Audio Log-Mel Front-End & Truthful Speech Gate (`transcribeAudio`)**:
+  - Added `CoreAIProvider.ANESpeechTranscriptionResult` and `transcribeAudio(wavData:languageHint:)` validating 16 kHz mono PCM + 128-bin HTK log-mel frames via `ANECoreMLRuntime.computeAudioLogMel` on the ANE lane, and throwing `ProviderExecutionError.runtimeUnavailable` until a real ASR tower (`CoreAISpeech` / `WhisperKit`) is linked (never returning fabricated placeholder transcripts).
 
 ---
 
@@ -166,11 +166,31 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 ---
 
-## Next Horizons (Optional Post-Phase 13 Frontiers)
+## Phase 14: Python v2.0.244 Engine, Jinja2 AST, GGUF RAM-Fit, SQLite Media-Blob & `/v1/*` Wire Parity (Done)
 
-- [ ] **H.1 Live Hardware Conversion & Throughput Certification (192 GB M2 Ultra Mac Studio)**:
-  - Run live `heylook-cli convert-mlx` (`4-bit affine`, `mxfp4`, `q4_zero`) and `scripts/export_coreai.sh` against resident unquantized BF16 checkpoints and compare prefill/decode throughput and memory residency across Tier 1 (`MLXSwiftProvider`) and Tier 2 (`CoreAIProvider`).
-- [ ] **H.2 Physical `iOS 27.2+` Device Deployment & Hybrid Failover**:
-  - Package and deploy `HeylookApp` to physical iPhone/iPad (`iOS 27.2+`) with on-device 4-bit ANE-palettized `.aimodel` bundles (`./scripts/export_coreai.sh --platform ios`) alongside Bonjour `_heylook._tcp` remote failover to the Mac Studio.
-- [ ] **H.3 Tier 2 Core AI Architecture Expansion**:
+- [x] **14.1 Real Jinja2 AST Engine, Template Inspection & Piece Tokenizer (`HeylookCore`)**:
+  - Implemented `HeylookJinjaRenderer` (recursive-descent Jinja2 lexer, AST parser, `validateSyntax`, `detectCapabilities`, `checkPrefixStability`, special-token `PromptMarkerSpan` scanner, and `huggingface/swift-jinja` bridge when linked), `ChatTemplateInspection` with Hugging Face `.cache/huggingface/download/*.metadata` git-blob SHA-1 / LFS SHA-256 `checkModifiedSinceDownload`, `CheckpointPieceTokenizer` (BPE merge-rank + Viterbi Unigram `tokenizer.json` piece segmentation), non-destructive `HeylookConfig.addScanFolder` / `removeScanFolder`, and `HeylookObservabilityLog` (`level` filtering, `retentionLimit`, JSONL persistence).
+- [x] **14.2 Deep `MLXSwiftProvider`, `GGUFSubprocessProvider` & `StreamingPipeline` Parity (`HeylookEngines`)**:
+  - Added `StopSequenceFilter` (multi-chunk holdback), `thinkingBudget` auto-`forceEndReasoning()`, and immediate `RequestRegistry.addCancelHandler` cancellation in `StreamingPipeline`.
+  - Upgraded `MLXSwiftProvider` with multi-branch `[KVCache]` snapshot cloning/trimming (checking `isTrimmable` on hybrid `MambaCache`/`ArraysCache`), conditional `<think>` KV prefix tracking (`sawReasoning`), real speculative decoding (`draft-mtp` via `MTPDrafterModelFactory` -> `MLXLMCommon.generate(..., mtpDrafter:)` and `draft-model` via `LLMModelFactory` -> `MLXLMCommon.generate(..., draftModel:)` + `speculativeDecodingTelemetry`), and VLM `image_max_tokens` downscaling.
+  - Upgraded `GGUFSubprocessProvider` with OS-socket-probed `GGUFPortPool`, `GGUFSpawnConfig.assessRAMFit` (dropping external drafter under tight Metal working-set headroom + retry without drafter on launch failure), media-blind sidecar fallback to embedded GGUF template when `--mmproj` is present, and `--reasoning-preserve` / `--ctx-checkpoints` / `--cache-reuse` / `json_schema` / `stop` support.
+- [x] **14.3 Full `/v1/*` Wire Contract, Security Middleware & `SQLiteStore` Media-Blob / Fork Parity (`HeylookCore` & `HeylookServer`)**:
+  - Upgraded `SQLiteStore` with SHA-256 deduplicated `media_blobs` + orphan GC, multimodal `content_blocks_json` persistence & hydration, `message_stats` + `queryPerformanceProfile` (`1h`/`6h`/`24h`/`7d`/`30d` + `byModel`), `cloneConversation(id:upToPosition:)`, single-turn `deleteMessage` position compaction, `COLLATE NOCASE` unique presets seeded once via `store_meta`, `clearAllData()`, and `mutationStream()`.
+  - Completed `HeylookRouter` route & security parity: strict `Host` DNS-rebinding rejection on loopback and `0.0.0.0`, `X-Heylook-Admin-Token` `401`/`403` auth, `HEYLOOK_READONLY_MODEL_CONFIG` `409` guard, `X-Request-ID` regex `422` validation + SSE echo, shared `RequestRegistry.shared` per-conversation `409 generation_in_progress` locks, `append`/`regenerate`/`continue` `/v1/conversations/{id}/generate`, `GET`/`POST /v1/conversations/{id}/prompt`, `/v1/conversations/{id}/clone`, `/v1/notebooks` CRUD + SSE `/generate`, `/v1/presets` CRUD, `/v1/models/reload`, `/v1/admin/models/validate`, `/v1/admin/models/{id}/fit`, `/v1/admin/models/{id}/cache/clear`, `/v1/admin/config` + `/logs`, `/v1/performance/profile/{range}`, `/v1/telemetry/events`, and `/v1/data/clear`.
+- [x] **14.4 Audio Resampling, SDK 27 `AVAssetReader` Migration & Expanded Test Suite (`HeylookEmbeddings` & `HeylookTests`)**:
+  - Added arbitrary WAV sample-rate / channel decoding via `AVAudioFile` + `AVAudioConverter` -> 16 kHz mono `Float32` and migrated `ArtifactProcessor` to SDK 27 async `AVAssetReader.outputProvider(for:)` with zero compiler warnings.
+- [x] **14.5 6-Surface SwiftUI Workbench, N×N Compare Matrix, Multi-Config Retrieval Lab & 40-Test Verification Suite (`HeylookUI`, `HeylookApp`, `HeylookTests`)**:
+  - Expanded the workbench to 6 surfaces (`Chat`, `Notebook`, `Presets`, `Embeddings & ANE`, `Models`, `Perf & Server`, `⌘1`–`⌘6`), added `PresetsSurface`, `MarkdownMessageView`, `CursorAwareTextEditor`, N×N multimodal Compare Matrix, Multi-Config Retrieval Lab, live `SQLiteStore.mutationStream()` + shared `RequestRegistry.shared` conversation locks, and expanded `HeylookTests` to `40/40` passing tests across both offline pure-Swift and `HEYLOOK_ENABLE_NATIVE_MLX=1` builds.
+
+---
+
+## Next Horizons (Optional Post-Phase 14 Frontiers)
+
+- [ ] **H.1 On-Device ASR Tower Integration (`CoreAISpeech` / `WhisperKit`)**:
+  - Link a compiled `WhisperKit` or `CoreAISpeech` speech-to-text bundle inside `CoreAIProvider.transcribeAudio` so `/v1/conversations/{id}/voice-generate` performs lexical speech transcription out of the box when an ASR model is installed.
+- [ ] **H.2 Live Hardware Conversion & Throughput Certification**:
+  - Run live `heylook-cli convert-mlx` (`4-bit affine`, `mxfp4`, `q4_zero`) and `scripts/export_coreai.sh` against resident unquantized BF16 checkpoints and compare prefill/decode behavior and memory residency across Tier 1 (`MLXSwiftProvider`) and Tier 2 (`CoreAIProvider`).
+- [ ] **H.3 Physical `iOS 27.2+` Device Deployment & Hybrid Failover**:
+  - Package and deploy `HeylookApp` to physical iPhone/iPad (`iOS 27.2+`) with on-device 4-bit ANE-palettized `.aimodel` bundles (`./scripts/export_coreai.sh --platform ios`) alongside Bonjour `_heylook._tcp` remote failover.
+- [ ] **H.4 Tier 2 Core AI Architecture Expansion**:
   - Extend `coreai-models` export rules (ANE prefill + GPU decode) as upstream adds new multimodal and reasoning architectures.

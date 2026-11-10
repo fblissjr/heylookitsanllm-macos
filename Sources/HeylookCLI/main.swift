@@ -1,3 +1,5 @@
+import Darwin
+import Dispatch
 import Foundation
 import HeylookCore
 import HeylookEmbeddings
@@ -28,12 +30,12 @@ struct HeylookCLI {
         case "watched":
             runWatched()
         case "serve":
-            let port = args.dropFirst().first.flatMap { UInt16($0) } ?? 8000
-            await runServe(port: port)
+            let port = args.dropFirst().first.flatMap { UInt16($0) }
+            await runServe(portOverride: port)
         case "chat":
             await runChat(args: Array(args.dropFirst()))
         case "eval-lab":
-            await runEvalLab()
+            await runEvalLab(args: Array(args.dropFirst()))
         case "convert-mlx":
             await runConvertMLX(args: Array(args.dropFirst()))
         default:
@@ -67,7 +69,10 @@ struct HeylookCLI {
     }
 
     static func makeEmbeddingEngine(computeOptions: ModelComputeOptions) -> any EmbeddingEngine {
-        return NativeMLXEmbeddingGemma2.makeBestAvailableEngine(computeOptions: computeOptions)
+        NativeMLXEmbeddingGemma2.makeBestAvailableEngine(
+            computeOptions: computeOptions,
+            allowSyntheticFallback: false
+        )
     }
 
     static func runDoctor() async {
@@ -75,12 +80,20 @@ struct HeylookCLI {
         let storeURL = defaultVectorStoreURL()
         print("=== Heylook Native macOS 27.2 / iOS 27.2 Doctor ===")
         print(String(format: "Device              : %@", snap.deviceName))
-        print(String(format: "Host Unified Memory : %.1f GB (Metal Recommended Max: %.1f GB)", snap.totalPhysicalRAMGB, snap.metalRecommendedMaxWorkingSetGB))
+        print(
+            String(
+                format: "Host Unified Memory : %.1f GB (Used: %.1f GB, Available: %.1f GB, Metal Max: %.1f GB)",
+                snap.totalPhysicalRAMGB,
+                snap.ramUsedGB,
+                snap.ramAvailableGB,
+                snap.metalRecommendedMaxWorkingSetGB
+            )
+        )
         print("Swift Concurrency   : Swift 6.2 Strict Actor Isolation")
         print("Compute Lanes       : GPU GenerationGate (FIFO) + ANE Co-Residency Lane")
         print("Supported Providers : MLXSwiftProvider, CoreAIProvider (.aimodel), GGUFSubprocessProvider, RemoteHeylookProvider")
         print("Embeddings Engine   : EmbeddingGemma 2 + vDSP Matryoshka (768d / 512d / 256d / 128d)")
-        print("Store Engine        : SQLite3 WAL (Conversations, Messages, Notebooks, Presets, VectorSpans)")
+        print("Store Engine        : SQLite3 WAL (Conversations, Messages, MediaBlobs, Stats, Notebooks, Presets, VectorSpans)")
         if let store = try? VectorStore(databaseURL: storeURL),
            let stats = try? store.stats() {
             let watched = (try? store.listWatchedFolders()) ?? []
@@ -108,7 +121,7 @@ struct HeylookCLI {
             } else {
                 depthBadge = ""
             }
-            print("- [\(m.provider.rawValue)] \(m.modelID)\(mtpBadge)\(visionBadge)\(audioBadge) ctx=\(m.contextSize.value) reasoning=\(m.reasoningFormat.value)\(depthBadge) template=\(m.templateSource.value) (\(m.modelPath))")
+            print("- [\(m.provider.rawValue)] \(m.modelID)\(mtpBadge)\(visionBadge)\(audioBadge) ctx=\(m.contextSize.value) mem=\(m.estimatedMemoryMB)MB reasoning=\(m.reasoningFormat.value)\(depthBadge) template=\(m.templateSource.value) (\(m.modelPath))")
         }
     }
 
@@ -146,7 +159,7 @@ struct HeylookCLI {
     static func runIndex(args: [String]) async {
         guard let targetPath = args.first, !targetPath.hasPrefix("--") else {
             print("Error: missing path to index. Usage: heylook-cli index <path> [--sampling fps|content|off] [--audio-from-video] [--compute all_gpu|hybrid_ane|all_ane]")
-            return
+            exit(1)
         }
         var sampling: VideoWindowSampling = .fps
         if let sIdx = args.firstIndex(of: "--sampling"), sIdx + 1 < args.count {
@@ -180,7 +193,8 @@ struct HeylookCLI {
                 }
             }
         } catch {
-            print("Index error: \(error)")
+            print("Index error: \(error.localizedDescription)")
+            exit(1)
         }
     }
 
@@ -242,7 +256,8 @@ struct HeylookCLI {
                 }
             }
         } catch {
-            print("Search error: \(error)")
+            print("Search error: \(error.localizedDescription)")
+            exit(1)
         }
     }
 
@@ -266,7 +281,7 @@ struct HeylookCLI {
     static func registerConfiguredModels(into scheduler: ComputeScheduler) async -> [EngineDescription] {
         let cfg = HeylookConfig.loadDefault()
         let found = cfg.discoverConfiguredModels()
-        await scheduler.registerDiscoveredModels(found)
+        await scheduler.registerDiscoveredModels(found, allowSyntheticFallback: false)
         return found
     }
 
@@ -323,12 +338,12 @@ struct HeylookCLI {
                     supportsVision: ProvenanceField(value: false, provenance: .derived),
                     supportsThinking: ProvenanceField(value: true, provenance: .derived)
                 )
-                let prov = ProviderFactory.makeProvider(for: adHoc)
+                let prov = ProviderFactory.makeProvider(for: adHoc, allowSyntheticFallback: false)
                 await scheduler.register(provider: prov, description: adHoc)
                 selectedDesc = adHoc
             } else {
                 print("Model '\(reqModel)' not found among \(discovered.count) discovered models.")
-                return
+                exit(1)
             }
         } else if let defMatch = discovered.first(where: { $0.modelID == cfg.defaultModel })
             ?? discovered.first(where: { $0.provider == .mlx })
@@ -336,7 +351,7 @@ struct HeylookCLI {
             selectedDesc = defMatch
         } else {
             print("No models discovered in configured scan_folders (\(cfg.scanFolders.joined(separator: ", "))). Pass '--model <path>' or configure heylook.toml.")
-            return
+            exit(1)
         }
 
         let registry = RequestRegistry()
@@ -388,14 +403,17 @@ struct HeylookCLI {
                 FileHandle.standardError.write(Data(statsLine.utf8))
             }
         } catch {
-            print("Chat error: \(error)")
+            print("Chat error: \(error.localizedDescription)")
+            await scheduler.unloadAllModels()
+            exit(1)
         }
         await scheduler.unloadAllModels()
     }
 
-    static func runServe(port: UInt16) async {
+    static func runServe(portOverride: UInt16?) async {
         do {
             let cfg = HeylookConfig.loadDefault()
+            let port = portOverride ?? UInt16(cfg.serverPort)
             let dbURL = HeylookConfig.defaultStoreURL
             let store = try SQLiteStore(databaseURL: dbURL)
             let scheduler = ComputeScheduler(
@@ -409,47 +427,101 @@ struct HeylookCLI {
                 scheduler: scheduler,
                 embeddingEngine: embeddingEngine,
                 bindHost: cfg.serverHost,
-                allowedHosts: cfg.allowedHosts
+                allowedHosts: cfg.allowedHosts,
+                adminToken: cfg.adminToken ?? ProcessInfo.processInfo.environment["HEYLOOK_ADMIN_TOKEN"],
+                allowSyntheticFallback: false
             )
             let server = HeylookHTTPServer(router: router, host: cfg.serverHost, port: port)
             try await server.start()
             print("Heylook Server listening on http://\(cfg.serverHost):\(port) (\(registered.count) models registered, store: \(dbURL.path))")
-            do {
-                try await Task.sleep(for: .seconds(3600 * 24))
-            } catch {
-                // Task cancelled / interrupted
-            }
+
+            // Block indefinitely on SIGINT / SIGTERM via DispatchSourceSignal (no 24-hour exit bug!)
+            await waitForShutdownSignal()
+            print("\nShutting down Heylook Server gracefully...")
             await server.stop()
+            SubprocessLifecycleRegistry.shared.terminateAll()
         } catch {
-            print("Server error: \(error)")
+            print("Server error: \(error.localizedDescription)")
+            exit(1)
         }
     }
 
-    static func runEvalLab() async {
+    private static func waitForShutdownSignal() async {
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+
+        final class ResumeOnce: @unchecked Sendable {
+            private let lock = NSLock()
+            private var resumed = false
+            private var sources: [any DispatchSourceSignal] = []
+
+            func retain(_ s: [any DispatchSourceSignal]) {
+                lock.lock()
+                sources = s
+                lock.unlock()
+            }
+
+            func finish(_ cont: CheckedContinuation<Void, Never>) {
+                lock.lock()
+                guard !resumed else {
+                    lock.unlock()
+                    return
+                }
+                resumed = true
+                let active = sources
+                sources.removeAll()
+                lock.unlock()
+                for src in active {
+                    src.cancel()
+                }
+                cont.resume()
+            }
+        }
+
+        let guardBox = ResumeOnce()
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global(qos: .utility))
+            let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global(qos: .utility))
+            guardBox.retain([sigintSource, sigtermSource])
+            sigintSource.setEventHandler {
+                guardBox.finish(cont)
+            }
+            sigtermSource.setEventHandler {
+                guardBox.finish(cont)
+            }
+            sigintSource.resume()
+            sigtermSource.resume()
+        }
+    }
+
+    static func runEvalLab(args: [String]) async {
+        let syntheticSelfTest = args.contains("--synthetic-self-test")
         print("=== Heylook Evaluation Lab (chain_probe + vlm_parity_probe + matryoshka_recall_probe) ===")
         do {
-            let report = try await EvalLabSuite.runAll()
+            let report = try await EvalLabSuite.runAll(allowSyntheticSelfTest: syntheticSelfTest)
             for probe in report.probes {
                 let badge = probe.passed ? "PASS" : "FAIL"
                 print("- [\(badge)] \(probe.name.padding(toLength: 24, withPad: " ", startingAt: 0)) : \(probe.detail)")
             }
-            print("--- Matryoshka Representation Learning (MRL) Recall@1 / Recall@3 / MRR ---")
-            for bench in report.matryoshkaBenchmarks {
-                print(
-                    String(
-                        format: "  %4dd | Recall@1=%.2f | Recall@3=%.2f | MRR=%.2f",
-                        bench.dimensions,
-                        bench.recallAt1,
-                        bench.recallAt3,
-                        bench.mrr
+            if !report.matryoshkaBenchmarks.isEmpty {
+                print("--- Matryoshka Representation Learning (MRL) Recall@1 / Recall@3 / MRR ---")
+                for bench in report.matryoshkaBenchmarks {
+                    print(
+                        String(
+                            format: "  %4dd | Recall@1=%.2f | Recall@3=%.2f | MRR=%.2f",
+                            bench.dimensions,
+                            bench.recallAt1,
+                            bench.recallAt3,
+                            bench.mrr
+                        )
                     )
-                )
+                }
             }
             if !report.allPassed {
                 exit(1)
             }
         } catch {
-            print("Eval lab error: \(error)")
+            print("Eval lab error: \(error.localizedDescription)")
             exit(1)
         }
     }
@@ -535,7 +607,7 @@ struct HeylookCLI {
           inspect-checkpoint [dir]                      Inspect local EmbeddingGemma-2-2B safetensors checkpoint
           convert-mlx <src-dir> <dst-dir> [--bits 4|8] [--group-size 32|64] [--mode affine|mxfp4|mxfp8|nvfp4] [--calibration standard|q4_zero] [--overwrite] [--dry-run]
                                                         Quantize & shard a safetensors LLM/VLM checkpoint in pure Swift
-          eval-lab                                      Run multi-turn KV chain, VLM parity, and MRL Recall@K probes
+          eval-lab [--synthetic-self-test]              Run multi-turn KV chain, VLM parity, and MRL Recall@K probes
           chat <prompt>                                 Stream a chat completion with thinking traces
           serve [port]                                  Run the embedded /v1/messages & /v1/embeddings server
         """)

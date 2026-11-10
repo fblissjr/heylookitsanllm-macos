@@ -309,10 +309,11 @@ public struct DeterministicHashEmbeddingEngine: EmbeddingEngine, Sendable {
 }
 
 
-public enum EmbeddingEngineError: LocalizedError, Sendable {
+public enum EmbeddingEngineError: LocalizedError, Sendable, Equatable {
     case invalidResponse(status: Int, detail: String)
     case vectorCountMismatch(expected: Int, actual: Int)
     case checkpointNotFound(URL)
+    case runtimeUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
@@ -322,6 +323,8 @@ public enum EmbeddingEngineError: LocalizedError, Sendable {
             return "Expected \(expected) vectors from engine, received \(actual)"
         case let .checkpointNotFound(url):
             return "EmbeddingGemma 2 MLX checkpoint not found at \(url.path)"
+        case let .runtimeUnavailable(detail):
+            return "Embedding runtime unavailable: \(detail)"
         }
     }
 }

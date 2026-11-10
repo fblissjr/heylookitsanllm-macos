@@ -164,7 +164,7 @@ Core AI supports heterogeneous execution at two levels:
 
 | Dimension | Native MLX Swift (`MLXSwiftProvider`) | Native Core AI (`CoreAIProvider` & `ANECoreMLRuntime`) |
 | :--- | :--- | :--- |
-| **Target Accelerator on macOS** | Metal GPU + Accelerate CPU (800 GB/s+ unified memory bandwidth on Mac Studio) | `macOS` exports run on Metal GPU/CPU; `iOS` / `BC1S` exports run on ANE (~38–50 TOPS, ideal for `< 8B` low-wattage models) |
+| **Target Accelerator on macOS** | Metal GPU + Accelerate CPU over unified memory | `macOS` exports run on Metal GPU/CPU; `iOS` / `BC1S` exports run on ANE (suited for compact low-wattage models) |
 | **Onboarding & Load Time** | **Zero export step**: `mmap`s Hugging Face `.safetensors` directly in seconds | Requires offline `torch.export` + `coreai-opt` + `TorchConverter` export and device specialization |
 | **Multi-Turn KV Cache Slicing** | **Dynamic `[KVCache]` in Swift**: grows incrementally and trims in place (`cache.trim(n)`) on message edits/branches | Stateful `NDArray` buffers bound to compiled `max_context_length` or static `(context_bucket, query_length)` functions |
 | **Architecture Breadth** | **61 LLMs + 20 VLMs** in pure Swift (`mlx-swift-lm`) | ~15 LLM families + utility/speech/diffusion recipes in `coreai-models` |

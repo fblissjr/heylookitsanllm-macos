@@ -12,19 +12,22 @@ public actor RemoteHeylookProvider: InferenceProvider {
         public let stopReason: StopReason?
         public let outputTokens: Int?
         public let performance: MessagesResponse.PerformanceExtension?
+        public let errorMessage: String?
 
         public init(
             textDelta: String = "",
             thinkingDelta: String = "",
             stopReason: StopReason? = nil,
             outputTokens: Int? = nil,
-            performance: MessagesResponse.PerformanceExtension? = nil
+            performance: MessagesResponse.PerformanceExtension? = nil,
+            errorMessage: String? = nil
         ) {
             self.textDelta = textDelta
             self.thinkingDelta = thinkingDelta
             self.stopReason = stopReason
             self.outputTokens = outputTokens
             self.performance = performance
+            self.errorMessage = errorMessage
         }
     }
 
@@ -49,6 +52,28 @@ public actor RemoteHeylookProvider: InferenceProvider {
         descriptionState
     }
 
+    public func preload() async throws {
+        let loadURL = baseURL
+            .appendingPathComponent("v1/models")
+            .appendingPathComponent(modelID)
+            .appendingPathComponent("load")
+        var req = URLRequest(url: loadURL)
+        req.httpMethod = "POST"
+        let (data, resp) = try await session.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let msg = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw ProviderExecutionError.runtimeUnavailable(
+                modelID: modelID,
+                detail: "Remote load HTTP \(http.statusCode)\(msg.isEmpty ? "" : ": \(msg)")"
+            )
+        }
+        if let decoded = try? JSONDecoder().decode(EngineDescription.self, from: data) {
+            descriptionState = decoded
+        } else {
+            descriptionState.isLoaded = true
+        }
+    }
+
     public func unload() async {
         descriptionState.isLoaded = false
         let unloadURL = baseURL
@@ -60,6 +85,28 @@ public actor RemoteHeylookProvider: InferenceProvider {
         _ = try? await session.data(for: req)
     }
 
+    /// Queries `GET /v1/models` on a remote `HeylookServer` peer.
+    public static func fetchRemoteModels(
+        from baseURL: URL,
+        session: URLSession = .shared
+    ) async throws -> [EngineDescription] {
+        let url = baseURL.appendingPathComponent("v1/models")
+        let (data, resp) = try await session.data(from: url)
+        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw ProviderExecutionError.runtimeUnavailable(
+                modelID: "remote",
+                detail: "Remote /v1/models returned HTTP \(http.statusCode)"
+            )
+        }
+        struct ModelsEnvelope: Decodable {
+            let data: [EngineDescription]
+        }
+        if let env = try? JSONDecoder().decode(ModelsEnvelope.self, from: data) {
+            return env.data
+        }
+        return try JSONDecoder().decode([EngineDescription].self, from: data)
+    }
+
     /// Parses an Anthropic Messages SSE `(event, data)` frame emitted by `HeylookServer`.
     public static func parseAnthropicSSEEvent(event: String, data: String) -> ParsedSSEEvent? {
         guard let payload = data.data(using: .utf8),
@@ -69,6 +116,13 @@ public actor RemoteHeylookProvider: InferenceProvider {
         }
 
         switch event {
+        case "error":
+            if let errDict = json["error"] as? [String: Any],
+               let msg = errDict["message"] as? String {
+                return ParsedSSEEvent(errorMessage: msg)
+            }
+            return ParsedSSEEvent(errorMessage: (json["message"] as? String) ?? "Remote SSE stream error")
+
         case "content_block_delta":
             guard let delta = json["delta"] as? [String: Any],
                   let deltaType = delta["type"] as? String
@@ -131,8 +185,10 @@ public actor RemoteHeylookProvider: InferenceProvider {
     ) -> AsyncThrowingStream<GenerationChunk, Error> {
         let baseURL = self.baseURL
         let session = self.session
+        let currentModelID = self.modelID
+
         return AsyncThrowingStream { continuation in
-            Task {
+            let workTask = Task {
                 do {
                     let url = baseURL.appendingPathComponent("v1/messages")
                     var urlReq = URLRequest(url: url)
@@ -154,15 +210,29 @@ public actor RemoteHeylookProvider: InferenceProvider {
                     wireReq.thinking = effectiveSampling.thinking
                     wireReq.thinkingBudget = effectiveSampling.thinkingBudget
                     wireReq.thinkingDepth = effectiveSampling.thinkingDepth ?? request.thinkingDepth
+                    wireReq.stopSequences = effectiveSampling.stopSequences ?? request.stopSequences
+                    wireReq.responseFormat = request.responseFormat
                     urlReq.httpBody = try JSONEncoder().encode(wireReq)
 
                     if useStream {
-                        let (bytes, _) = try await session.bytes(for: urlReq)
+                        let (bytes, resp) = try await session.bytes(for: urlReq)
+                        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                            var errBytes = Data()
+                            for try await b in bytes {
+                                errBytes.append(b)
+                                if errBytes.count >= 4096 { break }
+                            }
+                            let msg = String(decoding: errBytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                            throw ProviderExecutionError.runtimeUnavailable(
+                                modelID: currentModelID,
+                                detail: "Remote HTTP \(http.statusCode)\(msg.isEmpty ? "" : ": \(msg)")"
+                            )
+                        }
                         var currentEvent = ""
                         var generatedCount = 0
                         var sentReasoningEnd = false
                         for try await line in bytes.lines {
-                            let state = await registry.state(for: requestID)
+                            let state = registry.state(for: requestID)
                             if state.isAborted || Task.isCancelled {
                                 try? await self.forwardCancel(requestID: requestID)
                                 continuation.yield(
@@ -185,6 +255,12 @@ public actor RemoteHeylookProvider: InferenceProvider {
                                 let dataStr = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
                                 guard let parsed = Self.parseAnthropicSSEEvent(event: currentEvent, data: dataStr) else {
                                     continue
+                                }
+                                if let errMsg = parsed.errorMessage {
+                                    throw ProviderExecutionError.runtimeUnavailable(
+                                        modelID: currentModelID,
+                                        detail: errMsg
+                                    )
                                 }
                                 if !parsed.textDelta.isEmpty || !parsed.thinkingDelta.isEmpty {
                                     generatedCount += 1
@@ -215,7 +291,14 @@ public actor RemoteHeylookProvider: InferenceProvider {
                         return
                     }
 
-                    let (data, _) = try await session.data(for: urlReq)
+                    let (data, resp) = try await session.data(for: urlReq)
+                    if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                        let msg = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                        throw ProviderExecutionError.runtimeUnavailable(
+                            modelID: currentModelID,
+                            detail: "Remote HTTP \(http.statusCode)\(msg.isEmpty ? "" : ": \(msg)")"
+                        )
+                    }
                     let decoded = try JSONDecoder().decode(MessagesResponse.self, from: data)
                     let textBody = decoded.content.compactMap(\.text).joined()
                     let thinkBody = decoded.content.compactMap(\.thinking).joined()
@@ -234,9 +317,24 @@ public actor RemoteHeylookProvider: InferenceProvider {
                         )
                     )
                     continuation.finish()
+                } catch is CancellationError {
+                    try? await self.forwardCancel(requestID: requestID)
+                    continuation.yield(GenerationChunk(stopReason: .cancelled, activeComputePlacement: .remote))
+                    continuation.finish()
+                } catch let urlErr as URLError where urlErr.code == .cancelled {
+                    try? await self.forwardCancel(requestID: requestID)
+                    continuation.yield(GenerationChunk(stopReason: .cancelled, activeComputePlacement: .remote))
+                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+
+            registry.addCancelHandler(for: requestID) {
+                workTask.cancel()
+            }
+            continuation.onTermination = { _ in
+                workTask.cancel()
             }
         }
     }

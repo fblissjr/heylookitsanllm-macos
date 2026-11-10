@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import HeylookCore
 import Metal
@@ -20,6 +21,7 @@ public enum ProviderExecutionError: LocalizedError, Sendable, Equatable {
     case checkpointNotFound(modelID: String, path: String)
     case binaryNotFound(modelID: String, binaryPath: String)
     case runtimeUnavailable(modelID: String, detail: String)
+    case invalidRequest(detail: String)
 
     public var errorDescription: String? {
         switch self {
@@ -29,6 +31,8 @@ public enum ProviderExecutionError: LocalizedError, Sendable, Equatable {
             return "binary_not_found: Executable for '\(modelID)' not found at '\(binaryPath)'"
         case let .runtimeUnavailable(modelID, detail):
             return "runtime_unavailable: Cannot execute '\(modelID)' (\(detail))"
+        case let .invalidRequest(detail):
+            return "invalid_request: \(detail)"
         }
     }
 }
@@ -40,6 +44,12 @@ public protocol InferenceProvider: Sendable {
     var providerKind: EngineProviderKind { get }
 
     func describe() async -> EngineDescription
+
+    /// Eagerly loads weights / spawns runtime subprocesses and verifies readiness.
+    func preload() async throws
+
+    /// Clears KV / prompt / Metal caches without unloading model weights.
+    func clearCache() async -> Bool
 
     func generate(
         requestID: String,
@@ -53,10 +63,12 @@ public protocol InferenceProvider: Sendable {
 }
 
 public extension InferenceProvider {
+    func preload() async throws {}
+    func clearCache() async -> Bool { false }
     func unload() async {}
 }
 
-/// Hardware memory telemetry for Apple Silicon Unified Memory (e.g. 192 GB M2 Ultra Mac Studio).
+/// Hardware memory and CPU telemetry for Apple Silicon Unified Memory.
 public enum HardwareMemoryMonitor {
     public struct MemorySnapshot: Codable, Sendable, Equatable {
         public let totalPhysicalRAMGB: Double
@@ -64,19 +76,28 @@ public enum HardwareMemoryMonitor {
         public let metalCurrentAllocatedMB: Int
         public let processResidentMB: Int
         public let deviceName: String
+        public let ramUsedGB: Double
+        public let ramAvailableGB: Double
+        public let cpuPercent: Double
 
         public init(
             totalPhysicalRAMGB: Double,
             metalRecommendedMaxWorkingSetGB: Double,
             metalCurrentAllocatedMB: Int,
             processResidentMB: Int,
-            deviceName: String
+            deviceName: String,
+            ramUsedGB: Double = 0,
+            ramAvailableGB: Double = 0,
+            cpuPercent: Double = 0
         ) {
             self.totalPhysicalRAMGB = totalPhysicalRAMGB
             self.metalRecommendedMaxWorkingSetGB = metalRecommendedMaxWorkingSetGB
             self.metalCurrentAllocatedMB = metalCurrentAllocatedMB
             self.processResidentMB = processResidentMB
             self.deviceName = deviceName
+            self.ramUsedGB = ramUsedGB
+            self.ramAvailableGB = ramAvailableGB
+            self.cpuPercent = cpuPercent
         }
     }
 
@@ -98,12 +119,51 @@ public enum HardwareMemoryMonitor {
         }
         let rssMB = kerr == KERN_SUCCESS ? Int(info.resident_size / (1024 * 1024)) : 0
 
+        // Query system-wide Mach VM page counters for real ramUsedGB & ramAvailableGB
+        var vmStats = vm_statistics64()
+        var vmCount = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
+        var pageSize: vm_size_t = 16384
+        host_page_size(mach_host_self(), &pageSize)
+        let vmRes: kern_return_t = withUnsafeMutablePointer(to: &vmStats) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(vmCount)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &vmCount)
+            }
+        }
+        let ramUsedGB: Double
+        let ramAvailableGB: Double
+        if vmRes == KERN_SUCCESS {
+            let pageBytes = Double(pageSize)
+            let usedPages = Double(vmStats.active_count)
+                + Double(vmStats.wire_count)
+                + Double(vmStats.compressor_page_count)
+            let used = (usedPages * pageBytes) / (1024.0 * 1024.0 * 1024.0)
+            ramUsedGB = min(physGB, (used * 10).rounded() / 10)
+            ramAvailableGB = max(0, ((physGB - ramUsedGB) * 10).rounded() / 10)
+        } else {
+            let approxUsed = Double(rssMB) / 1024.0
+            ramUsedGB = (approxUsed * 10).rounded() / 10
+            ramAvailableGB = max(0, ((physGB - approxUsed) * 10).rounded() / 10)
+        }
+
+        // Normalized CPU utilization from 1-minute loadavg across active logical cores
+        var loadAvg: Double = 0
+        let nCores = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let cpuPct: Double
+        if getloadavg(&loadAvg, 1) == 1 {
+            cpuPct = min(100.0, max(0.0, ((loadAvg / Double(nCores)) * 1000.0).rounded() / 10.0))
+        } else {
+            cpuPct = 0.0
+        }
+
         return MemorySnapshot(
             totalPhysicalRAMGB: (physGB * 10).rounded() / 10,
             metalRecommendedMaxWorkingSetGB: (recommendedGB * 10).rounded() / 10,
             metalCurrentAllocatedMB: currentMetalMB,
             processResidentMB: rssMB,
-            deviceName: devName
+            deviceName: devName,
+            ramUsedGB: ramUsedGB,
+            ramAvailableGB: ramAvailableGB,
+            cpuPercent: cpuPct
         )
     }
 }
@@ -155,6 +215,15 @@ public actor ComputeScheduler {
         self.maxQueueDepth = max(1, maxQueueDepth)
     }
 
+    public func reconfigureLimits(maxLoadedGPUModels: Int? = nil, maxQueueDepth: Int? = nil) {
+        if let maxLoadedGPUModels {
+            self.maxLoadedGPUModels = max(1, maxLoadedGPUModels)
+        }
+        if let maxQueueDepth {
+            self.maxQueueDepth = max(1, maxQueueDepth)
+        }
+    }
+
     public func register(provider: any InferenceProvider, description: EngineDescription) async {
         providers[description.modelID] = provider
         descriptions[description.modelID] = description
@@ -175,6 +244,48 @@ public actor ComputeScheduler {
             let provider = ProviderFactory.makeProvider(for: desc, allowSyntheticFallback: allowSyntheticFallback)
             await register(provider: provider, description: desc)
         }
+    }
+
+    /// Replaces the registry with `discovered` (preserving currently loaded providers whose IDs match
+    /// unless `unloadRemoved` or `forceReload` is requested).
+    public func reloadRegistry(
+        _ discovered: [EngineDescription],
+        allowSyntheticFallback: Bool = false
+    ) async {
+        let newIDs = Set(discovered.map(\.modelID))
+        let removedIDs = Set(descriptions.keys).subtracting(newIDs)
+        for id in removedIDs {
+            await unloadModel(id)
+            providers.removeValue(forKey: id)
+            descriptions.removeValue(forKey: id)
+        }
+        for var desc in discovered {
+            if let existing = descriptions[desc.modelID], existing.isLoaded {
+                desc.isLoaded = true
+                descriptions[desc.modelID] = desc
+            } else {
+                let provider = ProviderFactory.makeProvider(for: desc, allowSyntheticFallback: allowSyntheticFallback)
+                await register(provider: provider, description: desc)
+            }
+        }
+    }
+
+    public func removeModel(_ modelID: String) async -> Bool {
+        guard descriptions[modelID] != nil else { return false }
+        await unloadModel(modelID)
+        providers.removeValue(forKey: modelID)
+        descriptions.removeValue(forKey: modelID)
+        return true
+    }
+
+    public func clearAllCaches() async -> Int {
+        var cleared = 0
+        for (_, provider) in providers {
+            if await provider.clearCache() {
+                cleared += 1
+            }
+        }
+        return cleared
     }
 
     public func listModels() -> [EngineDescription] {
@@ -291,18 +402,29 @@ public actor ComputeScheduler {
         return updated
     }
 
-    /// Marks `modelID` as loaded and enforces LRU eviction on unpinned GPU models while leaving
-    /// ANE-resident models (`computePlacement.runsOnNeuralEngineLane`) untouched.
-    /// Any evicted GPU model's `provider.unload()` is invoked so Metal memory and `llama-server`
-    /// subprocesses are immediately reclaimed.
-    public func activateModel(_ modelID: String) async throws -> EngineDescription {
+    /// Marks `modelID` as loaded (and when `warm == true`, invokes `provider.preload()` first so
+    /// weights / subprocesses are genuinely loaded before `isLoaded` becomes `true`) and enforces
+    /// LRU eviction on unpinned GPU models while leaving ANE-resident models untouched.
+    public func activateModel(_ modelID: String, warm: Bool = false) async throws -> EngineDescription {
         guard var desc = descriptions[modelID] else {
             throw ComputeSchedulerError.modelNotFound(modelID)
         }
-        desc.isLoaded = true
-        descriptions[modelID] = desc
-        let evictedIDs = recordResidency(for: desc)
+        let evictedIDs = planEvictionsIfActivating(desc)
         for evictedID in evictedIDs {
+            await unloadModel(evictedID)
+        }
+        if warm, let provider = providers[modelID] {
+            try await provider.preload()
+            var refreshed = await provider.describe()
+            refreshed.isLoaded = true
+            refreshed.isPinned = desc.isPinned
+            desc = refreshed
+        } else {
+            desc.isLoaded = true
+        }
+        descriptions[modelID] = desc
+        let postEvicted = recordResidency(for: desc)
+        for evictedID in postEvicted {
             await providers[evictedID]?.unload()
         }
         return desc
@@ -340,7 +462,7 @@ public actor ComputeScheduler {
         for modelID: String,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
-        let desc = try await activateModel(modelID)
+        let desc = try await activateModel(modelID, warm: false)
         let usesANELane = desc.computePlacement.value.runsOnNeuralEngineLane
 
         if usesANELane {
@@ -395,6 +517,22 @@ public actor ComputeScheduler {
         )
     }
 
+    private func planEvictionsIfActivating(_ desc: EngineDescription) -> [String] {
+        guard !desc.computePlacement.value.runsOnNeuralEngineLane else { return [] }
+        if lruOrderGPU.contains(desc.modelID) { return [] }
+        var simulated = lruOrderGPU + [desc.modelID]
+        var toEvict: [String] = []
+        while simulated.count > maxLoadedGPUModels {
+            guard let candidateIdx = simulated.firstIndex(where: { id in
+                descriptions[id]?.isPinned != true && id != desc.modelID
+            }) else {
+                break
+            }
+            toEvict.append(simulated.remove(at: candidateIdx))
+        }
+        return toEvict
+    }
+
     @discardableResult
     private func recordResidency(for desc: EngineDescription) -> [String] {
         if desc.computePlacement.value.runsOnNeuralEngineLane {
@@ -405,7 +543,6 @@ public actor ComputeScheduler {
         lruOrderGPU.append(desc.modelID)
 
         var evictedIDs: [String] = []
-        // Evict oldest unpinned GPU models when unpinned + pinned GPU models exceed maxLoadedGPUModels
         while lruOrderGPU.count > maxLoadedGPUModels {
             guard let candidateIdx = lruOrderGPU.firstIndex(where: { id in
                 descriptions[id]?.isPinned != true && id != desc.modelID

@@ -31,14 +31,14 @@ Every indexed file is represented as a parent `Artifact` (`ArtifactKind`: `.vide
 
 `ModelComputeOptions` allows routing the 3 towers of `EmbeddingGemma 2` independently across **CPU + Neural Engine (`.cpuAndNeuralEngine`)**, **MLX GPU (`.mlxGPU`)**, **CoreML GPU (`.cpuAndGPU`)**, or **CPU Only (`.cpuOnly`)**:
 
-| Component (`EmbeddingComponent`) | Compiled Bundle | ANE Op Residency | Est. Memory |
+| Component (`EmbeddingComponent`) | Compiled Bundle | ANE Op Placement | Role |
 | :--- | :--- | :--- | :--- |
-| **Vision Encoder (`visionEncoder`)** | `EmbeddingGemma2VisionANE.mlmodelc` | `100%` ANE | `~335 MB` |
-| **Audio Conformer (`audioEncoder`)** | `EmbeddingGemma2AudioANE.mlmodelc` | `99%` ANE | `~611 MB` |
-| **Text Backbone + Projection (`textBackbone`)** | `EmbeddingGemma2TextANE.mlmodelc` + `embed_tokens_fp16.bin` | `100%` ANE | `~542 MB` |
+| **Vision Encoder (`visionEncoder`)** | `EmbeddingGemma2VisionANE.mlmodelc` | Neural Engine primary | Patchifies & encodes still images and video keyframes |
+| **Audio Conformer (`audioEncoder`)** | `EmbeddingGemma2AudioANE.mlmodelc` | Neural Engine primary | Encodes 16 kHz 128-bin HTK log-mel audio windows |
+| **Text Backbone + Projection (`textBackbone`)** | `EmbeddingGemma2TextANE.mlmodelc` + `embed_tokens_fp16.bin` | Neural Engine + mmap FP16 embeddings | Encodes text tokens and fuses multimodal projections into 768d |
 
 ### ANE Execution Path (`HybridLocalEmbeddingEngine` & `ANECoreMLRuntime`)
-- When compiled `.mlmodelc` bundles exist in the checkpoint directory (`hasCompiledANETowers == true`), `HybridLocalEmbeddingEngine` decodes images via `CGImageSource`, computes 16 kHz 128-bin HTK log-mel spectrograms via `ANECoreMLRuntime.computeAudioLogMel`, and runs `aneRuntime.encodeVision`, `aneRuntime.encodeAudio`, and `aneRuntime.encodeTextAndFuse` directly on the Neural Engine.
+- When compiled `.mlmodelc` bundles exist in the checkpoint directory (`hasCompiledANETowers == true`), `HybridLocalEmbeddingEngine` decodes images via `CGImageSource`, resamples arbitrary sample-rate / multi-channel audio (`24 kHz`, `44.1 kHz`, `48 kHz` stereo/mono WAV/CAF/M4A) to `16 kHz` mono `Float32` via `AVAudioFile` + `AVAudioConverter`, computes 128-bin HTK log-mel spectrograms via `ANECoreMLRuntime.computeAudioLogMel`, and runs `aneRuntime.encodeVision`, `aneRuntime.encodeAudio`, and `aneRuntime.encodeTextAndFuse` directly on the Neural Engine.
 - **FP16 Overflow Mitigation (`ANESafeRMSNorm`)**: Because the Apple Neural Engine executes strictly in IEEE 754 `FP16` (`max = 65,504`), `scripts/export_ane_coreml.py` pre-scales hidden states by $1/16$ before squaring inside `RMSNorm` layers so large Gemma residual activations never overflow to `NaN` on ANE hardware.
 
 ---
@@ -46,8 +46,8 @@ Every indexed file is represented as a parent `Artifact` (`ArtifactKind`: `.vide
 ## 4. Video & Audio Windowing Pipeline (`ArtifactProcessor.swift`)
 
 - **Duration-Scaled Frame Budgets (`WindowPlanner.pickContent`)**:
-  Scales frame selection to the window duration (`min(maxFrames, max(2, ceil((hi - lo) * fps)))`) and falls back to all candidate frames when `< 3` anchors exist, preventing short clips or trailing windows from feeding 4x dense frames into a 1 fps vision processor.
+  Scales frame selection to the window duration (`min(maxFrames, max(2, ceil((hi - lo) * fps)))`) and falls back to all candidate frames when `< 3` anchors exist, preventing short clips or trailing windows from feeding dense frames into a 1 fps vision processor.
 - **Upright Portrait Frame Decoding**:
   Every `AVAssetImageGenerator` instance sets `appliesPreferredTrackTransform = true` so portrait iPhone clips are rotated upright before vision encoding.
-- **Soundtrack Indexing (`loadAudioFromVideo`)**:
-  When enabled, `IndexCoordinator` extracts both `.temporal` visual keyframe windows and `16 kHz` mono PCM audio windows (`30s` window, `15s` stride) for the same video artifact.
+- **SDK 27 Async Soundtrack Extraction (`loadAudioFromVideo`)**:
+  Uses SDK 27 `AVAssetReader.outputProvider(for:)` + `readySampleBuffer.withUnsafeSampleBuffer` to stream `16 kHz` mono PCM audio windows (`30s` window, `15s` stride) alongside `.temporal` visual keyframe windows for the same video artifact.

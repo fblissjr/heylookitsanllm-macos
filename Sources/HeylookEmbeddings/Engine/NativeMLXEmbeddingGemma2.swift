@@ -196,9 +196,11 @@ public enum NativeMLXEmbeddingGemma2 {
     }
 
     /// Creates the best available in-process `EmbeddingEngine` for the current build and checkpoint.
+    /// `allowSyntheticFallback` defaults to `false` (Repo Rule #3: Truthful Runtime).
     public static func makeBestAvailableEngine(
         checkpointURL: URL = defaultCheckpointURL,
-        computeOptions: ModelComputeOptions = .allMLXGPU
+        computeOptions: ModelComputeOptions = .allMLXGPU,
+        allowSyntheticFallback: Bool = false
     ) -> any EmbeddingEngine {
         #if canImport(MLXVLM)
         if FileManager.default.fileExists(atPath: checkpointURL.appendingPathComponent("config.json").path) {
@@ -210,37 +212,237 @@ public enum NativeMLXEmbeddingGemma2 {
         #endif
         return HybridLocalEmbeddingEngine(
             checkpointURL: checkpointURL,
-            computeOptions: computeOptions
+            computeOptions: computeOptions,
+            allowSyntheticFallback: allowSyntheticFallback
         )
     }
 }
 
-/// Hybrid local `EmbeddingEngine` used when `MLXVLM` is not linked (e.g. fast `swift build`):
-/// - Uses `ArtifactProcessor` + `WindowPlanner` for real video/audio window planning and frame extraction.
-/// - Uses `ANECoreMLRuntime` when compiled CoreML `.mlmodelc` towers are present on disk.
-/// - Falls back to `DeterministicHashEmbeddingEngine` so indexing, search, and UI work offline without external servers.
+/// Lightweight SentencePiece/BPE `tokenizer.json` piece encoder used by `HybridLocalEmbeddingEngine`
+/// when `Tokenizers` is not compiled in, eliminating fake Unicode-scalar modulo token IDs.
+public struct CheckpointPieceTokenizer: Sendable {
+    public let bosTokenID: Int
+    public let eosTokenID: Int
+    public let unkTokenID: Int
+    private let tokenToID: [String: Int]
+    private let tokenScores: [String: Float]
+    private let maxPieceChars: Int
+    private let usesSentencePieceSpace: Bool
+
+    public static func load(from checkpointDirectory: URL) -> CheckpointPieceTokenizer? {
+        let fm = FileManager.default
+        let candidateURLs = [
+            checkpointDirectory.appendingPathComponent("tokenizer.json"),
+            checkpointDirectory.appendingPathComponent("tokenizer/tokenizer.json"),
+        ]
+        guard let tokURL = candidateURLs.first(where: { fm.fileExists(atPath: $0.path) }),
+              let data = try? Data(contentsOf: tokURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let model = root["model"] as? [String: Any]
+        else {
+            return nil
+        }
+
+        var map: [String: Int] = [:]
+        var scores: [String: Float] = [:]
+        var maxLen = 1
+
+        if let vocabDict = model["vocab"] as? [String: Any] {
+            for (piece, rawID) in vocabDict {
+                if let id = (rawID as? NSNumber)?.intValue {
+                    map[piece] = id
+                    if piece.count > maxLen { maxLen = piece.count }
+                }
+            }
+        } else if let vocabList = model["vocab"] as? [[Any]] {
+            // Unigram SentencePiece format: `[["<pad>", 0.0], ["<eos>", 0.0], ["▁the", -3.12], ...]`
+            for (idx, entry) in vocabList.enumerated() where !entry.isEmpty {
+                if let piece = entry[0] as? String {
+                    map[piece] = idx
+                    if entry.count > 1, let sc = (entry[1] as? NSNumber)?.floatValue {
+                        scores[piece] = sc
+                    }
+                    if piece.count > maxLen { maxLen = piece.count }
+                }
+            }
+        }
+
+        if let added = root["added_tokens"] as? [[String: Any]] {
+            for item in added {
+                if let content = item["content"] as? String,
+                   let id = (item["id"] as? NSNumber)?.intValue {
+                    map[content] = id
+                    if content.count > maxLen { maxLen = content.count }
+                }
+            }
+        }
+
+        guard !map.isEmpty else { return nil }
+        let bos = map["<bos>"] ?? map["<s>"] ?? 2
+        let eos = map["<eos>"] ?? map["</s>"] ?? 1
+        let unk = map["<unk>"] ?? 3
+        let usesSP = map.keys.contains { $0.contains("▁") }
+
+        return CheckpointPieceTokenizer(
+            bosTokenID: bos,
+            eosTokenID: eos,
+            unkTokenID: unk,
+            tokenToID: map,
+            tokenScores: scores,
+            maxPieceChars: min(maxLen, 64),
+            usesSentencePieceSpace: usesSP
+        )
+    }
+
+    public func encode(_ text: String) -> [Int] {
+        guard !text.isEmpty else { return [] }
+        let normalized: String
+        if usesSentencePieceSpace {
+            normalized = text.replacingOccurrences(of: " ", with: "▁")
+        } else {
+            normalized = text
+        }
+        let chars = Array(normalized)
+        let n = chars.count
+
+        if !tokenScores.isEmpty {
+            // Viterbi dynamic programming segmentation over Unigram log-probabilities
+            var bestScore = [Float](repeating: -.greatestFiniteMagnitude, count: n + 1)
+            var bestPrev = [Int](repeating: 0, count: n + 1)
+            var bestID = [Int](repeating: unkTokenID, count: n + 1)
+            bestScore[0] = 0
+
+            for i in 0..<n where bestScore[i] > -.greatestFiniteMagnitude / 2 {
+                let upper = min(n, i + maxPieceChars)
+                var matchedAny = false
+                for j in (i + 1)...upper {
+                    let sub = String(chars[i..<j])
+                    if let tokID = tokenToID[sub] {
+                        matchedAny = true
+                        let pieceScore = tokenScores[sub] ?? -10.0
+                        let cand = bestScore[i] + pieceScore
+                        if cand > bestScore[j] {
+                            bestScore[j] = cand
+                            bestPrev[j] = i
+                            bestID[j] = tokID
+                        }
+                    }
+                }
+                if !matchedAny {
+                    // Byte fallback `<0xXX>` if present in Gemma vocab, else `<unk>`
+                    let charStr = String(chars[i])
+                    let utf8Bytes = Array(charStr.utf8)
+                    if utf8Bytes.count == 1,
+                       let byteID = tokenToID[String(format: "<0x%02X>", utf8Bytes[0])] {
+                        let cand = bestScore[i] - 20.0
+                        if cand > bestScore[i + 1] {
+                            bestScore[i + 1] = cand
+                            bestPrev[i + 1] = i
+                            bestID[i + 1] = byteID
+                        }
+                    } else {
+                        let cand = bestScore[i] - 25.0
+                        if cand > bestScore[i + 1] {
+                            bestScore[i + 1] = cand
+                            bestPrev[i + 1] = i
+                            bestID[i + 1] = unkTokenID
+                        }
+                    }
+                }
+            }
+
+            var reversedIDs: [Int] = []
+            var cur = n
+            while cur > 0 {
+                reversedIDs.append(bestID[cur])
+                let prev = bestPrev[cur]
+                cur = prev < cur ? prev : cur - 1
+            }
+            return reversedIDs.reversed()
+        }
+
+        // Greedy longest-match fallback for BPE vocab dicts
+        var ids: [Int] = []
+        var idx = 0
+        while idx < n {
+            var matchedLen = 0
+            var matchedID: Int?
+            let upper = min(n, idx + maxPieceChars)
+            for end in stride(from: upper, through: idx + 1, by: -1) {
+                let sub = String(chars[idx..<end])
+                if let id = tokenToID[sub] {
+                    matchedID = id
+                    matchedLen = end - idx
+                    break
+                }
+            }
+            if let matchedID {
+                ids.append(matchedID)
+                idx += matchedLen
+            } else {
+                let utf8Bytes = Array(String(chars[idx]).utf8)
+                var appendedByte = false
+                for b in utf8Bytes {
+                    if let byteID = tokenToID[String(format: "<0x%02X>", b)] {
+                        ids.append(byteID)
+                        appendedByte = true
+                    }
+                }
+                if !appendedByte {
+                    ids.append(unkTokenID)
+                }
+                idx += 1
+            }
+        }
+        return ids
+    }
+}
+
+/// Hybrid local `EmbeddingEngine` executing compiled CoreML `.mlmodelc` ANE towers (`ANECoreMLRuntime`)
+/// and `ArtifactProcessor` + `WindowPlanner` temporal windowing.
+/// Enforces Repo Rule #3 (*Truthful Runtime*): `allowSyntheticFallback` defaults to `false` and never
+/// silently masquerades `DeterministicHashEmbeddingEngine` vectors as model embeddings in production.
 public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
     public nonisolated let modelID: String
     public nonisolated let checkpointURL: URL
     public nonisolated let computeOptions: ModelComputeOptions
     public nonisolated let hasCompiledANETowers: Bool
+    public nonisolated let allowSyntheticFallback: Bool
     public nonisolated let nativeDimensions: Int = Matryoshka.gemma2NativeDimensions
     public nonisolated let supportedDimensions: [Int] = Matryoshka.gemma2Dimensions
 
     private let aneRuntime: ANECoreMLRuntime
+    private let pieceTokenizer: CheckpointPieceTokenizer?
     private let fallbackHash: DeterministicHashEmbeddingEngine
 
     public init(
         checkpointURL: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
-        computeOptions: ModelComputeOptions = .allMLXGPU
+        computeOptions: ModelComputeOptions = .allMLXGPU,
+        allowSyntheticFallback: Bool = false
     ) {
         self.checkpointURL = checkpointURL
         self.computeOptions = computeOptions
+        self.allowSyntheticFallback = allowSyntheticFallback
         let anePresent = ANETowerInspector.locateBundle(for: .textBackbone, in: checkpointURL) != nil
         self.hasCompiledANETowers = anePresent
-        self.modelID = anePresent ? checkpointURL.lastPathComponent : "deterministic-hash-768d"
+        self.modelID = (anePresent || !allowSyntheticFallback)
+            ? checkpointURL.lastPathComponent
+            : "deterministic-hash-768d"
         self.aneRuntime = ANECoreMLRuntime(checkpointDirectory: checkpointURL)
+        self.pieceTokenizer = CheckpointPieceTokenizer.load(from: checkpointURL)
         self.fallbackHash = DeterministicHashEmbeddingEngine(modelID: "deterministic-hash-768d")
+    }
+
+    public init(
+        checkpointDirectory: URL,
+        computeOptions: ModelComputeOptions = .allMLXGPU,
+        allowSyntheticFallback: Bool = false
+    ) {
+        self.init(
+            checkpointURL: checkpointDirectory,
+            computeOptions: computeOptions,
+            allowSyntheticFallback: allowSyntheticFallback
+        )
     }
 
     public func unload() async {
@@ -252,6 +454,12 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
         dimensions: Int? = nil
     ) async throws -> [EmbeddedOutput] {
         let targetDim = dimensions ?? nativeDimensions
+        if !hasCompiledANETowers && !allowSyntheticFallback {
+            throw EmbeddingEngineError.runtimeUnavailable(
+                "Compiled CoreML ANE towers (.mlmodelc) not found at '\(checkpointURL.path)' and native MLXVLM is not linked."
+            )
+        }
+
         var outputs = [EmbeddedOutput]()
         outputs.reserveCapacity(inputs.count)
 
@@ -259,6 +467,12 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
             try Task.checkCancellation()
             var seedText = item.title ?? ""
             var windowedVideoRequest: (url: URL, sampling: VideoWindowSampling)?
+            var tempVideoURL: URL?
+            defer {
+                if let tempVideoURL {
+                    try? FileManager.default.removeItem(at: tempVideoURL)
+                }
+            }
 
             for part in item.parts {
                 switch part {
@@ -266,8 +480,17 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                     seedText += " " + s
                 case let .media(kind, mimeType, data, url, windowSampling):
                     seedText += " \(kind.rawValue) \(mimeType) \(url?.lastPathComponent ?? "") \(data?.count ?? 0)"
-                    if kind == .video, let url, windowSampling != .off, windowedVideoRequest == nil {
-                        windowedVideoRequest = (url, windowSampling)
+                    if kind == .video, windowSampling != .off, windowedVideoRequest == nil {
+                        if let url {
+                            windowedVideoRequest = (url, windowSampling)
+                        } else if let data {
+                            let tmp = FileManager.default.temporaryDirectory
+                                .appendingPathComponent("heylook-emb-vid-\(UUID().uuidString).mp4")
+                            if (try? data.write(to: tmp)) != nil {
+                                tempVideoURL = tmp
+                                windowedVideoRequest = (tmp, windowSampling)
+                            }
+                        }
                     }
                 }
             }
@@ -275,11 +498,15 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
             let primary: [Float]
             if let aneVec = try await tryEmbedItemOnANE(item: item, targetDim: targetDim) {
                 primary = aneVec
-            } else {
+            } else if allowSyntheticFallback {
                 primary = fallbackHash.embed(text: seedText, dimensions: targetDim)
+            } else {
+                throw EmbeddingEngineError.runtimeUnavailable(
+                    "ANE tower execution unavailable for checkpoint '\(checkpointURL.path)' (verify tokenizer.json and .mlmodelc bundles exist)."
+                )
             }
-            var windows = [EmbeddedOutput.WindowVector]()
 
+            var windows = [EmbeddedOutput.WindowVector]()
             if let (videoURL, sampling) = windowedVideoRequest,
                let candidates = try? await ArtifactProcessor.extractVideoCandidates(for: videoURL, sampling: sampling) {
                 let planned = WindowPlanner.planWindows(
@@ -294,10 +521,22 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                 )
                 if planned.count > 1 {
                     for win in planned {
-                        let winVec = fallbackHash.embed(
-                            text: "\(seedText) window:\(win.start)-\(win.end)",
-                            dimensions: targetDim
-                        )
+                        let winVec: [Float]
+                        if hasCompiledANETowers,
+                           let decodedFrames = try? await ArtifactProcessor.decodeVideoFrames(for: videoURL, at: win.frameTimes),
+                           !decodedFrames.isEmpty,
+                           let aneWinVec = try await tryEmbedVideoFramesOnANE(frames: decodedFrames, targetDim: targetDim) {
+                            winVec = aneWinVec
+                        } else if allowSyntheticFallback {
+                            winVec = fallbackHash.embed(
+                                text: "\(seedText) window:\(win.start)-\(win.end)",
+                                dimensions: targetDim
+                            )
+                        } else {
+                            throw EmbeddingEngineError.runtimeUnavailable(
+                                "Failed to encode video window (\(win.start)s-\(win.end)s) on ANE."
+                            )
+                        }
                         windows.append(
                             EmbeddedOutput.WindowVector(
                                 start: win.start,
@@ -315,8 +554,56 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
         return outputs
     }
 
+    private func tryEmbedVideoFramesOnANE(
+        frames: [(time: Double, image: CGImage)],
+        targetDim: Int
+    ) async throws -> [Float]? {
+        let visionUnit: TowerComputeUnit = computeOptions.visionEncoder == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.visionEncoder
+        let textUnit: TowerComputeUnit = computeOptions.textBackbone == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.textBackbone
+
+        let bos = pieceTokenizer?.bosTokenID ?? 2
+        let eos = pieceTokenizer?.eosTokenID ?? 1
+        var tokenIDs: [Int] = [bos]
+        var softTokens: [Float] = []
+
+        for frame in frames {
+            guard let prep = ANECoreMLRuntime.prepareImagePixels(from: frame.image, forVideoBudget: true),
+                  let enc = try await aneRuntime.encodeVision(
+                      pixels: prep.pixels,
+                      height: prep.height,
+                      width: prep.width,
+                      unit: visionUnit
+                  )
+            else { return nil }
+            tokenIDs.append(255999)
+            tokenIDs.append(contentsOf: repeatElement(258884, count: enc.tokenCount))
+            tokenIDs.append(258882)
+            softTokens.append(contentsOf: enc.softTokens)
+        }
+        tokenIDs.append(eos)
+        return try await aneRuntime.encodeTextAndFuse(
+            tokenIDs: tokenIDs,
+            softTokens: softTokens.isEmpty ? nil : softTokens,
+            unit: textUnit,
+            dimensions: targetDim
+        )
+    }
+
     private func tryEmbedItemOnANE(item: EmbeddingInput, targetDim: Int) async throws -> [Float]? {
         guard hasCompiledANETowers else { return nil }
+        guard let pieceTokenizer else {
+            if !allowSyntheticFallback {
+                throw EmbeddingEngineError.runtimeUnavailable(
+                    "Missing tokenizer.json in checkpoint directory '\(checkpointURL.path)' required for ANE text backbone."
+                )
+            }
+            return nil
+        }
+
         let visionUnit: TowerComputeUnit = computeOptions.visionEncoder == .mlxGPU
             ? .cpuAndNeuralEngine
             : computeOptions.visionEncoder
@@ -327,8 +614,14 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
             ? .cpuAndNeuralEngine
             : computeOptions.textBackbone
 
-        var tokenIDs: [Int] = [2] // <bos>
+        var tokenIDs: [Int] = [pieceTokenizer.bosTokenID]
         var softTokens: [Float] = []
+        var tempURLs: [URL] = []
+        defer {
+            for tmp in tempURLs {
+                try? FileManager.default.removeItem(at: tmp)
+            }
+        }
 
         for part in item.parts {
             switch part {
@@ -336,13 +629,32 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                 let formatted = (item.task == .document || item.task == .retrievalDocument)
                     ? EmbeddingTask.documentPrompt(title: item.title, text: s)
                     : (item.task.promptPrefix + s)
-                for scalar in formatted.unicodeScalars.prefix(512) {
-                    tokenIDs.append(100 + Int(scalar.value % 250_000))
+                let encodedPieces = pieceTokenizer.encode(formatted)
+                tokenIDs.append(contentsOf: encodedPieces.prefix(2048))
+
+            case let .media(kind, _, data, url, _):
+                let mediaURL: URL
+                if let url {
+                    mediaURL = url
+                } else if let data {
+                    let ext: String
+                    switch kind {
+                    case .image: ext = "jpg"
+                    case .audio: ext = "wav"
+                    case .video: ext = "mp4"
+                    default: ext = "bin"
+                    }
+                    let tmp = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("heylook-ane-\(UUID().uuidString).\(ext)")
+                    try data.write(to: tmp)
+                    tempURLs.append(tmp)
+                    mediaURL = tmp
+                } else {
+                    continue
                 }
-            case let .media(kind, _, _, url, _):
-                guard let url else { continue }
+
                 if kind == .image {
-                    guard let prep = ANECoreMLRuntime.prepareImagePixels(from: url, forVideoBudget: false),
+                    guard let prep = ANECoreMLRuntime.prepareImagePixels(from: mediaURL, forVideoBudget: false),
                           let enc = try await aneRuntime.encodeVision(
                               pixels: prep.pixels,
                               height: prep.height,
@@ -355,7 +667,8 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                     tokenIDs.append(258882)
                     softTokens.append(contentsOf: enc.softTokens)
                 } else if kind == .audio {
-                    guard let pcm = try? await ArtifactProcessor.decodeMonoPCM(for: url),
+                    guard let pcm = try? await ArtifactProcessor.decodeMonoPCM(for: mediaURL),
+                          !pcm.isEmpty,
                           let mel = ANECoreMLRuntime.computeAudioLogMel(pcmSamples: pcm),
                           let enc = try await aneRuntime.encodeAudio(
                               melFeatures: mel.features,
@@ -367,10 +680,38 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                     tokenIDs.append(contentsOf: repeatElement(258881, count: enc.tokenCount))
                     tokenIDs.append(258883)
                     softTokens.append(contentsOf: enc.softTokens)
+                } else if kind == .video {
+                    let candidates = try await ArtifactProcessor.extractVideoCandidates(for: mediaURL, sampling: .fps)
+                    let indices = WindowPlanner.pickFPS(
+                        times: candidates.times,
+                        lo: 0,
+                        hi: min(candidates.duration, 32.0),
+                        fps: 1.0,
+                        maxFrames: 32
+                    )
+                    let decoded = try await ArtifactProcessor.decodeVideoFrames(
+                        for: mediaURL,
+                        at: indices.map { candidates.times[$0] }
+                    )
+                    guard !decoded.isEmpty else { return nil }
+                    for frame in decoded {
+                        guard let prep = ANECoreMLRuntime.prepareImagePixels(from: frame.image, forVideoBudget: true),
+                              let enc = try await aneRuntime.encodeVision(
+                                  pixels: prep.pixels,
+                                  height: prep.height,
+                                  width: prep.width,
+                                  unit: visionUnit
+                              )
+                        else { return nil }
+                        tokenIDs.append(255999)
+                        tokenIDs.append(contentsOf: repeatElement(258884, count: enc.tokenCount))
+                        tokenIDs.append(258882)
+                        softTokens.append(contentsOf: enc.softTokens)
+                    }
                 }
             }
         }
-        tokenIDs.append(1) // <eos>
+        tokenIDs.append(pieceTokenizer.eosTokenID)
         return try await aneRuntime.encodeTextAndFuse(
             tokenIDs: tokenIDs,
             softTokens: softTokens.isEmpty ? nil : softTokens,
@@ -454,10 +795,13 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
     }
 
     public func unload() async {
+        let hadEmbedder = cachedEmbedder != nil
         cachedEmbedder = nil
         cachedTokenizer = nil
         await aneRuntime.unload()
-        MLX.Memory.clearCache()
+        if hadEmbedder {
+            MLX.Memory.clearCache()
+        }
     }
 
     private static let fallbackDescriptor = NativeMLXEmbeddingGemma2.CheckpointDescriptor(

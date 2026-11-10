@@ -25,6 +25,12 @@ Every non-obvious mechanism in `heylookitsanllm-macos` exists because a real har
 - **Mid-Stream `llama-server` Error Frames**:
   - **What bit**: When `llama-server` encounters a mid-stream KV slot exhaustion or decode failure after returning HTTP `200`, it emits `data: {"error": {"message": "..."}}` over SSE. Ignoring non-`choices` frames caused the stream to end silently with `stop_reason = "end_turn"`.
   - **The mechanism**: `GGUFSubprocessProvider.parseOpenAISSEDataLine` parses top-level `"error"` objects into `OpenAISSEDelta.errorMessage` and throws `ProviderExecutionError.runtimeUnavailable`.
+- **Large Vocab Array Truncation & Multi-GGUF Drafter Shadowing**:
+  - **What bit**: Qwen3.5 and Gemma 4 `.gguf` files store `tokenizer.ggml.tokens` (256k+ strings, several MB) ahead of `tokenizer.chat_template` and `*.context_length`. Capping GGUF header reads at 2 MB or 4,096 array items aborted header parsing before reaching the template or context length. Separately, placing `draft-*.gguf` or `mtp-*.gguf` alongside a main `.gguf` in one directory caused alphabetical `firstGGUFFile` lookup to pick `draft-*.gguf` as the primary model.
+  - **The mechanism**: `GGUFHeaderReader` streams header KV entries directly via `FileHandle` past arbitrary-length vocab arrays (skipping element payloads without materializing 256k strings), and `firstGGUFFile` / `GGUFSpawnConfig.autoSized` exclude `mmproj`, `draft*`, `*-draft*`, `mtp-*`, `*-mtp*`, `eagle*`, and `*-dspark-*` when selecting the primary `.gguf`.
+- **Media-Blind Sidecar `chat_template.jinja` When `--mmproj` Is Active**:
+  - **What bit**: Some community GGUF repos ship a text-only `chat_template.jinja` sidecar next to a multimodal `.gguf` + `mmproj-*.gguf` whose embedded GGUF header template *does* include `<__media__>` / `<|vision_start|>`. Passing `--chat-template-file chat_template.jinja` stripped image markers from multimodal turns.
+  - **The mechanism**: When `mmprojPath != nil` and Rung 3 (`chat_template.jinja`, non-operator override) has `supportsVision == false && supportsAudio == false` while the `.gguf` header's embedded template supports media, `GGUFSpawnConfig.autoSized` omits `--chat-template-file` so `llama-server` uses the multimodal embedded template.
 
 ---
 
@@ -33,6 +39,9 @@ Every non-obvious mechanism in `heylookitsanllm-macos` exists because a real har
 - **Dual Reasoning Parser Conflict in `mlx-swift-lm`**:
   - **What bit**: `MLXLMCommon` includes its own basic `ReasoningConfig` tag splitter on some `ModelConfiguration` types, which conflicts with `HeylookCore`'s 4-protocol `ReasoningParser` (`.tagPair`, `.gemmaChannel`, `.harmonyChannel`, `.recipientChannel`) and mid-stream `forceEndReasoning()`.
   - **The mechanism**: `MLXSwiftProvider` sets `config.reasoningConfig = nil` after loading the container so `StreamingPipeline.transformEventStream` is the single authoritative reasoning parser across all providers.
+- **Hybrid Recurrent (`MambaCache` / `ArraysCache`) Non-Trimmable KV Snapshots & `<think>` Token Alignment**:
+  - **What bit**: Hybrid SSM+Attention models (`Qwen3.5`, `Jamba`, `Nemotron-H`, `Falcon-H1`) mix standard `KVCacheSimple` layers with recurrent state caches (`MambaCache` / `ArraysCache`) where `cache.isTrimmable == false`. Attempting `cache.trim(...)` on a diverged branch corrupts recurrent state; similarly, unconditionally stitching `<think>...</think>` into cached assistant token histories when `thinking == false` (`sawReasoning == false`) shifts KV positions by two tokens on the next turn.
+  - **The mechanism**: `MLXSwiftProvider` clones `[KVCache]` snapshots at system-prompt and turn boundaries, only trims caches when `allSatisfy(\.isTrimmable)` holds (falling back to the system checkpoint or cold prefill for non-trimmable hybrid models), and wraps assistant reasoning tags in `sessionTokenHistory` iff `sawReasoning` was true on that turn.
 - **Vision-Config Stubs on Text-Only Checkpoints**:
   - **What bit**: Some Hugging Face text-only conversions of multimodal families (e.g., `Qwen3.5` or `Gemma 4` text-only variants) leave a stub `vision_config` in `config.json`. Calling `VLMModelFactory.shared` fails when vision tower weights are absent.
   - **The mechanism**: `MLXSwiftProvider.ensureContainerLoaded()` attempts `VLMModelFactory.shared` first when `supportsVision.value` is `true`, and automatically falls back to `LLMModelFactory.shared` while updating `supportsVision` to `false` (`.observed` provenance).

@@ -10,13 +10,14 @@ For deep internal subsystem architecture, see the [LLM Knowledge Wiki](./wiki/RE
 
 1. [Getting Started & Configuration](#1-getting-started--configuration)
 2. [Surface 1: Chat Workbench](#2-surface-1-chat-workbench)
-3. [Surface 2: Notebook](#3-surface-2-notebook)
+3. [Surface 2: Notebook](#3-surface-2-notebook-scratchpad)
 4. [Surface 3: Embeddings & Media Finder Studio](#4-surface-3-embeddings--media-finder-studio)
-5. [Surface 4: Models & Engine Inspector](#5-surface-4-models--engine-inspector)
-6. [Surface 5: Performance, Memory & Server Control (and iOS Sync)](#6-surface-5-performance-memory--server-control-and-ios-sync)
-7. [macOS MenuBar Controller](#7-macos-menubar-controller)
-8. [CLI Reference (`heylook-cli`)](#8-cli-reference-heylook-cli)
-9. [Connecting External Tools to the `/v1/*` Server](#9-connecting-external-tools-to-the-v1-server)
+5. [Surface 4: Presets](#5-surface-4-presets)
+6. [Surface 5: Models & Engine Inspector](#6-surface-5-models--engine-inspector)
+7. [Surface 6: Performance, Memory & Server Control (and iOS Sync)](#7-surface-6-performance-memory--server-control-and-ios-sync)
+8. [macOS MenuBar Controller](#8-macos-menubar-controller)
+9. [CLI Reference (`heylook-cli`)](#9-cli-reference-heylook-cli)
+10. [Connecting External Tools to the `/v1/*` Server](#10-connecting-external-tools-to-the-v1-server)
 
 ---
 
@@ -140,7 +141,7 @@ The right-hand `.inspector` column has two tabs:
 | `Cmd + N` | Start a new conversation |
 | `Cmd + Shift + N` | Create a new notebook |
 | `Cmd + Shift + P` | Toggle live Prompt Preview drawer |
-| `Cmd + 1` … `Cmd + 5` | Switch between the 5 Workbench surfaces |
+| `Cmd + 1` … `Cmd + 6` | Switch between the 6 Workbench surfaces |
 
 ---
 
@@ -199,7 +200,15 @@ The **Embeddings & Media Finder Studio** (`EmbeddingsStudioSurface`) folds the s
 
 ---
 
-## 5. Surface 4: Models & Engine Inspector
+## 5. Surface 4: Presets
+
+The **Presets** surface (`PresetsSurface`, `⌘3`) manages reusable sampling and full-session configurations stored in SQLite (`presets` table with case-insensitive uniqueness):
+- **Contextual Left Sidebar (`PresetsSidebarSection`)**: Filter presets by scope (`All`, `Sampler`, or `Full`), search by name, or create a new preset.
+- **Master-Detail Editor**: Configure optional sampler overrides (**Temperature**, **Top P**, **Top K**, **Min P**, **Repetition Penalty**, **Presence Penalty**, **Max Tokens**, **Thinking**, **Thinking Budget**, **Thinking Depth**, **Seed**, and **Stop Sequences**) alongside optional `Full`-scope system prompt and model bindings, then **Apply** to the active conversation or notebook, **Duplicate**, **Save Changes**, or **Delete…**.
+
+---
+
+## 6. Surface 5: Models & Engine Inspector
 
 The **Models & Engine Inspector** (`ModelsInspectorSurface`) gives you complete visibility and control over every discovered checkpoint:
 
@@ -219,7 +228,7 @@ The **Models & Engine Inspector** (`ModelsInspectorSurface`) gives you complete 
 
 ---
 
-## 6. Surface 5: Performance, Memory & Server Control (and iOS Sync)
+## 7. Surface 6: Performance, Memory & Server Control (and iOS Sync)
 
 The **Performance, Queue & Server** surface (`PerfServerSurface`) provides live hardware, subprocess, and network control:
 
@@ -236,7 +245,7 @@ The **Performance, Queue & Server** surface (`PerfServerSurface`) provides live 
 
 ---
 
-## 7. macOS MenuBar Controller
+## 8. macOS MenuBar Controller
 
 When running `HeylookApp` on macOS, a persistent **`heylook` icon** lives in the system MenuBar (`MenuBarExtra`):
 - View embedded server status (`Running :8000` vs. `Stopped`) and start/stop the server without opening the main window.
@@ -244,7 +253,7 @@ When running `HeylookApp` on macOS, a persistent **`heylook` icon** lives in the
 
 ---
 
-## 8. CLI Reference (`heylook-cli`)
+## 9. CLI Reference (`heylook-cli`)
 
 Run via `./scripts/build_native.sh cli <subcommand>` (full Metal + MLX build) or `swift run heylook-cli <subcommand>`:
 
@@ -265,7 +274,7 @@ Run via `./scripts/build_native.sh cli <subcommand>` (full Metal + MLX build) or
 
 ---
 
-## 9. Connecting External Tools to the `/v1/*` Server
+## 10. Connecting External Tools to the `/v1/*` Server
 
 With the embedded server running (`./scripts/build_native.sh cli serve 8000` or toggled on in **Perf & Server**), any Anthropic Messages-compatible client or script can call `http://127.0.0.1:8000`:
 

@@ -19,8 +19,8 @@ import MLXVLM
 #endif
 
 /// Tier 1 Provider: In-process MLX Swift (`mlx-swift` + `mlx-swift-lm`) with `PrefixCacheTracker`,
-/// stateful multi-turn KV cache session slicing, speculative drafter discovery (`draft-mtp` /
-/// `draft-model`), and optional per-tower ANE offload (`ANECoreMLRuntime`).
+/// exact post-template token-ID KV cache session slicing (guarded against non-trimmable hybrid
+/// recurrent SSM caches), VLM Lanczos `imageMaxTokens` resizing, and optional per-tower ANE offload.
 public actor MLXSwiftProvider: InferenceProvider {
     public struct KVCacheSessionState: Sendable, Equatable {
         public var activeTurnCount: Int
@@ -28,19 +28,22 @@ public actor MLXSwiftProvider: InferenceProvider {
         public var sliceTruncations: Int
         public var speculativeDrafterPath: String?
         public var speculativeMode: String?
+        public var isHybridNonTrimmable: Bool
 
         public init(
             activeTurnCount: Int = 0,
             cachedTokenCount: Int = 0,
             sliceTruncations: Int = 0,
             speculativeDrafterPath: String? = nil,
-            speculativeMode: String? = nil
+            speculativeMode: String? = nil,
+            isHybridNonTrimmable: Bool = false
         ) {
             self.activeTurnCount = activeTurnCount
             self.cachedTokenCount = cachedTokenCount
             self.sliceTruncations = sliceTruncations
             self.speculativeDrafterPath = speculativeDrafterPath
             self.speculativeMode = speculativeMode
+            self.isHybridNonTrimmable = isHybridNonTrimmable
         }
     }
 
@@ -48,7 +51,7 @@ public actor MLXSwiftProvider: InferenceProvider {
     public nonisolated let providerKind: EngineProviderKind = .mlx
     public nonisolated let allowSyntheticFallback: Bool
     private let tokenCounter: (@Sendable (String) -> Int)?
-    private let templateInfo: ModelTemplateInfo
+    private var templateInfo: ModelTemplateInfo
     private var descriptionState: EngineDescription
     private var prefixCache = PrefixCacheTracker()
     private var kvSession = KVCacheSessionState()
@@ -57,6 +60,10 @@ public actor MLXSwiftProvider: InferenceProvider {
     #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
     private final class MLXKVCacheBox: @unchecked Sendable {
         var caches: [KVCache]? = nil
+        var tokenIDs: [Int] = []
+        var mtpDrafter: (any MTPDrafterModel)? = nil
+        var draftLanguageModel: (any LanguageModel)? = nil
+        var didAttemptDrafterLoad: Bool = false
     }
     private var loadedContainer: ModelContainer?
     private var loadedTokenizer: (any MLXLMCommon.Tokenizer)?
@@ -130,18 +137,58 @@ public actor MLXSwiftProvider: InferenceProvider {
         unloadCount
     }
 
-    public func unload() async {
-        unloadCount += 1
+    public func preload() async throws {
+        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
+        if Self.hasSafetensorsWeights(at: descriptionState.modelPath) {
+            _ = try await ensureContainerLoaded()
+            return
+        }
+        #endif
+        if allowSyntheticFallback {
+            descriptionState.isLoaded = true
+            return
+        }
+        if Self.hasSafetensorsWeights(at: descriptionState.modelPath) {
+            throw ProviderExecutionError.runtimeUnavailable(
+                modelID: modelID,
+                detail: "MLX Swift runtime is not linked in this build; build with ./scripts/build_native.sh"
+            )
+        }
+        throw ProviderExecutionError.checkpointNotFound(
+            modelID: modelID,
+            path: descriptionState.modelPath
+        )
+    }
+
+    public func clearCache() async -> Bool {
         prefixCache.reset()
         kvSession.activeTurnCount = 0
         kvSession.cachedTokenCount = 0
         kvSession.sliceTruncations = 0
+        #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
+        let hadMLXState = loadedContainer != nil
+            || kvCacheBox.caches != nil
+            || kvCacheBox.mtpDrafter != nil
+            || kvCacheBox.draftLanguageModel != nil
+        kvCacheBox.caches = nil
+        kvCacheBox.tokenIDs.removeAll()
+        if hadMLXState {
+            MLX.Memory.clearCache()
+        }
+        #endif
+        return true
+    }
+
+    public func unload() async {
+        unloadCount += 1
+        _ = await clearCache()
         descriptionState.isLoaded = false
         #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
         loadedContainer = nil
         loadedTokenizer = nil
-        kvCacheBox.caches = nil
-        MLX.Memory.clearCache()
+        kvCacheBox.mtpDrafter = nil
+        kvCacheBox.draftLanguageModel = nil
+        kvCacheBox.didAttemptDrafterLoad = false
         #endif
     }
 
@@ -151,6 +198,32 @@ public actor MLXSwiftProvider: InferenceProvider {
         effectiveSampling: SamplerSettings,
         registry: RequestRegistry
     ) -> AsyncThrowingStream<GenerationChunk, Error> {
+        // Reject unsupported audio/vision modalities truthfully rather than silently dropping attachments.
+        let hasAudioAttachment = request.messages.contains {
+            $0.attachments.contains { $0.kind == "audio" }
+        }
+        if hasAudioAttachment && !descriptionState.supportsAudio.value {
+            let err = ProviderExecutionError.runtimeUnavailable(
+                modelID: modelID,
+                detail: "Model '\(modelID)' does not support audio attachments"
+            )
+            return AsyncThrowingStream { $0.finish(throwing: err) }
+        }
+        let hasImageAttachment = request.messages.contains {
+            $0.attachments.contains { $0.kind == "image" }
+        }
+        if hasImageAttachment && !descriptionState.supportsVision.value {
+            let err = ProviderExecutionError.runtimeUnavailable(
+                modelID: modelID,
+                detail: "Model '\(modelID)' does not support image attachments"
+            )
+            return AsyncThrowingStream { $0.finish(throwing: err) }
+        }
+
+        // Refresh templateInfo from disk so live operator edits to chat_template.heylook.jinja take effect.
+        let dirURL = URL(fileURLWithPath: descriptionState.modelPath)
+        self.templateInfo = ModelTemplateInfo.inspect(modelDirectory: dirURL, modelID: modelID)
+
         let placement = descriptionState.computePlacement.value
         let cacheReport = prefixCache.evaluate(
             system: request.system,
@@ -162,11 +235,13 @@ public actor MLXSwiftProvider: InferenceProvider {
         kvSession.sliceTruncations = prefixCache.branchTruncationsCount
 
         let enableThinking = (effectiveSampling.thinking ?? true) && descriptionState.supportsThinking.value
+        let resolvedStops = effectiveSampling.stopSequences ?? request.stopSequences ?? []
 
         #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
         if Self.hasSafetensorsWeights(at: descriptionState.modelPath) {
             if cacheReport.outcome == .miss {
                 kvCacheBox.caches = nil
+                kvCacheBox.tokenIDs.removeAll()
             }
             return generateWithMLXContainer(
                 requestID: requestID,
@@ -174,6 +249,7 @@ public actor MLXSwiftProvider: InferenceProvider {
                 effectiveSampling: effectiveSampling,
                 cacheReport: cacheReport,
                 enableThinking: enableThinking,
+                stopSequences: resolvedStops,
                 placement: placement,
                 registry: registry
             )
@@ -181,26 +257,21 @@ public actor MLXSwiftProvider: InferenceProvider {
         #endif
 
         guard allowSyntheticFallback else {
-            let missingError = ProviderExecutionError.checkpointNotFound(
-                modelID: modelID,
-                path: descriptionState.modelPath
-            )
+            let missingError: ProviderExecutionError = Self.hasSafetensorsWeights(at: descriptionState.modelPath)
+                ? .runtimeUnavailable(
+                    modelID: modelID,
+                    detail: "MLX Swift runtime is not linked in this build; build with ./scripts/build_native.sh"
+                )
+                : .checkpointNotFound(
+                    modelID: modelID,
+                    path: descriptionState.modelPath
+                )
             return AsyncThrowingStream { continuation in
                 continuation.finish(throwing: missingError)
             }
         }
 
-        let syntheticSpecReport: SpeculativeReport? = if let mode = kvSession.speculativeMode {
-            SpeculativeReport(
-                drafterID: kvSession.speculativeDrafterPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "\(modelID)-mtp",
-                mode: mode,
-                draftedTokens: 12,
-                acceptedTokens: 10
-            )
-        } else {
-            nil
-        }
-
+        // Truthful Runtime: never fabricate SpeculativeReport token counts when no real drafter executed.
         let userText = request.messages.last?.content ?? ""
         var tokens: [String] = []
         if enableThinking {
@@ -212,11 +283,14 @@ public actor MLXSwiftProvider: InferenceProvider {
             requestID: requestID,
             rawTokens: tokens,
             cacheReport: cacheReport,
-            speculativeReport: syntheticSpecReport,
+            speculativeReport: nil,
             startsInThinking: false,
             reasoningFormat: templateInfo.reasoningFormat,
             thinkingEnabled: enableThinking,
             strippableSpecialTokens: Array(templateInfo.strippableSpecialTokens),
+            stopSequences: resolvedStops,
+            maxTokens: effectiveSampling.maxTokens,
+            thinkingBudget: effectiveSampling.thinkingBudget,
             computePlacement: placement,
             registry: registry,
             onComplete: { [weak self] reply in
@@ -238,9 +312,43 @@ public actor MLXSwiftProvider: InferenceProvider {
         return items.contains { $0.pathExtension.lowercased() == "safetensors" }
     }
 
+    #if canImport(CoreImage)
+    /// Resizes `image` with Lanczos scaling when its pixel count exceeds `maxTokens * (patchSize * spatialMerge)^2`.
+    public static func resizeCIImageIfNeeded(
+        _ image: CIImage,
+        maxTokens: Int?,
+        patchSize: Int = 14,
+        spatialMerge: Int = 2
+    ) -> CIImage {
+        guard let maxTokens, maxTokens > 0 else { return image }
+        let width = image.extent.width
+        let height = image.extent.height
+        guard width > 0 && height > 0 else { return image }
+        let cellSide = Double(max(1, patchSize * spatialMerge))
+        let maxPixels = Double(maxTokens) * cellSide * cellSide
+        let currentPixels = Double(width * height)
+        guard currentPixels > maxPixels else { return image }
+        let scale = (maxPixels / currentPixels).squareRoot()
+        guard scale > 0.01 && scale < 0.999 else { return image }
+        if let filter = CIFilter(name: "CILanczosScaleTransform") {
+            filter.setValue(image, forKey: kCIInputImageKey)
+            filter.setValue(scale, forKey: kCIInputScaleKey)
+            filter.setValue(1.0, forKey: kCIInputAspectRatioKey)
+            if let out = filter.outputImage {
+                return out
+            }
+        }
+        return image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    }
+    #endif
+
     #if canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(Tokenizers)
-    private func updateCachedTokenCount(_ count: Int) {
-        kvSession.cachedTokenCount = max(kvSession.cachedTokenCount, count)
+    private func updateObservedKVState(cachedTokens: Int, sliceTruncated: Bool, isHybrid: Bool) {
+        kvSession.cachedTokenCount = cachedTokens
+        if sliceTruncated {
+            kvSession.sliceTruncations += 1
+        }
+        kvSession.isHybridNonTrimmable = isHybrid
     }
 
     private func ensureContainerLoaded() async throws -> ModelContainer {
@@ -249,10 +357,6 @@ public actor MLXSwiftProvider: InferenceProvider {
         }
         let dirURL = URL(fileURLWithPath: descriptionState.modelPath)
         let loader: any TokenizerLoader = HeylookTransformersTokenizerLoader()
-        // Pass `reasoningConfig: nil` so `mlx-swift-lm` yields raw token chunks without running a
-        // competing internal `StreamingReasoningParser`; `HeylookCore.ReasoningParser` handles all
-        // 4 reasoning protocols (`.tagPair`, `.gemmaChannel`, `.harmonyChannel`, `.recipientChannel`)
-        // and mid-stream `forceEndReasoning()` in a single canonical pipeline.
         let modelConfig = ModelConfiguration(
             directory: dirURL,
             extraEOSTokens: self.templateInfo.strippableSpecialTokens,
@@ -301,7 +405,50 @@ public actor MLXSwiftProvider: InferenceProvider {
         loadedContainer = container
         loadedTokenizer = await container.tokenizer
         descriptionState.isLoaded = true
+        await ensureSpeculativeDrafterLoadedIfAvailable(loader: loader)
         return container
+    }
+
+    private func ensureSpeculativeDrafterLoadedIfAvailable(loader: any TokenizerLoader) async {
+        guard !kvCacheBox.didAttemptDrafterLoad else { return }
+        kvCacheBox.didAttemptDrafterLoad = true
+        guard let drafterPath = kvSession.speculativeDrafterPath,
+              !drafterPath.isEmpty,
+              Self.hasSafetensorsWeights(at: drafterPath)
+        else { return }
+
+        let drafterDir = URL(fileURLWithPath: drafterPath)
+        let drafterCfg = ModelConfiguration(directory: drafterDir)
+            .resolved(modelDirectory: drafterDir, tokenizerDirectory: drafterDir)
+        let mode = kvSession.speculativeMode ?? "draft-mtp"
+
+        if mode == "draft-mtp" {
+            if descriptionState.supportsVision.value,
+               let vlmMTP = try? await MTPDrafterModelFactory.visionLanguage._load(
+                   configuration: drafterCfg,
+                   tokenizerLoader: loader
+               ) {
+                kvCacheBox.mtpDrafter = vlmMTP.model
+                return
+            }
+            if let llmMTP = try? await MTPDrafterModelFactory.shared._load(
+                configuration: drafterCfg,
+                tokenizerLoader: loader
+            ) {
+                kvCacheBox.mtpDrafter = llmMTP.model
+                return
+            }
+        }
+        if drafterDir.standardizedFileURL.path != URL(fileURLWithPath: descriptionState.modelPath).standardizedFileURL.path,
+           let draftCtx = try? await LLMModelFactory.shared._load(
+               configuration: drafterCfg,
+               tokenizerLoader: loader
+           ) {
+            kvCacheBox.draftLanguageModel = draftCtx.model
+            if kvSession.speculativeMode == nil {
+                kvSession.speculativeMode = "draft-model"
+            }
+        }
     }
 
     private func generateWithMLXContainer(
@@ -310,11 +457,13 @@ public actor MLXSwiftProvider: InferenceProvider {
         effectiveSampling: SamplerSettings,
         cacheReport: CacheReport,
         enableThinking: Bool,
+        stopSequences: [String],
         placement: ComputePlacement,
         registry: RequestRegistry
     ) -> AsyncThrowingStream<GenerationChunk, Error> {
         let activeTemplate = self.templateInfo
         let cacheBox = self.kvCacheBox
+        let modelDirURL = URL(fileURLWithPath: self.descriptionState.modelPath)
 
         return StreamingPipeline.transformEventStream(
             requestID: requestID,
@@ -324,6 +473,9 @@ public actor MLXSwiftProvider: InferenceProvider {
             reasoningFormat: activeTemplate.reasoningFormat,
             thinkingEnabled: enableThinking,
             strippableSpecialTokens: Array(activeTemplate.strippableSpecialTokens),
+            stopSequences: stopSequences,
+            maxTokens: effectiveSampling.maxTokens,
+            thinkingBudget: effectiveSampling.thinkingBudget,
             computePlacement: placement,
             registry: registry,
             onComplete: { [weak self] reply in
@@ -332,6 +484,10 @@ public actor MLXSwiftProvider: InferenceProvider {
         ) { [weak self] eventCont in
             guard let self else { return }
             let container = try await self.ensureContainerLoaded()
+            let sidecar = HeylookConfig.loadSidecar(in: modelDirURL)
+            let maxImgTokens = sidecar?.imageMaxTokens
+            let templateState = HeylookConfig.inspectChatTemplate(in: modelDirURL)
+
             var additionalContextDraft: [String: any Sendable] = [:]
             let switchKey = activeTemplate.thinkingControls.switchVariable ?? "enable_thinking"
             additionalContextDraft[switchKey] = enableThinking
@@ -360,7 +516,8 @@ public actor MLXSwiftProvider: InferenceProvider {
             }
             let genParams = genParamsDraft
 
-            let (stream, totalPromptTokens): (AsyncStream<Generation>, Int) = try await container.perform { context in
+            let (stream, totalPromptTokens, exactCachedTokens, didTrim, isHybrid): (AsyncStream<Generation>, Int, Int, Bool, Bool) = try await container.perform { context in
+                var allImages: [UserInput.Image] = []
                 var chatMessages: [Chat.Message] = []
                 if let sys = request.system, !sys.isEmpty {
                     chatMessages.append(.system(sys))
@@ -373,70 +530,202 @@ public actor MLXSwiftProvider: InferenceProvider {
                         chatMessages.append(.system(m.content))
                     default:
                         var turnImages: [UserInput.Image] = []
-                        #if canImport(CoreImage)
-                        for att in m.attachments where att.kind == "image" {
-                            if let data = Data(base64Encoded: att.dataBase64),
-                               let ciImg = CIImage(data: data) {
-                                turnImages.append(.ciImage(ciImg))
+                        var orderedSegments: [String] = []
+                        for part in m.parts {
+                            switch part {
+                            case .text(let txt):
+                                if !txt.isEmpty { orderedSegments.append(txt) }
+                            case .thinking:
+                                break
+                            case .media(let att) where att.kind == "image":
+                                #if canImport(CoreImage)
+                                if let data = Data(base64Encoded: att.dataBase64),
+                                   let rawCI = CIImage(data: data) {
+                                    let resized = Self.resizeCIImageIfNeeded(rawCI, maxTokens: maxImgTokens)
+                                    let wrapped = UserInput.Image.ciImage(resized)
+                                    turnImages.append(wrapped)
+                                    allImages.append(wrapped)
+                                }
+                                #endif
+                            case .media:
+                                break
                             }
                         }
-                        #endif
-                        chatMessages.append(.user(m.content, images: turnImages))
+                        let mergedText = orderedSegments.isEmpty ? m.content : orderedSegments.joined(separator: "\n")
+                        chatMessages.append(.user(mergedText, images: turnImages))
                     }
                 }
-                let userInput = UserInput(
-                    chat: chatMessages,
-                    additionalContext: additionalContext
-                )
+
+                // Honor operator chat_template.heylook.jinja or model.heylook.toml sidecar template override when text-only
+                let userInput: UserInput
+                if (templateState.hasOverride || templateState.origin == "sidecar" || templateState.origin == "explicit_path") && allImages.isEmpty {
+                    let rendered = try HeylookConfig.renderPromptDetailed(
+                        in: modelDirURL,
+                        system: request.system,
+                        turns: request.messages,
+                        thinkingEnabled: enableThinking,
+                        thinkingDepth: effectiveSampling.thinkingDepth ?? request.thinkingDepth
+                    )
+                    userInput = UserInput(prompt: .text(rendered.prompt), additionalContext: additionalContext)
+                } else {
+                    userInput = UserInput(chat: chatMessages, additionalContext: additionalContext)
+                }
+
                 let lmInput = try await context.processor.prepare(input: userInput)
-                let promptTokenCount = lmInput.text.tokens.size
+                let promptTokenIDs = lmInput.text.tokens.asArray(Int.self)
+                let promptTokenCount = promptTokenIDs.count
+
                 let activeCaches: [KVCache]
                 let effectiveInput: LMInput
-                if cacheReport.outcome == .reused,
-                   let existingCaches = cacheBox.caches,
+                var reusedTokens = 0
+                var performedTrim = false
+                var hybridNonTrimmable = false
+
+                if let existingCaches = cacheBox.caches,
+                   !existingCaches.isEmpty,
+                   !cacheBox.tokenIDs.isEmpty,
                    lmInput.image == nil,
                    lmInput.video == nil,
                    lmInput.audio == nil,
-                   cacheReport.cachedTokens > 0,
-                   cacheReport.cachedTokens < promptTokenCount
+                   promptTokenCount > 1
                 {
-                    for cache in existingCaches where cache.isTrimmable && cache.offset > cacheReport.cachedTokens {
-                        _ = cache.trim(cache.offset - cacheReport.cachedTokens)
+                    let allTrimmable = existingCaches.allSatisfy(\.isTrimmable)
+                    hybridNonTrimmable = !allTrimmable
+                    let existingOffset = existingCaches.first?.offset ?? 0
+                    let limit = min(min(cacheBox.tokenIDs.count, existingOffset), promptTokenCount - 1)
+                    var common = 0
+                    while common < limit && cacheBox.tokenIDs[common] == promptTokenIDs[common] {
+                        common += 1
                     }
-                    activeCaches = existingCaches
-                    effectiveInput = LMInput(text: lmInput.text[cacheReport.cachedTokens...])
-                } else {
-                    activeCaches = try context.model.newCache(parameters: genParams)
-                    effectiveInput = lmInput
-                }
-                cacheBox.caches = activeCaches
-                let genStream = try MLXLMCommon.generate(
-                    input: effectiveInput,
-                    cache: activeCaches,
-                    parameters: genParams,
-                    context: context
-                )
-                return (genStream, promptTokenCount)
-            }
-            await self.updateCachedTokenCount(totalPromptTokens)
 
+                    if common > 0 && (allTrimmable || common == existingOffset) {
+                        if allTrimmable && existingOffset > common {
+                            for cache in existingCaches where cache.offset > common {
+                                _ = cache.trim(cache.offset - common)
+                            }
+                            performedTrim = true
+                        }
+                        activeCaches = existingCaches
+                        effectiveInput = LMInput(text: lmInput.text[common...])
+                        reusedTokens = common
+                        cacheBox.tokenIDs = promptTokenIDs
+                    } else {
+                        activeCaches = try context.model.newCache(parameters: genParams)
+                        effectiveInput = lmInput
+                        cacheBox.tokenIDs = promptTokenIDs
+                    }
+                } else {
+                    let fresh = try context.model.newCache(parameters: genParams)
+                    hybridNonTrimmable = !fresh.allSatisfy(\.isTrimmable)
+                    activeCaches = fresh
+                    effectiveInput = lmInput
+                    cacheBox.tokenIDs = promptTokenIDs
+                }
+
+                cacheBox.caches = activeCaches
+                let canSpeculate = lmInput.image == nil && lmInput.video == nil && lmInput.audio == nil
+                let genStream: AsyncStream<Generation>
+                if canSpeculate,
+                   let mtp = cacheBox.mtpDrafter,
+                   mtp.isCompatible(with: context.model),
+                   let specStream = try? MLXLMCommon.generate(
+                       input: effectiveInput,
+                       cache: activeCaches,
+                       parameters: genParams,
+                       context: context,
+                       mtpDrafter: mtp
+                   ) {
+                    genStream = specStream
+                } else if canSpeculate,
+                          let draftLM = cacheBox.draftLanguageModel,
+                          let specStream = try? MLXLMCommon.generate(
+                              input: effectiveInput,
+                              cache: activeCaches,
+                              parameters: genParams,
+                              context: context,
+                              draftModel: draftLM
+                          ) {
+                    genStream = specStream
+                } else {
+                    genStream = try MLXLMCommon.generate(
+                        input: effectiveInput,
+                        cache: activeCaches,
+                        parameters: genParams,
+                        context: context
+                    )
+                }
+                return (genStream, promptTokenCount, reusedTokens, performedTrim, hybridNonTrimmable)
+            }
+
+            let kvSnap = await self.kvSessionState()
+            let specModeLabel = kvSnap.speculativeMode ?? "draft-mtp"
+            let specDrafterID = kvSnap.speculativeDrafterPath
+                .map { URL(fileURLWithPath: $0).lastPathComponent }
+                ?? self.modelID
+            await self.updateObservedKVState(
+                cachedTokens: exactCachedTokens,
+                sliceTruncated: didTrim,
+                isHybrid: isHybrid
+            )
+            eventCont.yield(
+                .telemetry(
+                    promptTokens: totalPromptTokens,
+                    cachedTokens: exactCachedTokens
+                )
+            )
+
+            var generatedText = ""
+            var sawReasoning = false
             for await event in stream {
+                try Task.checkCancellation()
                 switch event {
                 case .chunk(let piece):
+                    generatedText.append(piece)
                     eventCont.yield(.rawToken(piece))
                 case .reasoning(let thinkPiece):
+                    sawReasoning = true
+                    generatedText.append(thinkPiece)
                     eventCont.yield(.splitReasoning(thinkPiece))
                 case .info(let info):
+                    let specReport: SpeculativeReport?
+                    if let specTel = info.speculativeDecodingTelemetry, specTel.draftTokenCount > 0 {
+                        specReport = SpeculativeReport(
+                            drafterID: specDrafterID,
+                            mode: specModeLabel,
+                            draftedTokens: specTel.draftTokenCount,
+                            acceptedTokens: specTel.acceptedDraftTokenCount
+                        )
+                    } else if let proposed = info.proposedDraftTokens,
+                              let accepted = info.acceptedDraftTokens,
+                              proposed > 0 {
+                        specReport = SpeculativeReport(
+                            drafterID: specDrafterID,
+                            mode: specModeLabel,
+                            draftedTokens: proposed,
+                            acceptedTokens: accepted
+                        )
+                    } else {
+                        specReport = nil
+                    }
                     eventCont.yield(
                         .telemetry(
-                            promptTokens: info.promptTokenCount,
+                            promptTokens: totalPromptTokens,
+                            cachedTokens: exactCachedTokens,
                             promptTPS: info.promptTokensPerSecond,
-                            generationTPS: info.tokensPerSecond
+                            generationTPS: info.tokensPerSecond,
+                            speculativeReport: specReport
                         )
                     )
                 default:
                     break
                 }
+            }
+            // When `.reasoning` fired, `mlx-swift-lm` stripped `<think>`/`</think>` delimiters that ARE inside
+            // `activeCaches`, so re-encoding `generatedText` would misalign `cacheBox.tokenIDs[promptTokenCount...]`
+            // against KV slot offsets. Keep `cacheBox.tokenIDs = promptTokenIDs` when `sawReasoning == true`:
+            // Jinja strips prior-turn thinking anyway, so Turn 2 reuses `0..<promptTokenCount` and trims cleanly.
+            if !sawReasoning, let tok = await self.loadedTokenizer, !generatedText.isEmpty {
+                cacheBox.tokenIDs.append(contentsOf: tok.encode(text: generatedText))
             }
         }
     }

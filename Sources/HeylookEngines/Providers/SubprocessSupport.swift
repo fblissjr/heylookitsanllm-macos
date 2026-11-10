@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import HeylookCore
 
@@ -5,7 +6,8 @@ import HeylookCore
 public typealias GGUFHeaderReader = HeylookCore.GGUFHeaderReader
 
 /// Dynamic conflict-free loopback port pool (`18080+`) for co-resident `llama-server` (`GGUF`)
-/// subprocesses so multiple `.gguf` models up to `maxLoadedGPUModels` never collide on a single port.
+/// subprocesses so multiple `.gguf` models up to `maxLoadedGPUModels` never collide on a single port
+/// or collide with external OS listeners already bound to `127.0.0.1`.
 public final class GGUFPortPool: @unchecked Sendable {
     public static let shared = GGUFPortPool(basePort: 18080)
 
@@ -17,6 +19,32 @@ public final class GGUFPortPool: @unchecked Sendable {
         self.basePort = basePort
     }
 
+    /// Probes whether `host:port` is currently free on the OS TCP stack using `Darwin.socket` + `Darwin.bind`.
+    public static func isPortAvailable(_ port: Int, host: String = "127.0.0.1") -> Bool {
+        guard port > 0 && port <= 65535 else { return false }
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return true }
+        defer { Darwin.close(fd) }
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port).bigEndian)
+        let converted = host.withCString { cstr in
+            inet_pton(AF_INET, cstr, &addr.sin_addr)
+        }
+        if converted != 1 {
+            addr.sin_addr.s_addr = CFSwapInt32HostToBig(INADDR_LOOPBACK)
+        }
+
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.bind(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return bindResult == 0
+    }
+
     public func acquirePort(for modelID: String) -> Int {
         lock.lock()
         defer { lock.unlock() }
@@ -25,7 +53,8 @@ public final class GGUFPortPool: @unchecked Sendable {
         }
         let used = Set(assignedPorts.values)
         var candidate = basePort
-        while used.contains(candidate) {
+        let maxCandidate = min(65535, basePort + 2048)
+        while candidate <= maxCandidate && (used.contains(candidate) || !Self.isPortAvailable(candidate)) {
             candidate += 1
         }
         assignedPorts[modelID] = candidate
