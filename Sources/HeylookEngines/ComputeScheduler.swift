@@ -213,9 +213,13 @@ public actor ComputeScheduler {
             updatedControls = existing.thinkingControls
         }
         let updatedTemplateSource: ProvenanceField<String>
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: existing.modelPath)
+        let fallbackTemplateSource = existing.templateSource.value == "chat_template.heylook.jinja"
+            ? (existing.provider == .gguf ? "gguf_embedded" : "tokenizer_config.json")
+            : existing.templateSource.value
         let inspectedChatTemplate = HeylookConfig.inspectChatTemplate(
-            in: URL(fileURLWithPath: existing.modelPath),
-            fallbackSource: existing.templateSource.value
+            in: dirURL,
+            fallbackSource: fallbackTemplateSource
         )
         if let customTemplate = sidecar.chatTemplatePath, !customTemplate.isEmpty {
             updatedTemplateSource = ProvenanceField(
@@ -229,8 +233,23 @@ public actor ComputeScheduler {
                 provenance: .configured,
                 effect: .reload
             )
+        } else if existing.templateSource.value == "chat_template.heylook.jinja" {
+            updatedTemplateSource = ProvenanceField(
+                value: inspectedChatTemplate.source,
+                provenance: .derived,
+                effect: .reload
+            )
         } else {
             updatedTemplateSource = existing.templateSource
+        }
+
+        let updatedDrafter: ProvenanceField<String?>
+        if sidecar.unsetKeys.contains("draft_model") || sidecar.unsetKeys.contains("draft_model_path") {
+            updatedDrafter = ProvenanceField(value: nil, provenance: .configured, effect: .reload)
+        } else if let draftModel = sidecar.draftModel, !draftModel.isEmpty {
+            updatedDrafter = ProvenanceField(value: draftModel, provenance: .configured, effect: .reload)
+        } else {
+            updatedDrafter = existing.speculativeDrafter
         }
 
         let updated = EngineDescription(
@@ -264,6 +283,7 @@ public actor ComputeScheduler {
             reasoningFormat: existing.reasoningFormat,
             thinkingControls: updatedControls,
             templateSource: updatedTemplateSource,
+            speculativeDrafter: updatedDrafter,
             estimatedMemoryMB: existing.estimatedMemoryMB,
             tags: sidecar.tags.isEmpty ? existing.tags : sidecar.tags
         )

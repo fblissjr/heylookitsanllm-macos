@@ -1097,6 +1097,9 @@ struct HeylookTests {
         let overrideURL = modelDir.appendingPathComponent("chat_template.heylook.jinja")
         #expect(FileManager.default.fileExists(atPath: overrideURL.path))
         #expect(try String(contentsOf: vendorTemplateURL, encoding: .utf8) == "VENDOR_TEMPLATE")
+        let descAfterPut = await scheduler.modelDescription(for: "qwen3.5-vendor-mlx")
+        #expect(descAfterPut?.templateSource.value == "chat_template.heylook.jinja")
+        #expect(descAfterPut?.templateSource.provenance == .configured)
 
         let getResp = await router.handle(
             method: "GET",
@@ -1116,6 +1119,9 @@ struct HeylookTests {
         #expect(delResp.status == 200)
         #expect(!FileManager.default.fileExists(atPath: overrideURL.path))
         #expect(try String(contentsOf: vendorTemplateURL, encoding: .utf8) == "VENDOR_TEMPLATE")
+        let descAfterDelete = await scheduler.modelDescription(for: "qwen3.5-vendor-mlx")
+        #expect(descAfterDelete?.templateSource.value == "chat_template.jinja")
+        #expect(descAfterDelete?.templateSource.provenance == .derived)
 
         // 4. POST /v1/models/{id}/image-plan (409 when unloaded, 200 when loaded) & POST /v1/conversations/{id}/prompt
         let unloadedPlanResp = await router.handle(
@@ -2462,5 +2468,11 @@ struct HeylookTests {
         #expect(vm.pendingConfirmation?.id == "unloadAllModels")
         #expect(vm.pendingConfirmation?.title == "Unload All Resident Models?")
         #expect(vm.pendingConfirmation?.confirmLabel == "Unload All Models")
+
+        // Verify resolveModelDirectoryURL handles both directories and .gguf file paths
+        let resolvedGGUFDir = HeylookConfig.resolveModelDirectoryURL(from: "/tmp/models/gguf/Qwen3.5-8B.gguf")
+        #expect(resolvedGGUFDir.path == "/tmp/models/gguf")
+        let resolvedMLXDir = HeylookConfig.resolveModelDirectoryURL(from: "/tmp/models/mlx/Qwen3.5-8B-MLX")
+        #expect(resolvedMLXDir.path == "/tmp/models/mlx/Qwen3.5-8B-MLX")
     }
 }

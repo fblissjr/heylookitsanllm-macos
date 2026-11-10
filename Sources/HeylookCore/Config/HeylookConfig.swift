@@ -257,6 +257,19 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return defaultAppSupportDirectory.appendingPathComponent("heylook_vectors.sqlite")
     }
 
+    /// Resolves a model path (which may point to a directory or a `.gguf` file) to its parent directory URL.
+    public static func resolveModelDirectoryURL(from modelPath: String) -> URL {
+        let rawURL = URL(fileURLWithPath: (modelPath as NSString).expandingTildeInPath)
+        if rawURL.pathExtension.lowercased() == "gguf" {
+            return rawURL.deletingLastPathComponent()
+        }
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: rawURL.path, isDirectory: &isDir), !isDir.boolValue {
+            return rawURL.deletingLastPathComponent()
+        }
+        return rawURL
+    }
+
     /// Resolves the 5-layer `SamplerCascade` (`builtin` -> `vendor generation_config.json` ->
     /// `model.heylook.toml` -> `preset` -> `request`) from a model directory path.
     public static func resolveEffectiveSampling(
@@ -267,10 +280,7 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         var vendorSettings: SamplerSettings?
         var modelSidecarSettings: SamplerSettings?
         if let modelPath, !modelPath.isEmpty {
-            let rawURL = URL(fileURLWithPath: (modelPath as NSString).expandingTildeInPath)
-            let dirURL = rawURL.pathExtension.lowercased() == "gguf"
-                ? rawURL.deletingLastPathComponent()
-                : rawURL
+            let dirURL = resolveModelDirectoryURL(from: modelPath)
             vendorSettings = loadVendorSampling(in: dirURL)
             let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")
             if let text = try? String(contentsOf: sidecarURL, encoding: .utf8) {
@@ -593,10 +603,13 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         in candidateDir: URL,
         fallbackSource: String = "default_chatml"
     ) -> ChatTemplateState {
+        let dir = candidateDir.pathExtension.lowercased() == "gguf"
+            ? candidateDir.deletingLastPathComponent()
+            : candidateDir
         let fm = FileManager.default
-        let overrideURL = candidateDir.appendingPathComponent("chat_template.heylook.jinja")
-        let sidecarURL = candidateDir.appendingPathComponent("chat_template.jinja")
-        let tokConfigURL = candidateDir.appendingPathComponent("tokenizer_config.json")
+        let overrideURL = dir.appendingPathComponent("chat_template.heylook.jinja")
+        let sidecarURL = dir.appendingPathComponent("chat_template.jinja")
+        let tokConfigURL = dir.appendingPathComponent("tokenizer_config.json")
 
         if fm.fileExists(atPath: overrideURL.path),
            let t = try? String(contentsOf: overrideURL, encoding: .utf8) {
@@ -645,8 +658,11 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         _ template: String,
         in candidateDir: URL
     ) throws -> ChatTemplateState {
-        try FileManager.default.createDirectory(at: candidateDir, withIntermediateDirectories: true)
-        let overrideURL = candidateDir.appendingPathComponent("chat_template.heylook.jinja")
+        let dir = candidateDir.pathExtension.lowercased() == "gguf"
+            ? candidateDir.deletingLastPathComponent()
+            : candidateDir
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let overrideURL = dir.appendingPathComponent("chat_template.heylook.jinja")
         try template.write(to: overrideURL, atomically: true, encoding: .utf8)
         return ChatTemplateState(
             source: "chat_template.heylook.jinja",
@@ -661,7 +677,10 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         in candidateDir: URL,
         fallbackSource: String = "gguf_embedded"
     ) -> ChatTemplateState {
-        let overrideURL = candidateDir.appendingPathComponent("chat_template.heylook.jinja")
+        let dir = candidateDir.pathExtension.lowercased() == "gguf"
+            ? candidateDir.deletingLastPathComponent()
+            : candidateDir
+        let overrideURL = dir.appendingPathComponent("chat_template.heylook.jinja")
         if FileManager.default.fileExists(atPath: overrideURL.path) {
             try? FileManager.default.removeItem(at: overrideURL)
         }
@@ -1147,6 +1166,13 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             ),
             thinkingControls: templateInfo.thinkingControls,
             templateSource: templateField,
+            speculativeDrafter: ProvenanceField(
+                value: drafter.draftModelPath ?? drafter.specType ?? (ggufHeader?.hasBuiltInMTP == true ? "draft-mtp" : nil),
+                provenance: sidecar?.draftModel != nil
+                    ? .configured
+                    : ((drafter.draftModelPath != nil || drafter.specType != nil || ggufHeader?.hasBuiltInMTP == true) ? .derived : .notApplicable),
+                effect: .reload
+            ),
             tags: tags
         )
     }

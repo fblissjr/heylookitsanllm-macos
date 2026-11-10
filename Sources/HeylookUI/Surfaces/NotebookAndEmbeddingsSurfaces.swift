@@ -19,13 +19,19 @@ struct NotebookSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
     @FocusState private var isBodyFocused: Bool
 
+    private var wordCount: Int {
+        viewModel.notebookBody
+            .split { $0.isWhitespace || $0.isNewline }
+            .count
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 TextField("Notebook Title", text: $viewModel.notebookTitle)
                     .font(.title3.weight(.semibold))
                     .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 360)
+                    .frame(maxWidth: 320)
 
                 Spacer()
 
@@ -34,14 +40,34 @@ struct NotebookSurface: View {
                         .controlSize(.small)
                 }
 
-                GlassEffectContainer(spacing: 10) {
+                GlassEffectContainer(spacing: 8) {
                     HStack(spacing: 8) {
+                        Button {
+                            Task { await viewModel.summarizeNotebook() }
+                        } label: {
+                            Label("Insert Summary", systemImage: "list.bullet.rectangle")
+                        }
+                        .buttonStyle(.glass)
+                        .controlSize(.small)
+                        .disabled(viewModel.isNotebookGenerating || viewModel.notebookBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        Button {
+                            Task { await viewModel.analyzeNotebook() }
+                        } label: {
+                            Label("Analyze Selection", systemImage: "wand.and.stars")
+                        }
+                        .buttonStyle(.glass)
+                        .controlSize(.small)
+                        .disabled(viewModel.isNotebookGenerating || viewModel.notebookBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
                         Button {
                             Task { await viewModel.continueNotebookGeneration() }
                         } label: {
                             Label("Continue Writing", systemImage: "sparkles")
                         }
                         .buttonStyle(.glassProminent)
+                        .controlSize(.small)
+                        .keyboardShortcut(.return, modifiers: [.command])
                         .disabled(viewModel.isNotebookGenerating)
 
                         Button {
@@ -50,6 +76,7 @@ struct NotebookSurface: View {
                             Label("Save", systemImage: "square.and.arrow.down")
                         }
                         .buttonStyle(.glass)
+                        .controlSize(.small)
                         .keyboardShortcut("s", modifiers: [.command])
 
                         Button {
@@ -58,6 +85,7 @@ struct NotebookSurface: View {
                             Label("Send to Chat", systemImage: "bubble.left.and.bubble.right")
                         }
                         .buttonStyle(.glass)
+                        .controlSize(.small)
                     }
                 }
             }
@@ -73,6 +101,18 @@ struct NotebookSurface: View {
                     RoundedRectangle(cornerRadius: 10)
                         .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
                 }
+
+            HStack {
+                Text("\(wordCount) words • \(viewModel.notebookBody.count) characters")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let activeModel = viewModel.activeModelDescription {
+                    Text("Model: \(activeModel.modelID) (\(activeModel.computePlacement.value.label))")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

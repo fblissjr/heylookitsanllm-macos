@@ -9,7 +9,18 @@ import HeylookServer
 
 #if os(macOS)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
 #endif
+
+private func copyTextToClipboard(_ text: String) {
+    #if os(macOS)
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+    #elseif canImport(UIKit)
+    UIPasteboard.general.string = text
+    #endif
+}
 
 // MARK: - 1. Chat Workbench Surface
 
@@ -166,8 +177,9 @@ private struct ChatPromptPreviewDrawer: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
 
     var body: some View {
+        let previewText = viewModel.renderedPromptPreview()
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("Live Rendered Template Preview")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -177,9 +189,16 @@ private struct ChatPromptPreviewDrawer: View {
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
                 }
+                Button {
+                    copyTextToClipboard(previewText)
+                } label: {
+                    Label("Copy Prompt", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
             }
             ScrollView {
-                Text(viewModel.renderedPromptPreview())
+                Text(previewText)
                     .font(.system(.caption, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
@@ -524,6 +543,17 @@ struct MessageBubbleView: View {
                         .background(Color.secondary.opacity(0.12), in: Capsule())
                 }
                 Button {
+                    copyTextToClipboard(message.content)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.caption)
+                        .frame(minWidth: 28, minHeight: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .help("Copy message text")
+
+                Button {
                     onBeginEdit()
                 } label: {
                     Image(systemName: "pencil")
@@ -638,24 +668,42 @@ struct LoadAndSamplerInspectorView: View {
             Tab("Samplers", systemImage: "slider.horizontal.3") {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Sampler Cascade")
-                                    .font(.headline)
-                                Text("builtin → model → preset → request")
-                                    .font(.caption2.monospaced())
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button("Reset") {
-                                viewModel.resetSamplerOverrides()
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(viewModel.userOverriddenSamplerKeys.isEmpty)
-                        }
+                         HStack {
+                             VStack(alignment: .leading, spacing: 2) {
+                                 Text("Sampler Cascade")
+                                     .font(.headline)
+                                 Text("builtin → vendor → model → preset → request")
+                                     .font(.caption2.monospaced())
+                                     .foregroundStyle(.secondary)
+                             }
+                             Spacer()
+                             Button("Reset") {
+                                 viewModel.resetSamplerOverrides()
+                             }
+                             .buttonStyle(.bordered)
+                             .controlSize(.small)
+                             .disabled(viewModel.userOverriddenSamplerKeys.isEmpty)
+                         }
 
-                        Divider()
+                         if let activeModel = viewModel.activeModelDescription {
+                             VStack(alignment: .leading, spacing: 4) {
+                                 Text(activeModel.modelID)
+                                     .font(.caption.weight(.semibold))
+                                 Text("Ctx: \(activeModel.contextSize.value) • \(activeModel.computePlacement.value.label) • Template: \(activeModel.templateSource.value)")
+                                     .font(.caption2.monospaced())
+                                     .foregroundStyle(.secondary)
+                                 if let drafter = activeModel.speculativeDrafter.value, !drafter.isEmpty {
+                                     Text("Drafter: \((drafter as NSString).lastPathComponent)")
+                                         .font(.caption2.monospaced())
+                                         .foregroundStyle(.purple)
+                                 }
+                             }
+                             .padding(8)
+                             .frame(maxWidth: .infinity, alignment: .leading)
+                             .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                         }
+
+                         Divider()
 
                         VStack(alignment: .leading, spacing: 10) {
                             HStack {
@@ -744,8 +792,17 @@ struct LoadAndSamplerInspectorView: View {
             Tab("Prompt", systemImage: "text.quote") {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("System Prompt Override")
-                            .font(.headline)
+                        HStack {
+                            Text("System Prompt Override")
+                                .font(.headline)
+                            Spacer()
+                            Button("Reset to Default") {
+                                viewModel.draftSystemPrompt = ""
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(viewModel.draftSystemPrompt.isEmpty)
+                        }
                         Text("Applied to the active conversation turn before chat template rendering.")
                             .font(.caption)
                             .foregroundStyle(.secondary)

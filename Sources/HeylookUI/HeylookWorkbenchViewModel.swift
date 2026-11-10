@@ -851,7 +851,7 @@ public final class HeylookWorkbenchViewModel {
         if !draftPrompt.isEmpty {
             turns.append((role: "user", content: draftPrompt, thinking: nil))
         }
-        let dirURL = activeModelDescription.map { URL(fileURLWithPath: $0.modelPath) }
+        let dirURL = activeModelDescription.map { HeylookConfig.resolveModelDirectoryURL(from: $0.modelPath) }
         return HeylookConfig.renderPromptPreview(
             in: dirURL,
             system: draftSystemPrompt.isEmpty ? nil : draftSystemPrompt,
@@ -919,6 +919,27 @@ public final class HeylookWorkbenchViewModel {
     }
 
     public func continueNotebookGeneration() async {
+        await runNotebookSynthesis(
+            prompt: "Continue writing seamlessly from:\n\n\(notebookBody)",
+            prefixSeparator: notebookBody.isEmpty ? "" : "\n\n"
+        )
+    }
+
+    public func summarizeNotebook() async {
+        await runNotebookSynthesis(
+            prompt: "Provide a concise, high-signal bulleted summary of the following notebook document:\n\n\(notebookBody)",
+            prefixSeparator: "\n\n## Summary\n"
+        )
+    }
+
+    public func analyzeNotebook() async {
+        await runNotebookSynthesis(
+            prompt: "Critique the key assumptions, trade-offs, and actionable next steps in the following notebook document:\n\n\(notebookBody)",
+            prefixSeparator: "\n\n## Analysis & Next Steps\n"
+        )
+    }
+
+    private func runNotebookSynthesis(prompt: String, prefixSeparator: String) async {
         guard !isNotebookGenerating else { return }
         let modelID = selectedModelID.isEmpty ? (registeredModels.first?.modelID ?? "") : selectedModelID
         guard !modelID.isEmpty else {
@@ -929,24 +950,25 @@ public final class HeylookWorkbenchViewModel {
         let reqID = "nb_\(UUID().uuidString.prefix(8))"
         do {
             let provider = try await scheduler.provider(for: modelID)
-            let desc = await provider.describe()
+            let resolved = currentResolvedSamplers
+            let effective = resolved.effective
             let req = MessagesRequest(
                 model: modelID,
-                messages: [MessagesRequest.MessageTurn(role: "user", content: "Continue writing seamlessly from:\n\n\(notebookBody)")],
-                maxTokens: 256,
-                temperature: temperatureOverride,
+                messages: [MessagesRequest.MessageTurn(role: "user", content: prompt)],
+                system: draftSystemPrompt.isEmpty ? nil : draftSystemPrompt,
+                maxTokens: effective.maxTokens ?? 512,
+                temperature: effective.temperature,
+                topP: effective.topP,
+                topK: effective.topK,
+                minP: effective.minP,
                 thinking: false
             )
-            let resolved = HeylookConfig.resolveEffectiveSampling(
-                modelPath: desc.modelPath,
-                request: req.samplerOverlay
-            )
-            notebookBody += "\n\n"
+            notebookBody += prefixSeparator
             try await scheduler.withComputeLease(for: modelID) { [registry] in
                 let stream = await provider.generate(
                     requestID: reqID,
                     request: req,
-                    effectiveSampling: resolved.effective,
+                    effectiveSampling: effective,
                     registry: registry
                 )
                 for try await chunk in stream {
@@ -1464,8 +1486,16 @@ public final class HeylookWorkbenchViewModel {
         await refreshMetrics()
     }
 
+    public func unloadGGUFAllocation(_ allocationEntry: String) async {
+        let modelID = allocationEntry.components(separatedBy: "::").first ?? allocationEntry
+        await scheduler.unloadModel(modelID)
+        GGUFPortPool.shared.releasePort(for: modelID)
+        await refreshMetrics()
+        statusBanner = "Unloaded GGUF subprocess for \(modelID)."
+    }
+
     public func loadSidecarConfig(for model: EngineDescription) -> ModelSidecarConfig {
-        let dirURL = URL(fileURLWithPath: model.modelPath)
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: model.modelPath)
         let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")
         if let text = try? String(contentsOf: sidecarURL, encoding: .utf8) {
             return ModelSidecarConfig.parseTOML(text)
@@ -1479,6 +1509,7 @@ public final class HeylookWorkbenchViewModel {
             flashAttn: model.flashAttention.value,
             supportsVision: model.supportsVision.value,
             supportsThinking: model.supportsThinking.value,
+            draftModel: model.speculativeDrafter.value,
             sampling: SamplerSettings(
                 temperature: 0.7,
                 topP: 0.95,
@@ -1489,7 +1520,7 @@ public final class HeylookWorkbenchViewModel {
     }
 
     public func saveModelSidecar(_ sidecar: ModelSidecarConfig, for model: EngineDescription) async {
-        let dirURL = URL(fileURLWithPath: model.modelPath)
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: model.modelPath)
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: dirURL.path, isDirectory: &isDir), isDir.boolValue {
             let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")
@@ -1501,7 +1532,7 @@ public final class HeylookWorkbenchViewModel {
     }
 
     public func loadChatTemplateState(for model: EngineDescription) -> HeylookConfig.ChatTemplateState {
-        let dirURL = URL(fileURLWithPath: model.modelPath)
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: model.modelPath)
         return HeylookConfig.inspectChatTemplate(
             in: dirURL,
             fallbackSource: model.templateSource.value
@@ -1510,7 +1541,7 @@ public final class HeylookWorkbenchViewModel {
 
     @discardableResult
     public func saveChatTemplateOverride(_ template: String, for model: EngineDescription) async -> HeylookConfig.ChatTemplateState {
-        let dirURL = URL(fileURLWithPath: model.modelPath)
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: model.modelPath)
         let state = (try? HeylookConfig.writeChatTemplateOverride(template, in: dirURL))
             ?? HeylookConfig.ChatTemplateState(source: "chat_template.heylook.jinja", hasOverride: true, template: template)
         let sidecar = loadSidecarConfig(for: model)
@@ -1522,10 +1553,12 @@ public final class HeylookWorkbenchViewModel {
 
     @discardableResult
     public func revertChatTemplateOverride(for model: EngineDescription) async -> HeylookConfig.ChatTemplateState {
-        let dirURL = URL(fileURLWithPath: model.modelPath)
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: model.modelPath)
         let reverted = HeylookConfig.deleteChatTemplateOverride(
             in: dirURL,
-            fallbackSource: model.templateSource.value
+            fallbackSource: model.templateSource.value == "chat_template.heylook.jinja"
+                ? (model.provider == .gguf ? "gguf_embedded" : "tokenizer_config.json")
+                : model.templateSource.value
         )
         let sidecar = loadSidecarConfig(for: model)
         _ = try? await scheduler.applySidecarUpdate(sidecar, for: model.modelID)

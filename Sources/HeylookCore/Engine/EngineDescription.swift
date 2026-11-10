@@ -215,6 +215,7 @@ public struct EngineDescription: Codable, Identifiable, Sendable, Equatable {
     public let reasoningFormat: ProvenanceField<String>
     public let thinkingControls: ThinkingControls?
     public let templateSource: ProvenanceField<String>
+    public let speculativeDrafter: ProvenanceField<String?>
     public let estimatedMemoryMB: Int
     public let tags: [String]
 
@@ -237,6 +238,7 @@ public struct EngineDescription: Codable, Identifiable, Sendable, Equatable {
         reasoningFormat: ProvenanceField<String> = ProvenanceField(value: "tag_pair", provenance: .derived, effect: .reload),
         thinkingControls: ThinkingControls? = nil,
         templateSource: ProvenanceField<String> = ProvenanceField(value: "tokenizer_config.json", provenance: .derived, effect: .reload),
+        speculativeDrafter: ProvenanceField<String?> = ProvenanceField(value: nil, provenance: .notApplicable, effect: .reload),
         estimatedMemoryMB: Int = 0,
         tags: [String] = []
     ) {
@@ -258,6 +260,7 @@ public struct EngineDescription: Codable, Identifiable, Sendable, Equatable {
         self.reasoningFormat = reasoningFormat
         self.thinkingControls = thinkingControls
         self.templateSource = templateSource
+        self.speculativeDrafter = speculativeDrafter
         self.estimatedMemoryMB = estimatedMemoryMB
         self.tags = tags
     }

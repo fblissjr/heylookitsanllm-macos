@@ -412,7 +412,7 @@ public actor HeylookRouter {
                     guard let existing = await scheduler.modelDescription(for: modelID) else {
                         throw ComputeSchedulerError.modelNotFound(modelID)
                     }
-                    let dirURL = URL(fileURLWithPath: existing.modelPath)
+                    let dirURL = HeylookConfig.resolveModelDirectoryURL(from: existing.modelPath)
                     struct ChatTemplateResponse: Encodable {
                         let model: String
                         let source: String
@@ -442,6 +442,11 @@ public actor HeylookRouter {
                             templateText = String(decoding: body, as: UTF8.self)
                         }
                         let state = try HeylookConfig.writeChatTemplateOverride(templateText, in: dirURL)
+                        let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")
+                        let sidecar = (try? String(contentsOf: sidecarURL, encoding: .utf8))
+                            .map(ModelSidecarConfig.parseTOML)
+                            ?? ModelSidecarConfig(id: modelID)
+                        _ = try? await scheduler.applySidecarUpdate(sidecar, for: modelID)
                         return try .json(
                             ChatTemplateResponse(
                                 model: modelID,
@@ -453,8 +458,15 @@ public actor HeylookRouter {
                     case "DELETE":
                         let reverted = HeylookConfig.deleteChatTemplateOverride(
                             in: dirURL,
-                            fallbackSource: existing.templateSource.value
+                            fallbackSource: existing.templateSource.value == "chat_template.heylook.jinja"
+                                ? (existing.provider == .gguf ? "gguf_embedded" : "tokenizer_config.json")
+                                : existing.templateSource.value
                         )
+                        let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")
+                        let sidecar = (try? String(contentsOf: sidecarURL, encoding: .utf8))
+                            .map(ModelSidecarConfig.parseTOML)
+                            ?? ModelSidecarConfig(id: modelID)
+                        _ = try? await scheduler.applySidecarUpdate(sidecar, for: modelID)
                         return try .json([
                             "model": modelID,
                             "source": reverted.source
@@ -480,7 +492,7 @@ public actor HeylookRouter {
                         let tomlText = String(decoding: body, as: UTF8.self)
                         sidecar = ModelSidecarConfig.parseTOML(tomlText)
                     }
-                    let dirURL = URL(fileURLWithPath: existing.modelPath)
+                    let dirURL = HeylookConfig.resolveModelDirectoryURL(from: existing.modelPath)
                     var isDir: ObjCBool = false
                     if FileManager.default.fileExists(atPath: dirURL.path, isDirectory: &isDir), isDir.boolValue {
                         let sidecarURL = dirURL.appendingPathComponent("model.heylook.toml")

@@ -211,8 +211,110 @@ private struct ModelRegistryRowView: View {
                         .background(Color.secondary.opacity(0.12), in: Capsule())
                 }
             }
+
+            DisclosureGroup("Engine Provenance & Capabilities (\(model.estimatedMemoryMB) MB est.)") {
+                VStack(alignment: .leading, spacing: 5) {
+                    ProvenanceDetailRow(
+                        label: "Architecture",
+                        value: model.architecture.value,
+                        source: model.architecture.provenance,
+                        effect: model.architecture.effect
+                    )
+                    ProvenanceDetailRow(
+                        label: "Quantization",
+                        value: model.quantization.value,
+                        source: model.quantization.provenance,
+                        effect: model.quantization.effect
+                    )
+                    ProvenanceDetailRow(
+                        label: "Compute Placement",
+                        value: model.computePlacement.value.label,
+                        source: model.computePlacement.provenance,
+                        effect: model.computePlacement.effect
+                    )
+                    ProvenanceDetailRow(
+                        label: "Context Window",
+                        value: "\(model.contextSize.value) tokens",
+                        source: model.contextSize.provenance,
+                        effect: model.contextSize.effect
+                    )
+                    ProvenanceDetailRow(
+                        label: "Flash Attention",
+                        value: model.flashAttention.value ? "true" : "false",
+                        source: model.flashAttention.provenance,
+                        effect: model.flashAttention.effect
+                    )
+                    ProvenanceDetailRow(
+                        label: "Vision / Audio / Embeddings",
+                        value: "V:\(model.supportsVision.value) A:\(model.supportsAudio.value) E:\(model.supportsEmbeddings.value)",
+                        source: model.supportsVision.provenance,
+                        effect: model.supportsVision.effect
+                    )
+                    ProvenanceDetailRow(
+                        label: "Thinking & Format",
+                        value: "\(model.supportsThinking.value) (\(model.reasoningFormat.value))",
+                        source: model.supportsThinking.provenance,
+                        effect: model.supportsThinking.effect
+                    )
+                    ProvenanceDetailRow(
+                        label: "Chat Template Source",
+                        value: model.templateSource.value,
+                        source: model.templateSource.provenance,
+                        effect: model.templateSource.effect
+                    )
+                    if let drafter = model.speculativeDrafter.value, !drafter.isEmpty {
+                        ProvenanceDetailRow(
+                            label: "Speculative Drafter",
+                            value: drafter,
+                            source: model.speculativeDrafter.provenance,
+                            effect: model.speculativeDrafter.effect
+                        )
+                    }
+                    if let controls = model.thinkingControls {
+                        let depthList = controls.depthValues.isEmpty
+                            ? "[]"
+                            : "[\(controls.depthValues.joined(separator: ","))]"
+                        let disableLabel = controls.canDisableThinking ? "true" : "false"
+                        let controlsLine = "ThinkingControls: switch=\(controls.switchVariable ?? "none") • depth=\(controls.depthVariable ?? "none") \(depthList) • canDisable=\(disableLabel)"
+                        Text(controlsLine)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.top, 6)
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
         }
         .padding(.vertical, 6)
+    }
+}
+
+private struct ProvenanceDetailRow: View {
+    let label: String
+    let value: String
+    let source: ProvenanceSource
+    let effect: EffectClass
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 170, alignment: .leading)
+            Text(value)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Spacer()
+            Text(effect.rawValue)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.1), in: Capsule())
+            SamplerProvenancePill(source: source, isRequestOverride: false)
+        }
     }
 }
 
@@ -483,11 +585,15 @@ private struct ModelSidecarEditorSheet: View {
     let model: EngineDescription
     @Environment(\.dismiss) private var dismiss
 
+    @State private var loadedBaseSidecar: ModelSidecarConfig = ModelSidecarConfig()
     @State private var pinned: Bool = false
+    @State private var computePlacement: ComputePlacement = .mlxGPU
     @State private var ctxSize: Int = 8192
     @State private var flashAttn: Bool = true
     @State private var supportsVision: Bool = false
     @State private var supportsThinking: Bool = true
+    @State private var imageMaxTokensText: String = ""
+    @State private var draftModelText: String = ""
     @State private var temperature: Double = 0.7
     @State private var topP: Double = 0.95
     @State private var thinkingBudget: Int = 4096
@@ -498,7 +604,7 @@ private struct ModelSidecarEditorSheet: View {
     @State private var chatTemplateText: String = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Edit model.heylook.toml Sidecar & Chat Template")
@@ -522,11 +628,30 @@ private struct ModelSidecarEditorSheet: View {
             Divider()
 
             Toggle("Pin Model in Unified Memory (Exempt from GPU LRU Eviction)", isOn: $pinned)
-            Stepper("Context Size (ctx_size): \(ctxSize)", value: $ctxSize, in: 2048...1_048_576, step: 4096)
-                .font(.subheadline.monospacedDigit())
-            Toggle("Flash Attention (flash_attn)", isOn: $flashAttn)
-            Toggle("Supports Vision (supports_vision)", isOn: $supportsVision)
-            Toggle("Supports Thinking (supports_thinking)", isOn: $supportsThinking)
+            HStack(spacing: 16) {
+                Picker("Compute Placement (compute_unit)", selection: $computePlacement) {
+                    ForEach(ComputePlacement.allCases, id: \.self) { placement in
+                        Text(placement.label).tag(placement)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Stepper("Context Size (ctx_size): \(ctxSize)", value: $ctxSize, in: 2048...1_048_576, step: 4096)
+                    .font(.subheadline.monospacedDigit())
+            }
+            HStack(spacing: 16) {
+                Toggle("Flash Attention (flash_attn)", isOn: $flashAttn)
+                Toggle("Supports Vision (vision)", isOn: $supportsVision)
+                Toggle("Supports Thinking (thinking_capable)", isOn: $supportsThinking)
+            }
+            HStack(spacing: 10) {
+                TextField("Image Max Tokens (image_max_tokens, optional)", text: $imageMaxTokensText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospaced())
+                TextField("Speculative Drafter Path (draft_model, optional)", text: $draftModelText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospaced())
+            }
 
             Divider()
 
@@ -585,7 +710,7 @@ private struct ModelSidecarEditorSheet: View {
 
                 TextEditor(text: $chatTemplateText)
                     .font(.system(.caption, design: .monospaced))
-                    .frame(minHeight: 110, maxHeight: 150)
+                    .frame(minHeight: 100, maxHeight: 140)
                     .overlay {
                         RoundedRectangle(cornerRadius: 6)
                             .strokeBorder(Color.secondary.opacity(0.22), lineWidth: 1)
@@ -605,23 +730,26 @@ private struct ModelSidecarEditorSheet: View {
                         .split(separator: ",")
                         .map { $0.trimmingCharacters(in: .whitespaces) }
                         .filter { !$0.isEmpty }
-                    let updatedSidecar = ModelSidecarConfig(
-                        id: model.modelID,
-                        provider: model.provider,
-                        pinned: pinned,
-                        computePlacement: model.computePlacement.value,
-                        ctxSize: ctxSize,
-                        flashAttn: flashAttn,
-                        supportsVision: supportsVision,
-                        supportsThinking: supportsThinking,
-                        unsetKeys: parsedUnset,
-                        sampling: SamplerSettings(
-                            temperature: temperature,
-                            topP: topP,
-                            thinkingBudget: thinkingBudget
-                        ),
-                        tags: parsedTags
-                    )
+                    let parsedImageMaxTokens = Int(imageMaxTokensText.trimmingCharacters(in: .whitespacesAndNewlines))
+                    let trimmedDraft = draftModelText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                    var updatedSidecar = loadedBaseSidecar
+                    updatedSidecar.id = model.modelID
+                    updatedSidecar.provider = model.provider
+                    updatedSidecar.pinned = pinned
+                    updatedSidecar.computePlacement = computePlacement
+                    updatedSidecar.ctxSize = ctxSize
+                    updatedSidecar.flashAttn = flashAttn
+                    updatedSidecar.supportsVision = supportsVision
+                    updatedSidecar.supportsThinking = supportsThinking
+                    updatedSidecar.imageMaxTokens = parsedImageMaxTokens
+                    updatedSidecar.draftModel = trimmedDraft.isEmpty ? nil : trimmedDraft
+                    updatedSidecar.unsetKeys = parsedUnset
+                    updatedSidecar.sampling.temperature = temperature
+                    updatedSidecar.sampling.topP = topP
+                    updatedSidecar.sampling.thinkingBudget = thinkingBudget
+                    updatedSidecar.tags = parsedTags
+
                     Task {
                         await viewModel.saveModelSidecar(updatedSidecar, for: model)
                         dismiss()
@@ -632,14 +760,18 @@ private struct ModelSidecarEditorSheet: View {
             }
         }
         .padding(20)
-        .frame(minWidth: 560)
+        .frame(minWidth: 580)
         .onAppear {
             let loaded = viewModel.loadSidecarConfig(for: model)
+            loadedBaseSidecar = loaded
             pinned = loaded.pinned ?? model.isPinned
+            computePlacement = loaded.computePlacement ?? model.computePlacement.value
             ctxSize = loaded.ctxSize ?? model.contextSize.value
             flashAttn = loaded.flashAttn ?? model.flashAttention.value
             supportsVision = loaded.supportsVision ?? model.supportsVision.value
             supportsThinking = loaded.supportsThinking ?? model.supportsThinking.value
+            imageMaxTokensText = loaded.imageMaxTokens.map(String.init) ?? ""
+            draftModelText = loaded.draftModel ?? (model.speculativeDrafter.value ?? "")
             temperature = loaded.sampling.temperature ?? 0.7
             topP = loaded.sampling.topP ?? 0.95
             thinkingBudget = loaded.sampling.thinkingBudget ?? (model.thinkingBudget.value ?? 4096)
@@ -689,13 +821,25 @@ struct PerfServerSurface: View {
                         .foregroundStyle(viewModel.activeSubprocessCount > 0 ? .orange : .green)
                 }
                 LabeledContent("Allocated GGUF Loopback Ports") {
-                    Text(
-                        viewModel.sortedActiveGGUFPorts.isEmpty
-                            ? "None (18080+ free)"
-                            : viewModel.sortedActiveGGUFPorts.joined(separator: ", ")
-                    )
-                    .font(.caption.monospaced().weight(.medium))
-                    .lineLimit(1)
+                    if viewModel.sortedActiveGGUFPorts.isEmpty {
+                        Text("None (18080+ free)")
+                            .font(.caption.monospaced().weight(.medium))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        HStack(spacing: 6) {
+                            ForEach(viewModel.sortedActiveGGUFPorts, id: \.self) { allocation in
+                                HStack(spacing: 4) {
+                                    Text(allocation)
+                                        .font(.caption2.monospaced().weight(.medium))
+                                    Button("Unload") {
+                                        Task { await viewModel.unloadGGUFAllocation(allocation) }
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                }
+                            }
+                        }
+                    }
                 }
                 LabeledContent("Memory & Subprocess Reclamation") {
                     Button("Unload All & Reclaim Memory…", role: .destructive) {
@@ -717,6 +861,66 @@ struct PerfServerSurface: View {
                 Text("Calls `provider.unload()`, `MLX.Memory.clearCache()`, `ANECoreMLRuntime.unload()`, and `SubprocessLifecycleRegistry.shared.terminateAll()` (`SIGTERM` -> `SIGKILL`).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if !viewModel.aneInspectionReports.isEmpty {
+                Section("ANE Tower Compute Plan (EmbeddingGemma 2 MLComputePlan)") {
+                    ForEach(EmbeddingComponent.allCases) { component in
+                        if let report = viewModel.aneInspectionReports.first(where: { $0.component == component }) {
+                            let unitBadge = viewModel[computeUnitFor: component].shortBadge
+                            let residencyPct = Int((report.aneResidencyFraction * 100).rounded())
+                            let summaryText = report.isCompiledBundlePresent
+                                ? "\(residencyPct)% ANE ops (\(unitBadge))"
+                                : "MLX GPU fallback (\(unitBadge))"
+                            LabeledContent(component.title) {
+                                HStack(spacing: 8) {
+                                    Circle()
+                                        .fill(report.isCompiledBundlePresent ? Color.green : Color.orange)
+                                        .frame(width: 7, height: 7)
+                                    Text(summaryText)
+                                        .font(.caption.monospaced())
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Section("Recent Request Telemetry (TPS, KV Prefix Cache & Speculative Acceptance)") {
+                let assistantTurns = viewModel.currentMessages.filter { $0.role == "assistant" }.suffix(6)
+                if assistantTurns.isEmpty {
+                    Text("No assistant turns recorded in the active conversation yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(Array(assistantTurns)) { turn in
+                        HStack(spacing: 10) {
+                            Text(turn.modelID ?? "assistant")
+                                .font(.caption2.monospaced().weight(.semibold))
+                                .lineLimit(1)
+                            if let cache = turn.cacheReport {
+                                Text(cache.summaryBadge)
+                                    .font(.caption2.monospaced())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.blue.opacity(0.12), in: Capsule())
+                            }
+                            if let spec = turn.speculativeReport {
+                                Text(spec.summaryBadge)
+                                    .font(.caption2.monospaced())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.purple.opacity(0.14), in: Capsule())
+                            }
+                            Spacer()
+                            if let tps = turn.generationTPS, tps > 0 {
+                                Text(String(format: "%.1f tok/s", tps))
+                                    .font(.caption2.monospaced().weight(.bold))
+                                    .foregroundStyle(.green)
+                            }
+                        }
+                    }
+                }
             }
 
             Section {
