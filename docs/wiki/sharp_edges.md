@@ -116,3 +116,9 @@ Every non-obvious mechanism in `heylookitsanllm-macos` exists because a real har
 - **`CoreAISpeech.Decoder` Shadows `Swift.Decoder` in `Codable` Initializers**:
   - **What bit**: When `HEYLOOK_ENABLE_COREAI=1` links `CoreAISpeech` from `apple/coreai-models`, any file importing `CoreAISpeech` inherits `CoreAISpeech.Decoder` (its acoustic speech decoder protocol), causing `init(from decoder: Decoder)` to fail with `value of type 'any Decoder' has no member 'container'`.
   - **The mechanism**: Always qualify `Codable` initializers in `CoreAIProvider.swift` as `public init(from decoder: any Swift.Decoder) throws`.
+- **`URL.deletingPathExtension()` Truncates Model Directory Names Containing Version Dots (`0.6b`, `3.5`)**:
+  - **What bit**: Calling `bundleURL.deletingPathExtension().lastPathComponent` on a directory such as `parakeet-tdt-0.6b-v3_float16_static` treats `.6b-v3_float16_static` as a file extension and truncates the derived model ID to `parakeet-tdt-0`.
+  - **The mechanism**: `CoreAIBundleManifest.canonicalBundleID(for:)` prefers `metadata.json` `"name"` when present and strips `.pathExtension` **only** when the extension is `"aimodel"` or `"mlmodelc"`.
+- **`NWListener(using:on:)` Throws `EINVAL` (`NWError 22`) When `NWParameters.requiredLocalEndpoint` Already Sets a Port**:
+  - **What bit**: Setting `params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: nwPort)` to restrict loopback binding and then calling `NWListener(using: params, on: nwPort)` causes `Network.framework` (`libnetwork`) to reject the double-specified port with `NWError error 22 - Invalid argument`.
+  - **The mechanism**: In `HeylookHTTPServer.start()`, invoke `try NWListener(using: params)` (`on: .any`) whenever `params.requiredLocalEndpoint` carries `(host, port)`, and pass `on: nwPort` only for wildcard (`0.0.0.0` / `::`) listeners.

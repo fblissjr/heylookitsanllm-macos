@@ -547,7 +547,7 @@ public actor ComputeScheduler {
         if let envPath = ProcessInfo.processInfo.environment["HEYLOOK_ASR_MODEL_PATH"],
            !envPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let expanded = (envPath as NSString).expandingTildeInPath
-            let id = URL(fileURLWithPath: expanded).deletingPathExtension().lastPathComponent
+            let id = CoreAIBundleManifest.canonicalBundleID(for: URL(fileURLWithPath: expanded))
             let exists = FileManager.default.fileExists(atPath: expanded)
             let avail = exists && (coreAISpeechLinked || allowSyntheticFallback)
             return VoiceASRSummary(
@@ -627,7 +627,7 @@ public actor ComputeScheduler {
                     throw ProviderExecutionError.checkpointNotFound(modelID: pref, path: expanded)
                 }
                 let bundleURL = URL(fileURLWithPath: expanded)
-                let derivedID = bundleURL.deletingPathExtension().lastPathComponent
+                let derivedID = CoreAIBundleManifest.canonicalBundleID(for: bundleURL)
                 let desc = EngineDescription(
                     modelID: derivedID,
                     provider: .coreai,
@@ -665,13 +665,13 @@ public actor ComputeScheduler {
             }
             guard FileManager.default.fileExists(atPath: expanded) else {
                 throw ProviderExecutionError.checkpointNotFound(
-                    modelID: URL(fileURLWithPath: expanded).lastPathComponent,
+                    modelID: CoreAIBundleManifest.canonicalBundleID(for: URL(fileURLWithPath: expanded)),
                     path: expanded
                 )
             }
             let bundleURL = URL(fileURLWithPath: expanded)
             let desc = EngineDescription(
-                modelID: bundleURL.deletingPathExtension().lastPathComponent,
+                modelID: CoreAIBundleManifest.canonicalBundleID(for: bundleURL),
                 provider: .coreai,
                 modelPath: expanded,
                 architecture: ProvenanceField(

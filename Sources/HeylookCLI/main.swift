@@ -645,7 +645,7 @@ struct HeylookCLI {
                 let dirURL = URL(fileURLWithPath: expanded)
                 let arch = HeylookConfig.inspectSpeechRecognizerArchitecture(in: dirURL) ?? "speech_recognizer"
                 let adHocDesc = EngineDescription(
-                    modelID: dirURL.deletingPathExtension().lastPathComponent,
+                    modelID: CoreAIBundleManifest.canonicalBundleID(for: dirURL),
                     provider: .coreai,
                     modelPath: dirURL.path,
                     architecture: ProvenanceField(value: arch, provenance: .derived, effect: .reload),

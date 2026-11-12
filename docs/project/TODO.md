@@ -201,7 +201,9 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 ## Next Horizons (Optional Post-Phase 15 Frontiers)
 
-- [x] **H.1 On-Device ASR Tower Integration (`System SpeechTranscriber` + `CoreAISpeech`)**: Completed in Phase 15 above.
+- [x] **H.1 On-Device ASR Tower Integration (`System SpeechTranscriber` + `CoreAISpeech`)**: Completed in Phase 15 above (`parakeet-tdt-0.6b-v3_float16_static` exported locally and CLI-smoke-verified; full head-to-head `Parakeet TDT` vs. `Apple SpeechTranscriber` warm/cold server benchmark not run yet — tracked below).
+- [ ] **H.1b Live `Parakeet TDT` vs. `Apple SpeechTranscriber` Benchmark (Not Run Yet)**:
+  - Run the full warm/cold latency, Real-Time Factor (`RTFx`), RSS delta, and multi-clip accuracy comparison between `parakeet-tdt-0.6b-v3_float16_static` (`CoreAISpeech`) and `apple-speech-transcriber` (`Speech.framework`) over `POST /v1/audio/transcriptions` once multi-asset bundle root discovery (`HeylookConfig.resolveCoreAIBundleRoot`) is active in the built server binary.
 - [ ] **H.2 Live Hardware Conversion & Throughput Certification**:
   - Run live `heylook-cli convert-mlx` (`4-bit affine`, `mxfp4`, `q4_zero`) and `scripts/export_coreai.sh` against resident unquantized BF16 checkpoints and compare prefill/decode behavior and memory residency across Tier 1 (`MLXSwiftProvider`) and Tier 2 (`CoreAIProvider`).
 - [ ] **H.3 Physical `iOS 27.2+` Device Deployment & Hybrid Failover**:

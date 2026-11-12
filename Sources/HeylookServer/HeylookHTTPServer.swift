@@ -2523,15 +2523,21 @@ public actor HeylookHTTPServer {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+        let isWildcard = host.isEmpty || host == "0.0.0.0" || host == "::" || host == "*"
+        let nwListener: NWListener
+        if !isWildcard {
             let bindAddr = (host == "localhost") ? "127.0.0.1" : host
             params.requiredLocalEndpoint = NWEndpoint.hostPort(
                 host: NWEndpoint.Host(bindAddr),
                 port: nwPort
             )
+            // When `requiredLocalEndpoint` already carries a specific port, passing `on: nwPort`
+            // as well causes `libnetwork` to fail with `NWError.posix(.EINVAL)` (error 22).
+            nwListener = try NWListener(using: params)
+        } else {
+            nwListener = try NWListener(using: params, on: nwPort)
         }
-        let nwListener = try NWListener(using: params, on: nwPort)
-        if advertiseBonjour && host != "127.0.0.1" && host != "localhost" && host != "::1" {
+        if advertiseBonjour && isWildcard {
             nwListener.service = NWListener.Service(name: "Heylook Server", type: "_heylook._tcp")
         }
         let routerRef = self.router

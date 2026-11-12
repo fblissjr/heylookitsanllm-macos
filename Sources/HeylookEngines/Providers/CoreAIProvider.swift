@@ -65,6 +65,23 @@ public struct CoreAIBundleManifest: Codable, Sendable, Equatable {
         self.speechArchitecture = speechArchitecture
     }
 
+    /// Derives a truthful model ID for a `.aimodel` or CoreAI bundle directory without truncating version dots (e.g. `0.6b`).
+    public static func canonicalBundleID(for bundleURL: URL) -> String {
+        let std = bundleURL.standardizedFileURL
+        let dir = std.path.hasSuffix("metadata.json") ? std.deletingLastPathComponent() : std
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("metadata.json")),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let metaName = json["name"] as? String,
+           !metaName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return metaName
+        }
+        let ext = dir.pathExtension.lowercased()
+        if ext == "aimodel" || ext == "mlmodelc" {
+            return dir.deletingPathExtension().lastPathComponent
+        }
+        return dir.lastPathComponent
+    }
+
     public static func inspect(at bundleURL: URL) throws -> CoreAIBundleManifest {
         let fm = FileManager.default
         let isMetaFile = bundleURL.standardizedFileURL.path.hasSuffix("metadata.json")
@@ -79,7 +96,7 @@ public struct CoreAIBundleManifest: Codable, Sendable, Equatable {
             let decURL = bundleDir.appendingPathComponent("decoder.aimodel")
             if fm.fileExists(atPath: encURL.path) && fm.fileExists(atPath: decURL.path) {
                 return CoreAIBundleManifest(
-                    name: bundleDir.deletingPathExtension().lastPathComponent,
+                    name: Self.canonicalBundleID(for: bundleDir),
                     kind: "speech_recognizer",
                     schemaVersion: "0.1",
                     vocabSize: 51866,
@@ -109,7 +126,7 @@ public struct CoreAIBundleManifest: Codable, Sendable, Equatable {
 
         let name = (json["name"] as? String)
             ?? (json["tokenizer"] as? String)?.components(separatedBy: "/").last
-            ?? bundleDir.deletingPathExtension().lastPathComponent
+            ?? Self.canonicalBundleID(for: bundleDir)
         let rawKind = (json["kind"] as? String)
             ?? (json["model_type"] as? String)
             ?? (visionDict != nil ? "vlm" : "llm")

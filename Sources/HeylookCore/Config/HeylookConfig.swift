@@ -1489,6 +1489,14 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
 
         var isDir: ObjCBool = false
         let existsAsDir = fm.fileExists(atPath: standardizedURL.path, isDirectory: &isDir) && isDir.boolValue
+        if parentDir.path != standardizedScanRoot.path {
+            let parentHasManifest = fm.fileExists(atPath: parentDir.appendingPathComponent("metadata.json").path)
+            let parentHasWhisper = fm.fileExists(atPath: parentDir.appendingPathComponent("encoder.aimodel").path)
+                && fm.fileExists(atPath: parentDir.appendingPathComponent("decoder.aimodel").path)
+            if parentHasManifest || parentHasWhisper {
+                return parentDir
+            }
+        }
         if existsAsDir {
             let hasManifest = fm.fileExists(atPath: standardizedURL.appendingPathComponent("metadata.json").path)
             let hasWhisperAssets = fm.fileExists(atPath: standardizedURL.appendingPathComponent("encoder.aimodel").path)

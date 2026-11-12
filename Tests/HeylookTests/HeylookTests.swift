@@ -4143,6 +4143,27 @@ struct HeylookTests {
             withIntermediateDirectories: true
         )
 
+        // 2b. Exported multi-asset Parakeet directory (`parakeet-tdt-0.6b-v3_float16_static/` with inner `*_encoder.aimodel/metadata.json`)
+        let multiAssetParakeetDir = tempRoot.appendingPathComponent("parakeet-tdt-0.6b-v3_float16_static", isDirectory: true)
+        let innerEncDir = multiAssetParakeetDir.appendingPathComponent("parakeet-tdt-0.6b-v3_float16_static_encoder.aimodel", isDirectory: true)
+        let innerDecDir = multiAssetParakeetDir.appendingPathComponent("parakeet-tdt-0.6b-v3_float16_static_decoder_step.aimodel", isDirectory: true)
+        try FileManager.default.createDirectory(at: innerEncDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: innerDecDir, withIntermediateDirectories: true)
+        try Data("{\"author\":\"M. Sekoyan\"}".utf8).write(to: innerEncDir.appendingPathComponent("metadata.json"))
+        try Data("{\"author\":\"M. Sekoyan\"}".utf8).write(to: innerDecDir.appendingPathComponent("metadata.json"))
+        try Data("""
+        {
+          "metadata_version": "0.2",
+          "kind": "speech_recognizer",
+          "name": "parakeet-tdt-0.6b-v3_float16_static",
+          "assets": {
+            "encoder": "parakeet-tdt-0.6b-v3_float16_static_encoder.aimodel",
+            "decoder_step": "parakeet-tdt-0.6b-v3_float16_static_decoder_step.aimodel"
+          },
+          "config": { "architecture": "parakeet_tdt", "vocab_size": 8193 }
+        }
+        """.utf8).write(to: multiAssetParakeetDir.appendingPathComponent("metadata.json"))
+
         // 3. Verify CoreAIBundleManifest inspection on both layouts
         let parakeetManifest = try CoreAIBundleManifest.inspect(at: parakeetDir)
         #expect(parakeetManifest.isSpeechRecognizer == true)
@@ -4152,11 +4173,20 @@ struct HeylookTests {
         #expect(whisperManifest.isSpeechRecognizer == true)
         #expect(whisperManifest.speechArchitecture == "whisper")
 
-        // 4. Verify HeylookConfig.discoverModels keeps top-level `.aimodel` bundle root (never shifts to tempRoot!)
+        // 4. Verify HeylookConfig.discoverModels keeps top-level `.aimodel` bundle root AND collapses inner `.aimodel` assets into `multiAssetParakeetDir`
         let discovered = HeylookConfig.discoverModels(in: [tempRoot])
-        #expect(discovered.count == 2)
+        #expect(discovered.count == 3)
 
-        let parakeetDesc = try #require(discovered.first(where: { $0.modelID.contains("parakeet-tdt") }))
+        let multiDesc = try #require(discovered.first(where: { $0.modelID == "parakeet-tdt-0.6b-v3_float16_static" }))
+        #expect(URL(fileURLWithPath: multiDesc.modelPath).standardizedFileURL == multiAssetParakeetDir.standardizedFileURL)
+        #expect(multiDesc.architecture.value == "parakeet_tdt")
+        #expect(multiDesc.isSpeechRecognizer == true)
+
+        let parakeetDesc = try #require(
+            discovered.first(where: {
+                $0.modelID.contains("parakeet-tdt") && $0.modelID != "parakeet-tdt-0.6b-v3_float16_static"
+            })
+        )
         #expect(URL(fileURLWithPath: parakeetDesc.modelPath).standardizedFileURL == parakeetDir.standardizedFileURL)
         #expect(parakeetDesc.provider == .coreai)
         #expect(parakeetDesc.computePlacement.value == .ane)
@@ -4401,5 +4431,17 @@ struct HeylookTests {
         let vm = await MainActor.run { HeylookWorkbenchViewModel(autoBootstrap: false) }
         let autoSendDefault = await MainActor.run { vm.autoSendVoiceTurn }
         #expect(autoSendDefault == false)
+
+        // Verify canonicalBundleID preserves version dots (e.g. `0.6b`) while stripping `.aimodel`
+        #expect(
+            CoreAIBundleManifest.canonicalBundleID(
+                for: URL(fileURLWithPath: "/tmp/parakeet-tdt-0.6b-v3_float16_static")
+            ) == "parakeet-tdt-0.6b-v3_float16_static"
+        )
+        #expect(
+            CoreAIBundleManifest.canonicalBundleID(
+                for: URL(fileURLWithPath: "/tmp/whisper-small.aimodel")
+            ) == "whisper-small"
+        )
     }
 }
