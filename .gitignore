@@ -5,6 +5,7 @@
 # internal
 internal/
 coderef/
+models/
 update-coderef.sh
 heylook.toml
 .agents/skills/

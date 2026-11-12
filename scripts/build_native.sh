@@ -85,6 +85,8 @@ assemble_app_bundle() {
     <string>NSApplication</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Heylook Workbench uses the microphone for 16 kHz ANE voice prompt transcription.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Heylook Workbench transcribes voice prompts locally on the Apple Neural Engine.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Heylook Workbench discovers and serves _heylook._tcp inference peers on your local network.</string>
     <key>NSBonjourServices</key>

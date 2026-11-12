@@ -237,6 +237,19 @@ public struct EngineDescription: Codable, Identifiable, Sendable, Equatable {
     public let estimatedMemoryMB: Int
     public let tags: [String]
 
+    /// True when this entry represents a dedicated ASR speech recognizer (`CoreAISpeech` Whisper / Parakeet TDT
+    /// or Apple `SpeechTranscriber`) rather than an autoregressive text-chat model.
+    public var isSpeechRecognizer: Bool {
+        let arch = architecture.value.lowercased()
+        if arch == "whisper"
+            || arch == "parakeet_tdt"
+            || arch == "speech_recognizer"
+            || arch == "apple_speech_transcriber" {
+            return true
+        }
+        return tags.contains { ["asr", "speech_recognizer"].contains($0.lowercased()) }
+    }
+
     public init(
         modelID: String,
         provider: EngineProviderKind,

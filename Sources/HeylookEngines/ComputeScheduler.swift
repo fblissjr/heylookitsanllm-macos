@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import HeylookCore
 import Metal
+import Speech
 
 public enum ComputeSchedulerError: LocalizedError, Sendable, Equatable {
     case queueOverloaded(depth: Int, maxDepth: Int)
@@ -199,8 +200,35 @@ public actor ComputeScheduler {
         }
     }
 
+    public struct VoiceASRSummary: Codable, Sendable, Equatable {
+        public let available: Bool
+        public let defaultModel: String?
+        public let backend: String
+        public let models: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case available
+            case defaultModel = "default_model"
+            case backend
+            case models
+        }
+
+        public init(
+            available: Bool,
+            defaultModel: String?,
+            backend: String,
+            models: [String] = []
+        ) {
+            self.available = available
+            self.defaultModel = defaultModel
+            self.backend = backend
+            self.models = models
+        }
+    }
+
     private var providers: [String: any InferenceProvider] = [:]
     private var descriptions: [String: EngineDescription] = [:]
+    private var auxiliaryASRProviders: [String: CoreAIProvider] = [:]
     private var lruOrderGPU: [String] = []
     private var loadedANE: Set<String> = []
     private var maxLoadedGPUModels: Int
@@ -454,6 +482,10 @@ public actor ComputeScheduler {
         for (_, provider) in providers {
             await provider.unload()
         }
+        for (_, asrProvider) in auxiliaryASRProviders {
+            await asrProvider.unload()
+        }
+        auxiliaryASRProviders.removeAll()
     }
 
     /// Acquires a compute lease on either the **ANE Co-Resident Lane** (concurrent, zero GPU contention)
@@ -502,6 +534,217 @@ public actor ComputeScheduler {
             throw ComputeSchedulerError.modelNotFound(modelID)
         }
         return p
+    }
+
+    /// Reports the currently active/available ANE Voice ASR backend and candidate models.
+    public func voiceASRSummary(allowSyntheticFallback: Bool = false) -> VoiceASRSummary {
+        let registeredASR = descriptions.values
+            .filter { $0.provider == .coreai && $0.isSpeechRecognizer }
+            .map(\.modelID)
+            .sorted()
+        let coreAISpeechLinked = CoreAIProvider.isCoreAISpeechLinked
+
+        if let envPath = ProcessInfo.processInfo.environment["HEYLOOK_ASR_MODEL_PATH"],
+           !envPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let expanded = (envPath as NSString).expandingTildeInPath
+            let id = URL(fileURLWithPath: expanded).deletingPathExtension().lastPathComponent
+            let exists = FileManager.default.fileExists(atPath: expanded)
+            let avail = exists && (coreAISpeechLinked || allowSyntheticFallback)
+            return VoiceASRSummary(
+                available: avail,
+                defaultModel: id,
+                backend: coreAISpeechLinked ? "coreai_speech" : (allowSyntheticFallback ? "synthetic_fixture" : "coreai_speech_unlinked"),
+                models: ([id] + registeredASR + (SpeechTranscriber.isAvailable ? [CoreAIProvider.systemSpeechModelID] : []))
+            )
+        }
+
+        if !registeredASR.isEmpty && (coreAISpeechLinked || allowSyntheticFallback) {
+            var allModels = registeredASR
+            if SpeechTranscriber.isAvailable {
+                allModels.append(CoreAIProvider.systemSpeechModelID)
+            }
+            return VoiceASRSummary(
+                available: true,
+                defaultModel: registeredASR.first,
+                backend: coreAISpeechLinked ? "coreai_speech" : "synthetic_fixture",
+                models: allModels
+            )
+        }
+
+        if SpeechTranscriber.isAvailable || allowSyntheticFallback {
+            return VoiceASRSummary(
+                available: true,
+                defaultModel: CoreAIProvider.systemSpeechModelID,
+                backend: SpeechTranscriber.isAvailable ? "apple_speech_transcriber" : "synthetic_fixture",
+                models: [CoreAIProvider.systemSpeechModelID]
+            )
+        }
+
+        return VoiceASRSummary(
+            available: false,
+            defaultModel: nil,
+            backend: "unavailable",
+            models: registeredASR
+        )
+    }
+
+    /// Resolves and caches the persistent ANE-lane `CoreAIProvider` used for voice ASR transcription.
+    public func resolveASRProvider(
+        preferredModelID: String? = nil,
+        allowSyntheticFallback: Bool = false
+    ) throws -> (provider: CoreAIProvider, isRegisteredInCatalog: Bool) {
+        let coreAISpeechLinked = CoreAIProvider.isCoreAISpeechLinked
+
+        let trimmedPref = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 1. Explicit model ID or filesystem bundle path requested by caller
+        if let pref = trimmedPref, !pref.isEmpty {
+            if pref == CoreAIProvider.systemSpeechModelID || pref == CoreAIProvider.systemSpeechModelPath {
+                if let cached = auxiliaryASRProviders[CoreAIProvider.systemSpeechModelID],
+                   cached.allowSyntheticFallback == allowSyntheticFallback {
+                    return (cached, false)
+                }
+                let created = CoreAIProvider(
+                    description: CoreAIProvider.systemSpeechDescription(),
+                    allowSyntheticFallback: allowSyntheticFallback
+                )
+                auxiliaryASRProviders[CoreAIProvider.systemSpeechModelID] = created
+                return (created, false)
+            }
+
+            if let registered = providers[pref] as? CoreAIProvider {
+                return (registered, true)
+            }
+
+            // Support passing an explicit filesystem `.aimodel` / bundle directory path (e.g. from CLI `--model <path>`)
+            let expanded = (pref as NSString).expandingTildeInPath
+            if pref.contains("/") || pref.lowercased().hasSuffix(".aimodel") {
+                if let cached = auxiliaryASRProviders[expanded],
+                   cached.allowSyntheticFallback == allowSyntheticFallback {
+                    return (cached, false)
+                }
+                guard FileManager.default.fileExists(atPath: expanded) else {
+                    throw ProviderExecutionError.checkpointNotFound(modelID: pref, path: expanded)
+                }
+                let bundleURL = URL(fileURLWithPath: expanded)
+                let derivedID = bundleURL.deletingPathExtension().lastPathComponent
+                let desc = EngineDescription(
+                    modelID: derivedID,
+                    provider: .coreai,
+                    modelPath: expanded,
+                    architecture: ProvenanceField(
+                        value: HeylookConfig.inspectSpeechRecognizerArchitecture(in: bundleURL) ?? "speech_recognizer",
+                        provenance: .derived,
+                        effect: .reload
+                    ),
+                    computePlacement: ProvenanceField(
+                        value: .ane,
+                        provenance: .derived,
+                        effect: .reload,
+                        computePlacement: .ane
+                    ),
+                    supportsAudio: ProvenanceField(value: true, provenance: .derived, effect: .reload),
+                    supportsThinking: ProvenanceField(value: false, provenance: .derived, effect: .perRequest),
+                    tags: ["asr", "speech"]
+                )
+                let created = CoreAIProvider(description: desc, allowSyntheticFallback: allowSyntheticFallback)
+                auxiliaryASRProviders[expanded] = created
+                return (created, false)
+            }
+
+            throw ComputeSchedulerError.modelNotFound(pref)
+        }
+
+        // 2. Explicit `HEYLOOK_ASR_MODEL_PATH` environment variable (truthful failure if missing)
+        if let envPath = ProcessInfo.processInfo.environment["HEYLOOK_ASR_MODEL_PATH"],
+           !envPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let expanded = (envPath as NSString).expandingTildeInPath
+            if let cached = auxiliaryASRProviders[expanded],
+               cached.allowSyntheticFallback == allowSyntheticFallback {
+                return (cached, false)
+            }
+            guard FileManager.default.fileExists(atPath: expanded) else {
+                throw ProviderExecutionError.checkpointNotFound(
+                    modelID: URL(fileURLWithPath: expanded).lastPathComponent,
+                    path: expanded
+                )
+            }
+            let bundleURL = URL(fileURLWithPath: expanded)
+            let desc = EngineDescription(
+                modelID: bundleURL.deletingPathExtension().lastPathComponent,
+                provider: .coreai,
+                modelPath: expanded,
+                architecture: ProvenanceField(
+                    value: HeylookConfig.inspectSpeechRecognizerArchitecture(in: bundleURL) ?? "speech_recognizer",
+                    provenance: .configured,
+                    effect: .reload
+                ),
+                computePlacement: ProvenanceField(
+                    value: .ane,
+                    provenance: .configured,
+                    effect: .reload,
+                    computePlacement: .ane
+                ),
+                supportsAudio: ProvenanceField(value: true, provenance: .configured, effect: .reload),
+                supportsThinking: ProvenanceField(value: false, provenance: .derived, effect: .perRequest),
+                tags: ["asr", "speech"]
+            )
+            let created = CoreAIProvider(description: desc, allowSyntheticFallback: allowSyntheticFallback)
+            auxiliaryASRProviders[expanded] = created
+            return (created, false)
+        }
+
+        // 3. Registered CoreAISpeech bundle in catalog (when CoreAISpeech is linked or in synthetic test mode)
+        if coreAISpeechLinked || allowSyntheticFallback {
+            let sortedASR = descriptions.values
+                .filter { $0.provider == .coreai && $0.isSpeechRecognizer }
+                .sorted { $0.modelID.localizedStandardCompare($1.modelID) == .orderedAscending }
+            if let firstDesc = sortedASR.first,
+               let registered = providers[firstDesc.modelID] as? CoreAIProvider {
+                return (registered, true)
+            }
+        }
+
+        // 4. Built-in Apple `SpeechTranscriber` (`SpeechAnalyzer`) on the ANE lane
+        let sysKey = CoreAIProvider.systemSpeechModelID
+        if let cached = auxiliaryASRProviders[sysKey],
+           cached.allowSyntheticFallback == allowSyntheticFallback {
+            return (cached, false)
+        }
+        let sysProvider = CoreAIProvider(
+            description: CoreAIProvider.systemSpeechDescription(),
+            allowSyntheticFallback: allowSyntheticFallback
+        )
+        auxiliaryASRProviders[sysKey] = sysProvider
+        return (sysProvider, false)
+    }
+
+    /// Executes ANE-lane speech transcription while preserving resident GPU LLMs untouched.
+    public func transcribeVoice(
+        wavData: Data,
+        languageHint: String = "en",
+        preferredASRModelID: String? = nil,
+        allowSyntheticFallback: Bool = false
+    ) async throws -> CoreAIProvider.ANESpeechTranscriptionResult {
+        let resolved = try resolveASRProvider(
+            preferredModelID: preferredASRModelID,
+            allowSyntheticFallback: allowSyntheticFallback
+        )
+        if resolved.isRegisteredInCatalog {
+            return try await withComputeLease(for: resolved.provider.modelID) {
+                try await resolved.provider.transcribeAudio(
+                    wavData: wavData,
+                    languageHint: languageHint
+                )
+            }
+        }
+        activeANETasks += 1
+        loadedANE.insert(resolved.provider.modelID)
+        defer { activeANETasks -= 1 }
+        return try await resolved.provider.transcribeAudio(
+            wavData: wavData,
+            languageHint: languageHint
+        )
     }
 
     public func metrics() -> SchedulerMetrics {

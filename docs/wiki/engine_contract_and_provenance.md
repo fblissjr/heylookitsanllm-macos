@@ -1,6 +1,6 @@
 # Engine Contract, Provenance, Sampler Cascade & Template Analysis
 
-Covers `Sources/HeylookCore/Domain/` and `Sources/HeylookCore/Config/HeylookConfig.swift`.
+Covers `Sources/HeylookCore/Engine/`, `Sources/HeylookCore/Sampling/`, `Sources/HeylookCore/Parsing/`, and `Sources/HeylookCore/Config/`.
 
 ---
 

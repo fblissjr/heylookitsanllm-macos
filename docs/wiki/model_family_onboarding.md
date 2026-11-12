@@ -9,7 +9,7 @@
 | Tier | Runtime Framework | Provider Actor | Supported Model Families |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: In-Process MLX Swift (Metal GPU)** | `ml-explore/mlx-swift` + `ml-explore/mlx-swift-lm` (`MLXLLM`, `MLXVLM`, `MLXLMCommon`) | `MLXSwiftProvider` | **61 LLM architectures** (`LLMTypeRegistry`): `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_next`, `qwen3_5` (`_moe`/`_text`), `qwen3_8` (`_moe`/`_text`), `gemma`, `gemma2`, `gemma3` (`_text`), `gemma3n`, `gemma4` (`_unified`/`_text`), `deepseek_v2`, `deepseek_v3`, `gpt_oss`, `llama`, `mistral`, `mistral3`, `mixtral`, `glm4` (`_moe`/`_moe_lite`), `minimax`, `mimo` (`_v2_flash`), `lfm2` (`_moe`), `phi`/`phi3`/`phimoe`, `olmo2`/`olmo3`/`olmoe`, `nemotron_h`, `nemotron_labs_diffusion`, `jamba`, `mamba2`, `falcon_h1`, `ernie4_5`, `exaone4`, `bailing_moe`, `baichuan_m1`, `smollm3`, `granite` (`moehybrid`), `helium`, `hunyuan_v1_dense`, `apertus`, `afmoe`, `bitnet`, `cohere`, `starcoder2`, `internlm2`, `minicpm`, `nanbeige`, `nanochat`, `lille-130m`, `mellum`, `openelm`<br>**20 VLM architectures** (`VLMTypeRegistry`): `qwen2_vl`, `qwen2_5_vl`, `qwen3_vl` (`_moe`), `qwen3_5` (`_moe`), `qwen3_8` (`_moe`), `gemma3`, `gemma4` (`_unified`), `muse_glimmer`, `pixtral`, `mistral3`, `lfm2_vl`, `glm_ocr`, `paligemma`, `idefics3`, `smolvlm`, `fastvlm`<br>**Speculative Drafters** (`MTPDrafterTypeRegistry`): `gemma4_assistant`, `qwen3_5_mtp`, `qwen3_8_mtp` |
-| **Tier 2: Apple Neural Engine (ANE) & CoreAI** | `apple/coreai-models` (`CoreAILanguageModels`, `CoreAISpeech`, `CoreAIVision`), `argmaxinc/argmax-oss-swift` (`WhisperKit`), `CoreML` | `CoreAIProvider` & `HeylookEmbeddings` (`ANECoreMLRuntime`) | **`.aimodel` bundles** (`Schema 0.2`): `gemma3`, `gemma3n`, `gemma4`, `gpt_oss`, `mistral`, `mixtral`, `muse_glimmer`, `olmo2`, `phi`, `qwen2`, `qwen3`, `qwen3_5`, `qwen3_moe`, `smollm2`, `vlm`<br>**Multimodal Embeddings**: `EmbeddingGemma 2` (`embeddinggemma-2-MLX-BF16` + Vision/Audio/Text ANE `.mlmodelc` towers)<br>**Speech**: `whisper`, `parakeet`, `wav2vec2` |
+| **Tier 2: Apple Neural Engine (ANE) & CoreAI** | `apple/coreai-models` (`CoreAILanguageModels`, `CoreAISpeech`, `CoreAIVision`), `Speech.framework` (`SpeechAnalyzer` + `SpeechTranscriber`), `CoreML` | `CoreAIProvider` & `HeylookEmbeddings` (`ANECoreMLRuntime`) | **`.aimodel` bundles** (`Schema 0.2`): `gemma3`, `gemma3n`, `gemma4`, `gpt_oss`, `mistral`, `mixtral`, `muse_glimmer`, `olmo2`, `phi`, `qwen2`, `qwen3`, `qwen3_5`, `qwen3_moe`, `smollm2`, `vlm`<br>**Multimodal Embeddings**: `EmbeddingGemma 2` (`embeddinggemma-2-MLX-BF16` + Vision/Audio/Text ANE `.mlmodelc` towers)<br>**Speech (`[ASR]`)**: `apple-speech-transcriber` (`Speech.framework`), `parakeet` (`nvidia/parakeet-tdt-0.6b-v3`), `whisper` (`openai/whisper-*`) |
 | **Tier 3: GGUF (`llama-server`)** | `llama.cpp` subprocess + pure-Swift `GGUFHeaderReader` | `GGUFSubprocessProvider` | Any GGUF architecture supported by `llama.cpp` (`qwen35`/`qwen35moe`, `qwen38`, `gemma4`, `llama4`, `deepseek2`/`deepseek3`, `gpt-oss`, `mamba2`, `jamba`, `command-r`, etc.) with automatic `mmproj-*.gguf` vision/audio pairing, `--cache-ram 8192` hybrid-recurrent SSM sizing, and `--spec-type draft-mtp` |
 
 ---
@@ -128,6 +128,11 @@ Core AI models are exported as `.aimodel` resource bundles (`metadata.json` Sche
 
    # Export EmbeddingGemma 2 .aimodel (macOS GPU or iOS ANE)
    ./scripts/export_coreai.sh embedding embeddinggemma-2 --platform iOS
+
+   # Export Parakeet TDT (25-language FastConformer + TDT transducer) or Whisper for CoreAISpeech
+   # Static offline window (--audio-seconds 15.0, float16) masks shorter clips via attention_mask
+   ./scripts/export_coreai.sh parakeet --model nvidia/parakeet-tdt-0.6b-v3 --dtype float16 --audio-seconds 15.0 --output-dir ./models/coreai
+   ./scripts/export_coreai.sh whisper --model openai/whisper-small --output-dir ./models/coreai
 
    # Optional Ahead-of-Time (AOT) compilation via xcrun coreai-build
    ./scripts/export_coreai.sh compile ~/.heylook/models/Qwen3.5-9B/main.aimodel --platform macOS

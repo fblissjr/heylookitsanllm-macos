@@ -51,7 +51,7 @@ When a macOS executable is launched from a CLI build directory (`.build/debug/he
    - Always configure `.defaultSize(width: 1360, height: 860)` and `.windowResizability(.contentMinSize)`.
    - Include standard macOS menu commands: `SidebarCommands()`, `InspectorCommands()`, and surface shortcuts (`⌘1`–`⌘6`, `⌘N`, `⇧⌘N`).
 3. **`.app` Bundle Assembly (`scripts/build_native.sh`)**:
-   - `./scripts/build_native.sh build` and `./scripts/build_native.sh app` assemble `HeylookWorkbench.app` with `Contents/Info.plist` (`CFBundlePackageType = APPL`, `LSMinimumSystemVersion = 27.2`) alongside `mlx-swift_Cmlx.bundle` (`default.metallib`).
+   - `./scripts/build_native.sh build` and `./scripts/build_native.sh app` assemble `HeylookWorkbench.app` with `Contents/Info.plist` (`CFBundlePackageType = APPL`, `LSMinimumSystemVersion = 27.2`, `NSMicrophoneUsageDescription`, and `NSSpeechRecognitionUsageDescription`) alongside `mlx-swift_Cmlx.bundle` (`default.metallib`).
 
 ---
 
@@ -133,7 +133,7 @@ Per Apple's exported `swiftui-specialist` and `swiftui-whats-new-27` skills:
      - `ModelsInspectorSurface`: `ModelsTopActionBar`, `ModelRegistryRowView`.
 2. **Cached `@Observable` Stored Projections & `@Bindable` KeyPaths (`dataflow.md` & `foreach.md`)**:
    - Pass `@Observable` models into child views via `@Bindable var viewModel: HeylookWorkbenchViewModel` (never `@Binding var viewModel: HeylookWorkbenchViewModel`).
-   - Cache derived collections and lookups (`activeModelDescription`, `filteredModels`, `modelCountsByProvider`, `sortedActiveGGUFPorts`) in `didSet` hooks on `HeylookWorkbenchViewModel` instead of recomputing `.first(where:)`, `.filter`, or `.sorted` inside `View.body` or `ForEach` arguments.
+   - Cache derived collections and lookups (`activeModelDescription`, `generationModels`, `availableASRModels`, `filteredModels`, `modelCountsByProvider`, `sortedActiveGGUFPorts`) in `didSet` hooks on `HeylookWorkbenchViewModel` instead of recomputing `.first(where:)`, `.filter`, or `.sorted` inside `View.body` or `ForEach` arguments.
    - Pass `Sequence.enumerated()` directly to `ForEach(HeylookSurface.allCases.enumerated(), id: \.element.id)` (Swift 6.1+ `EnumeratedSequence: RandomAccessCollection`) without wrapping in `Array(...)`, or wrap indexed domain elements in a dedicated `Identifiable` value type (such as `KeyframeStamp: Identifiable` and precomputed `sortedAttributes` in `EmbeddingsInspectorView`).
    - Never construct `Binding(get: { ... }, set: { ... })` closures inside `body`. Expose computed getter/setter properties or subscripts on `@Observable` (`$viewModel.boundTemperature`, `$viewModel.boundEffectiveQueryTask`, `$viewModel[computeUnitFor: component]`) and bind via `@Bindable` KeyPaths.
 3. **`@State` Macro Rules in SDK 27 (`state-macro.md`)**:

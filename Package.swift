@@ -56,9 +56,10 @@ if enableCoreAI {
             branch: "main"
         )
     )
-    enginesDependencies.append(
-        .product(name: "CoreAILM", package: "coreai-models")
-    )
+    enginesDependencies.append(contentsOf: [
+        .product(name: "CoreAILM", package: "coreai-models"),
+        .product(name: "CoreAISpeech", package: "coreai-models"),
+    ])
 }
 
 let package = Package(
@@ -105,8 +106,10 @@ let package = Package(
             dependencies: enginesDependencies,
             linkerSettings: [
                 .linkedFramework("Accelerate"),
+                .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreML"),
                 .linkedFramework("Metal"),
+                .linkedFramework("Speech"),
             ]
         ),
         .target(

@@ -536,9 +536,20 @@ public final class HeylookWorkbenchViewModel {
     }
 
     public var isRecordingVoice: Bool = false
+    public var autoSendVoiceTurn: Bool = false
+    public var selectedASRModelID: String? = nil {
+        didSet { refreshASRAvailability() }
+    }
+    public private(set) var availableASRModels: [EngineDescription] = []
+    public private(set) var activeASRBackendLabel: String = "Apple SpeechTranscriber (ANE)"
     public var lastVoiceTranscription: CoreAIProvider.ANESpeechTranscriptionResult?
     public private(set) var resolvedASRModelPath: String?
-    public var isVoiceASRConfigured: Bool { resolvedASRModelPath != nil }
+    public var isVoiceASRConfigured: Bool {
+        resolvedASRModelPath != nil
+            || CoreAIProvider.isSystemSpeechAvailable
+            || connectedRemoteServerURL != nil
+    }
+    private var pendingVoiceAutoSend: Bool?
     private var voiceRecorder: AVAudioRecorder?
     private var voiceRecordingURL: URL?
 
@@ -769,6 +780,7 @@ public final class HeylookWorkbenchViewModel {
             port: UInt16(cfg.serverPort)
         )
         self.serverPort = UInt16(cfg.serverPort)
+        self.refreshASRAvailability()
 
         if autoBootstrap {
             Task {
@@ -865,7 +877,7 @@ public final class HeylookWorkbenchViewModel {
     }
 
     private func recomputeFilteredModels() {
-        generationModels = registeredModels.filter { !$0.supportsEmbeddings.value }
+        generationModels = registeredModels.filter { !$0.supportsEmbeddings.value && !$0.isSpeechRecognizer }
         var counts: [EngineProviderKind: Int] = [:]
         for model in registeredModels {
             counts[model.provider, default: 0] += 1
@@ -944,26 +956,60 @@ public final class HeylookWorkbenchViewModel {
 
     private func refreshASRAvailability() {
         let fm = FileManager.default
+        var models: [EngineDescription] = registeredModels.filter {
+            $0.provider == .coreai && $0.isSpeechRecognizer
+        }
+        if CoreAIProvider.isSystemSpeechAvailable,
+           !models.contains(where: { $0.modelID == CoreAIProvider.systemSpeechModelID }) {
+            models.append(CoreAIProvider.systemSpeechDescription())
+        }
+        availableASRModels = models
+
+        var resolvedPath: String?
         if let envPath = ProcessInfo.processInfo.environment["HEYLOOK_ASR_MODEL_PATH"],
            !envPath.isEmpty,
            fm.fileExists(atPath: (envPath as NSString).expandingTildeInPath) {
-            resolvedASRModelPath = (envPath as NSString).expandingTildeInPath
-            return
-        }
-        if fm.fileExists(atPath: "models/ane-speech-whisper.aimodel") {
-            resolvedASRModelPath = "models/ane-speech-whisper.aimodel"
-            return
-        }
-        if let candidate = registeredModels.first(where: { desc in
-            let lower = desc.modelID.lowercased()
-            let hasTag = desc.tags.contains { ["asr", "whisper", "speech"].contains($0.lowercased()) }
+            resolvedPath = (envPath as NSString).expandingTildeInPath
+        } else if fm.fileExists(atPath: "models/ane-speech-whisper.aimodel") {
+            resolvedPath = "models/ane-speech-whisper.aimodel"
+        } else if let candidate = registeredModels.first(where: { desc in
+            guard desc.isSpeechRecognizer else { return false }
             let expanded = (desc.modelPath as NSString).expandingTildeInPath
-            return (hasTag || lower.contains("whisper") || lower.contains("asr")) && fm.fileExists(atPath: expanded)
+            return fm.fileExists(atPath: expanded)
         }) {
-            resolvedASRModelPath = (candidate.modelPath as NSString).expandingTildeInPath
-            return
+            resolvedPath = (candidate.modelPath as NSString).expandingTildeInPath
         }
-        resolvedASRModelPath = nil
+        resolvedASRModelPath = resolvedPath
+
+        let chosenModel: EngineDescription? = {
+            if let explicitID = selectedASRModelID {
+                return models.first(where: { $0.modelID == explicitID })
+            }
+            if CoreAIProvider.isCoreAISpeechLinked,
+               let coreAISpeech = models.first(where: { $0.modelID != CoreAIProvider.systemSpeechModelID }) {
+                return coreAISpeech
+            }
+            return models.first(where: { $0.modelID == CoreAIProvider.systemSpeechModelID }) ?? models.first
+        }()
+
+        if let chosenModel {
+            switch chosenModel.architecture.value.lowercased() {
+            case "parakeet_tdt":
+                activeASRBackendLabel = "Parakeet TDT (ANE)"
+            case "whisper":
+                activeASRBackendLabel = "Whisper (ANE)"
+            case "apple_speech_transcriber":
+                activeASRBackendLabel = "Apple SpeechTranscriber (ANE)"
+            default:
+                activeASRBackendLabel = "\(chosenModel.modelID) (ANE)"
+            }
+        } else if resolvedPath != nil {
+            activeASRBackendLabel = "CoreAI Speech (ANE)"
+        } else if connectedRemoteServerURL != nil {
+            activeASRBackendLabel = "Remote Server ASR"
+        } else {
+            activeASRBackendLabel = "Voice ASR Unavailable"
+        }
     }
 
     public func confirmDestructiveAction(_ action: DestructiveActionPrompt) {
@@ -2139,32 +2185,73 @@ public final class HeylookWorkbenchViewModel {
     }
 
     @discardableResult
-    public func sendVoiceTurn(
+    public func transcribeVoiceToComposer(
         wavData: Data,
-        languageHint: String = "en"
+        languageHint: String = "en",
+        autoSend: Bool? = nil
     ) async -> CoreAIProvider.ANESpeechTranscriptionResult? {
-        guard let asrPath = resolvedASRModelPath else {
-            statusBanner = "No Whisper / ASR .aimodel bundle found. Set HEYLOOK_ASR_MODEL_PATH."
+        guard isVoiceASRConfigured else {
+            statusBanner = "Voice input unavailable: neither Apple SpeechTranscriber nor a CoreAISpeech .aimodel bundle is available."
             return nil
         }
-        let aneProvider = CoreAIProvider(
-            description: EngineDescription(
-                modelID: "ane-speech-whisper",
-                provider: .coreai,
-                modelPath: asrPath,
-                computePlacement: ProvenanceField(
-                    value: .ane,
-                    provenance: .derived,
-                    effect: .reload,
-                    computePlacement: .ane
-                )
-            )
-        )
+
         do {
-            let transcript = try await aneProvider.transcribeAudio(wavData: wavData, languageHint: languageHint)
+            let transcript: CoreAIProvider.ANESpeechTranscriptionResult
+            if let remoteBase = connectedRemoteServerURL,
+               let baseURL = URL(string: remoteBase) {
+                var urlReq = URLRequest(url: baseURL.appendingPathComponent("v1/audio/transcriptions"))
+                urlReq.httpMethod = "POST"
+                urlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                let payload = AudioTranscriptionRequest(
+                    audioBase64: wavData.base64EncodedString(),
+                    languageHint: languageHint,
+                    model: selectedASRModelID
+                )
+                urlReq.httpBody = try JSONEncoder().encode(payload)
+                let (respData, resp) = try await URLSession.shared.data(for: urlReq)
+                if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                    let msg = String(decoding: respData, as: UTF8.self)
+                    throw ProviderExecutionError.runtimeUnavailable(
+                        modelID: selectedASRModelID ?? "remote-asr",
+                        detail: "Remote /v1/audio/transcriptions HTTP \(http.statusCode): \(msg)"
+                    )
+                }
+                transcript = try JSONDecoder().decode(CoreAIProvider.ANESpeechTranscriptionResult.self, from: respData)
+            } else {
+                transcript = try await scheduler.transcribeVoice(
+                    wavData: wavData,
+                    languageHint: languageHint,
+                    preferredASRModelID: selectedASRModelID
+                )
+            }
+
             lastVoiceTranscription = transcript
-            draftPrompt = transcript.text
-            await sendChatPrompt()
+            await refreshMetrics()
+
+            let cleanedText = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanedText.isEmpty else {
+                statusBanner = "No speech detected in recording."
+                return transcript
+            }
+
+            let trimmedDraft = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedDraft.isEmpty {
+                draftPrompt = cleanedText
+            } else {
+                draftPrompt = "\(trimmedDraft) \(cleanedText)"
+            }
+
+            let shouldAutoSend = autoSend ?? autoSendVoiceTurn
+            if shouldAutoSend {
+                await sendChatPrompt()
+            } else {
+                statusBanner = String(
+                    format: "Dictated %.1fs via %@ (%@).",
+                    transcript.durationSeconds,
+                    transcript.modelID,
+                    transcript.computePlacement.rawValue.uppercased()
+                )
+            }
             return transcript
         } catch {
             statusBanner = "ANE voice transcription failed: \(error.localizedDescription)"
@@ -2172,26 +2259,46 @@ public final class HeylookWorkbenchViewModel {
         }
     }
 
-    public func toggleVoiceRecording() {
-        Task { await performToggleVoiceRecording() }
+    @discardableResult
+    public func sendVoiceTurn(
+        wavData: Data,
+        languageHint: String = "en"
+    ) async -> CoreAIProvider.ANESpeechTranscriptionResult? {
+        await transcribeVoiceToComposer(
+            wavData: wavData,
+            languageHint: languageHint,
+            autoSend: true
+        )
     }
 
-    private func performToggleVoiceRecording() async {
+    public func toggleVoiceRecording(autoSendOnStop: Bool? = nil) {
+        Task { await performToggleVoiceRecording(autoSendOnStop: autoSendOnStop) }
+    }
+
+    private func performToggleVoiceRecording(autoSendOnStop: Bool? = nil) async {
         if isRecordingVoice {
             voiceRecorder?.stop()
             voiceRecorder = nil
             isRecordingVoice = false
+            let resolvedAutoSend = autoSendOnStop ?? pendingVoiceAutoSend ?? autoSendVoiceTurn
+            pendingVoiceAutoSend = nil
             guard let url = voiceRecordingURL else { return }
             voiceRecordingURL = nil
             defer { try? FileManager.default.removeItem(at: url) }
             if let wavData = try? Data(contentsOf: url), wavData.count > 44 {
-                _ = await sendVoiceTurn(wavData: wavData)
+                _ = await transcribeVoiceToComposer(wavData: wavData, autoSend: resolvedAutoSend)
             }
             return
         }
 
         guard isVoiceASRConfigured else {
-            statusBanner = "Voice input unavailable: no ASR .aimodel bundle configured."
+            statusBanner = "Voice input unavailable: no ASR runtime configured."
+            return
+        }
+
+        let granted = await AVAudioApplication.requestRecordPermission()
+        guard granted else {
+            statusBanner = "Microphone permission denied. Grant Microphone access in System Settings > Privacy & Security."
             return
         }
 
@@ -2214,9 +2321,11 @@ public final class HeylookWorkbenchViewModel {
             let recorder = try AVAudioRecorder(url: tempURL, settings: settings)
             recorder.prepareToRecord()
             if recorder.record() {
+                pendingVoiceAutoSend = autoSendOnStop
                 voiceRecordingURL = tempURL
                 voiceRecorder = recorder
                 isRecordingVoice = true
+                statusBanner = "Recording 16 kHz mono voice input (\(activeASRBackendLabel))…"
             }
         } catch {
             statusBanner = "Microphone capture failed: \(error.localizedDescription)"

@@ -34,6 +34,8 @@ struct HeylookCLI {
             await runServe(portOverride: port)
         case "chat":
             await runChat(args: Array(args.dropFirst()))
+        case "transcribe":
+            await runTranscribe(args: Array(args.dropFirst()))
         case "eval-lab":
             await runEvalLab(args: Array(args.dropFirst()))
         case "convert-mlx":
@@ -92,6 +94,13 @@ struct HeylookCLI {
         print("Swift Concurrency   : Swift 6.2 Strict Actor Isolation")
         print("Compute Lanes       : GPU GenerationGate (FIFO) + ANE Co-Residency Lane")
         print("Supported Providers : MLXSwiftProvider, CoreAIProvider (.aimodel), GGUFSubprocessProvider, RemoteHeylookProvider")
+        let doctorScheduler = ComputeScheduler()
+        _ = await registerConfiguredModels(into: doctorScheduler)
+        let asrSummary = await doctorScheduler.voiceASRSummary()
+        let asrStatusText = asrSummary.available
+            ? "Available (default=\(asrSummary.defaultModel ?? "none"), backend=\(asrSummary.backend), models=[\(asrSummary.models.joined(separator: ", "))])"
+            : "Unavailable"
+        print("Voice ASR Engine    : \(asrStatusText)")
         print("Embeddings Engine   : EmbeddingGemma 2 + vDSP Matryoshka (768d / 512d / 256d / 128d)")
         print("Store Engine        : SQLite3 WAL (Conversations, Messages, MediaBlobs, Stats, Notebooks, Presets, VectorSpans)")
         if let store = try? VectorStore(databaseURL: storeURL),
@@ -113,6 +122,7 @@ struct HeylookCLI {
         print("Discovered \(found.count) models across \(cfg.scanFolders.count) configured folders (\(cfg.explicitModels.count) explicit entries in heylook.toml).")
         for m in found {
             let mtpBadge = m.tags.contains("mtp") ? " [MTP]" : ""
+            let asrBadge = m.isSpeechRecognizer ? " [ASR]" : ""
             let visionBadge = m.supportsVision.value ? " [vision]" : ""
             let audioBadge = m.supportsAudio.value ? " [audio]" : ""
             let depthBadge: String
@@ -121,7 +131,7 @@ struct HeylookCLI {
             } else {
                 depthBadge = ""
             }
-            print("- [\(m.provider.rawValue)] \(m.modelID)\(mtpBadge)\(visionBadge)\(audioBadge) ctx=\(m.contextSize.value) mem=\(m.estimatedMemoryMB)MB reasoning=\(m.reasoningFormat.value)\(depthBadge) template=\(m.templateSource.value) (\(m.modelPath))")
+            print("- [\(m.provider.rawValue)] \(m.modelID)\(mtpBadge)\(asrBadge)\(visionBadge)\(audioBadge) ctx=\(m.contextSize.value) mem=\(m.estimatedMemoryMB)MB reasoning=\(m.reasoningFormat.value)\(depthBadge) template=\(m.templateSource.value) (\(m.modelPath))")
         }
     }
 
@@ -592,12 +602,91 @@ struct HeylookCLI {
         }
     }
 
+    static func runTranscribe(args: [String]) async {
+        var audioPath: String?
+        var requestedModel: String?
+        var languageHint = "en"
+
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
+            if (arg == "--model" || arg == "-m"), i + 1 < args.count {
+                requestedModel = args[i + 1]
+                i += 2
+            } else if (arg == "--lang" || arg == "-l"), i + 1 < args.count {
+                languageHint = args[i + 1]
+                i += 2
+            } else if !arg.hasPrefix("-") && audioPath == nil {
+                audioPath = arg
+                i += 1
+            } else {
+                i += 1
+            }
+        }
+
+        guard let audioPath, !audioPath.isEmpty else {
+            print("Usage: heylook-cli transcribe <audio-path> [--model <id_or_path>] [--lang <locale>]")
+            exit(1)
+        }
+
+        let audioURL = URL(fileURLWithPath: (audioPath as NSString).expandingTildeInPath)
+        guard let wavData = try? Data(contentsOf: audioURL) else {
+            print("Error: unable to read audio file at \(audioURL.path)")
+            exit(1)
+        }
+
+        let scheduler = ComputeScheduler()
+        _ = await registerConfiguredModels(into: scheduler)
+
+        var preferredModelID = requestedModel
+        if let reqModel = requestedModel, !reqModel.isEmpty {
+            let expanded = (reqModel as NSString).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: expanded) {
+                let dirURL = URL(fileURLWithPath: expanded)
+                let arch = HeylookConfig.inspectSpeechRecognizerArchitecture(in: dirURL) ?? "speech_recognizer"
+                let adHocDesc = EngineDescription(
+                    modelID: dirURL.deletingPathExtension().lastPathComponent,
+                    provider: .coreai,
+                    modelPath: dirURL.path,
+                    architecture: ProvenanceField(value: arch, provenance: .derived, effect: .reload),
+                    quantization: ProvenanceField(value: "int4", provenance: .derived, effect: .reload),
+                    computePlacement: ProvenanceField(value: .ane, provenance: .derived, effect: .reload, computePlacement: .ane),
+                    supportsVision: ProvenanceField(value: false, provenance: .derived, effect: .reload),
+                    supportsAudio: ProvenanceField(value: true, provenance: .derived, effect: .reload),
+                    supportsThinking: ProvenanceField(value: false, provenance: .derived, effect: .perRequest),
+                    reasoningFormat: ProvenanceField(value: "none", provenance: .derived, effect: .reload),
+                    templateSource: ProvenanceField(value: "speech_recognizer", provenance: .derived, effect: .reload),
+                    tags: ["asr", "speech"]
+                )
+                let prov = CoreAIProvider(description: adHocDesc, allowSyntheticFallback: false)
+                await scheduler.register(provider: prov, description: adHocDesc)
+                preferredModelID = adHocDesc.modelID
+            }
+        }
+
+        do {
+            let result = try await scheduler.transcribeVoice(
+                wavData: wavData,
+                languageHint: languageHint,
+                preferredASRModelID: preferredModelID,
+                allowSyntheticFallback: false
+            )
+            print("=== Heylook ANE Speech Transcription ===")
+            print(String(format: "  Model     : %@ (backend=%@, placement=%@)", result.modelID, result.backend, result.computePlacement.rawValue))
+            print(String(format: "  Audio     : %.2fs @ %d Hz (rms=%.4f, mel_frames=%d)", result.durationSeconds, result.sampleRateHz, result.rmsEnergy, result.melFrames))
+            print("  Transcript: \(result.text.isEmpty ? "(no speech detected)" : result.text)")
+        } catch {
+            print("Transcription error: \(error.localizedDescription)")
+            exit(1)
+        }
+    }
+
     static func printUsage() {
         print("""
         Usage: heylook-cli <command> [args]
         Commands:
-          doctor | status                               Inspect unified memory, compute lanes, and vector store
-          models                                        Discover LLM/VLM models from configured folders
+          doctor | status                               Inspect unified memory, compute lanes, ASR, and vector store
+          models                                        Discover LLM/VLM/ASR models from configured folders
           index <path> [--sampling fps|content|off] [--no-audio-from-video] [--compute all_gpu|hybrid_ane|all_ane]
                                                         Index files or folders into the multimodal vector store
           search <query> [--dim 768|512|256|128] [--task query|similarity|code|qa|fact] [--media <path>]
@@ -607,6 +696,8 @@ struct HeylookCLI {
           inspect-checkpoint [dir]                      Inspect local EmbeddingGemma-2-2B safetensors checkpoint
           convert-mlx <src-dir> <dst-dir> [--bits 4|8] [--group-size 32|64] [--mode affine|mxfp4|mxfp8|nvfp4] [--calibration standard|q4_zero] [--overwrite] [--dry-run]
                                                         Quantize & shard a safetensors LLM/VLM checkpoint in pure Swift
+          transcribe <audio-path> [--model <id_or_path>] [--lang <locale>]
+                                                        Transcribe WAV/M4A/FLAC speech on the Apple Neural Engine
           eval-lab [--synthetic-self-test]              Run multi-turn KV chain, VLM parity, and MRL Recall@K probes
           chat <prompt>                                 Stream a chat completion with thinking traces
           serve [port]                                  Run the embedded /v1/messages & /v1/embeddings server

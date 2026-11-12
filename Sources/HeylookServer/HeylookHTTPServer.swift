@@ -88,12 +88,14 @@ public struct ConversationVoiceGenerateRequest: Codable, Sendable, Equatable {
     public var model: String
     public var audioBase64: String
     public var languageHint: String?
+    public var asrModel: String?
     public var sampling: SamplerSettings?
 
     public enum CodingKeys: String, CodingKey {
         case model
         case audioBase64 = "audio_base64"
         case languageHint = "language_hint"
+        case asrModel = "asr_model"
         case sampling
     }
 
@@ -101,12 +103,37 @@ public struct ConversationVoiceGenerateRequest: Codable, Sendable, Equatable {
         model: String,
         audioBase64: String,
         languageHint: String? = "en",
+        asrModel: String? = nil,
         sampling: SamplerSettings? = nil
     ) {
         self.model = model
         self.audioBase64 = audioBase64
         self.languageHint = languageHint
+        self.asrModel = asrModel
         self.sampling = sampling
+    }
+}
+
+/// Request payload for `POST /v1/audio/transcriptions` (standalone ANE speech transcription).
+public struct AudioTranscriptionRequest: Codable, Sendable, Equatable {
+    public var audioBase64: String
+    public var languageHint: String?
+    public var model: String?
+
+    public enum CodingKeys: String, CodingKey {
+        case audioBase64 = "audio_base64"
+        case languageHint = "language_hint"
+        case model
+    }
+
+    public init(
+        audioBase64: String,
+        languageHint: String? = "en",
+        model: String? = nil
+    ) {
+        self.audioBase64 = audioBase64
+        self.languageHint = languageHint
+        self.model = model
     }
 }
 
@@ -430,6 +457,7 @@ public actor HeylookRouter {
                 let metalWorkingSetGB: Double
                 let maxRequestMediaBytes: Int
                 let embeddingLimits: EmbeddingRequestLimits
+                let voiceASR: ComputeScheduler.VoiceASRSummary
                 let readOnlyModelConfig: Bool
                 let endpoints: [String]
 
@@ -439,11 +467,13 @@ public actor HeylookRouter {
                     case metalWorkingSetGB = "metal_working_set_gb"
                     case maxRequestMediaBytes = "max_request_media_bytes"
                     case embeddingLimits = "embedding_limits"
+                    case voiceASR = "voice_asr"
                     case readOnlyModelConfig = "read_only_model_config"
                     case endpoints
                 }
             }
             let snap = HardwareMemoryMonitor.snapshot()
+            let asrSummary = await scheduler.voiceASRSummary(allowSyntheticFallback: allowSyntheticFallback)
             return try .json(
                 CapabilitiesEnvelope(
                     deviceName: snap.deviceName,
@@ -451,10 +481,12 @@ public actor HeylookRouter {
                     metalWorkingSetGB: snap.metalRecommendedMaxWorkingSetGB,
                     maxRequestMediaBytes: EmbeddingRequestLimits.maxRequestMediaBytes,
                     embeddingLimits: .default,
+                    voiceASR: asrSummary,
                     readOnlyModelConfig: isReadOnlyConfig || HeylookConfig.isModelConfigReadOnly,
                     endpoints: [
                         "/v1/messages",
                         "/v1/embeddings",
+                        "/v1/audio/transcriptions",
                         "/v1/conversations",
                         "/v1/models",
                         "/v1/presets",
@@ -495,6 +527,28 @@ public actor HeylookRouter {
 
         case ("POST", "/v1/embeddings"):
             return try await handleEmbeddings(body: body)
+
+        case ("POST", "/v1/audio/transcriptions"):
+            let req = try JSONDecoder().decode(AudioTranscriptionRequest.self, from: body)
+            guard let wavData = Data(base64Encoded: req.audioBase64) else {
+                return .error(status: 400, type: "invalid_request_error", message: "Invalid base64 audio payload in /v1/audio/transcriptions.")
+            }
+            do {
+                let transcript = try await scheduler.transcribeVoice(
+                    wavData: wavData,
+                    languageHint: req.languageHint ?? "en",
+                    preferredASRModelID: req.model,
+                    allowSyntheticFallback: allowSyntheticFallback
+                )
+                return try .json(transcript)
+            } catch let schedErr as ComputeSchedulerError {
+                if case .modelNotFound(let missingID) = schedErr {
+                    return .error(status: 404, type: "model_not_found", message: "ASR model '\(missingID)' not found.")
+                }
+                return .error(status: 503, type: "speech_runtime_unavailable", message: schedErr.localizedDescription)
+            } catch {
+                return .error(status: 503, type: "speech_runtime_unavailable", message: error.localizedDescription)
+            }
 
         case ("POST", "/v1/cache/clear"):
             let clearedCount = await scheduler.clearAllCaches()
@@ -1260,28 +1314,24 @@ public actor HeylookRouter {
                 guard let wavData = Data(base64Encoded: voiceReq.audioBase64) else {
                     return .error(status: 400, type: "invalid_request_error", message: "Invalid base64 audio payload in voice-generate.")
                 }
-                let aneProvider = CoreAIProvider(
-                    description: EngineDescription(
-                        modelID: "ane-speech-whisper",
-                        provider: .coreai,
-                        modelPath: "models/ane-speech-whisper.aimodel",
-                        computePlacement: ProvenanceField(
-                            value: .ane,
-                            provenance: .derived,
-                            effect: .reload,
-                            computePlacement: .ane
-                        )
-                    ),
-                    allowSyntheticFallback: allowSyntheticFallback
-                )
                 let transcript: CoreAIProvider.ANESpeechTranscriptionResult
                 do {
-                    transcript = try await aneProvider.transcribeAudio(
+                    transcript = try await scheduler.transcribeVoice(
                         wavData: wavData,
-                        languageHint: voiceReq.languageHint ?? "en"
+                        languageHint: voiceReq.languageHint ?? "en",
+                        preferredASRModelID: voiceReq.asrModel,
+                        allowSyntheticFallback: allowSyntheticFallback
                     )
+                } catch let schedErr as ComputeSchedulerError {
+                    if case .modelNotFound(let missingID) = schedErr {
+                        return .error(status: 404, type: "model_not_found", message: "ASR model '\(missingID)' not found.")
+                    }
+                    return .error(status: 503, type: "speech_runtime_unavailable", message: schedErr.localizedDescription)
                 } catch {
                     return .error(status: 503, type: "speech_runtime_unavailable", message: error.localizedDescription)
+                }
+                guard !transcript.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return .error(status: 422, type: "empty_transcription", message: "No speech detected in audio payload.")
                 }
                 let transcriptJSON = (try? String(data: JSONEncoder().encode(transcript), encoding: .utf8)) ?? "{}"
                 let voiceFrame = "event: heylook_voice_transcribed\ndata: \(transcriptJSON)\n\n"

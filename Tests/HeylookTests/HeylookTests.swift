@@ -1681,14 +1681,17 @@ struct HeylookTests {
             audioBase64: wav.base64EncodedString(),
             languageHint: "en"
         )
-        // Truthful default: even if WAV contains TEXT: bytes, production router (allowSyntheticFallback: false) rejects without real ASR
+        // Truthful default: even if WAV contains TEXT: bytes, production router (allowSyntheticFallback: false)
+        // never trusts inline TEXT: markers — real SpeechTranscriber sees a pure sine tone with zero words (422),
+        // or returns 503 when speech assets are unavailable.
         let strictVoiceResp = await strictVoiceRouter.handle(
             method: "POST",
             path: "/v1/conversations/conv_voice_strict/voice-generate",
             headers: ["Host": "127.0.0.1:8000"],
             body: try JSONEncoder().encode(voiceReq)
         )
-        #expect(strictVoiceResp.status == 503)
+        #expect(strictVoiceResp.status == 422 || strictVoiceResp.status == 503)
+        #expect(try store.listMessages(conversationID: "conv_voice_strict").isEmpty)
 
         let resp = await router.handle(
             method: "POST",
@@ -4093,5 +4096,310 @@ struct HeylookTests {
         try await Task.sleep(for: .milliseconds(20))
         let recordedEvents = await recorder.snapshot()
         #expect(recordedEvents.contains(.dataCleared))
+    }
+
+    // MARK: - Phase 15 (H.1): On-Device ASR & Voice Turn Live Wiring
+
+    @Test("CoreAISpeech Parakeet TDT & Whisper .aimodel manifest inspection, root discovery, and UI generation filter")
+    func testCoreAISpeechBundleManifestAndDiscovery() async throws {
+        let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase15_asr_disc_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        // 1. Parakeet TDT bundle wrapped inside a top-level `<name>.aimodel` directory
+        let parakeetDir = tempRoot.appendingPathComponent("parakeet-tdt-0.6b-v3.aimodel", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: parakeetDir.appendingPathComponent("encoder.aimodel", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: parakeetDir.appendingPathComponent("decoder_step.aimodel", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: parakeetDir.appendingPathComponent("joint.aimodel", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let parakeetMeta: [String: Any] = [
+            "format_version": 1,
+            "kind": "speech_recognizer",
+            "config": [
+                "architecture": "parakeet_tdt",
+                "sample_rate": 16000
+            ]
+        ]
+        let metaData = try JSONSerialization.data(withJSONObject: parakeetMeta, options: [.prettyPrinted])
+        try metaData.write(to: parakeetDir.appendingPathComponent("metadata.json"))
+
+        // 2. Legacy Whisper directory (`encoder.aimodel` + `decoder.aimodel`, no `metadata.json`)
+        let whisperDir = tempRoot.appendingPathComponent("whisper-large-v3-turbo", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: whisperDir.appendingPathComponent("encoder.aimodel", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: whisperDir.appendingPathComponent("decoder.aimodel", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        // 3. Verify CoreAIBundleManifest inspection on both layouts
+        let parakeetManifest = try CoreAIBundleManifest.inspect(at: parakeetDir)
+        #expect(parakeetManifest.isSpeechRecognizer == true)
+        #expect(parakeetManifest.speechArchitecture == "parakeet_tdt")
+
+        let whisperManifest = try CoreAIBundleManifest.inspect(at: whisperDir)
+        #expect(whisperManifest.isSpeechRecognizer == true)
+        #expect(whisperManifest.speechArchitecture == "whisper")
+
+        // 4. Verify HeylookConfig.discoverModels keeps top-level `.aimodel` bundle root (never shifts to tempRoot!)
+        let discovered = HeylookConfig.discoverModels(in: [tempRoot])
+        #expect(discovered.count == 2)
+
+        let parakeetDesc = try #require(discovered.first(where: { $0.modelID.contains("parakeet-tdt") }))
+        #expect(URL(fileURLWithPath: parakeetDesc.modelPath).standardizedFileURL == parakeetDir.standardizedFileURL)
+        #expect(parakeetDesc.provider == .coreai)
+        #expect(parakeetDesc.computePlacement.value == .ane)
+        #expect(parakeetDesc.architecture.value == "parakeet_tdt")
+        #expect(parakeetDesc.supportsAudio.value == true)
+        #expect(parakeetDesc.supportsVision.value == false)
+        #expect(parakeetDesc.supportsThinking.value == false)
+        #expect(parakeetDesc.isSpeechRecognizer == true)
+        #expect(parakeetDesc.tags.contains("asr"))
+        #expect(parakeetDesc.tags.contains("speech"))
+
+        let whisperDesc = try #require(discovered.first(where: { $0.modelID == "whisper-large-v3-turbo" }))
+        #expect(URL(fileURLWithPath: whisperDesc.modelPath).standardizedFileURL == whisperDir.standardizedFileURL)
+        #expect(whisperDesc.architecture.value == "whisper")
+        #expect(whisperDesc.isSpeechRecognizer == true)
+
+        // 5. Verify HeylookWorkbenchViewModel filters pure ASR models out of `generationModels` while exposing `availableASRModels`
+        let llmDesc = EngineDescription(
+            modelID: "qwen3-4b-mlx",
+            provider: .mlx,
+            modelPath: tempRoot.path,
+            isLoaded: true
+        )
+        let vm = await MainActor.run { () -> HeylookWorkbenchViewModel in
+            let model = HeylookWorkbenchViewModel(autoBootstrap: false)
+            model.registeredModels = [llmDesc, parakeetDesc, whisperDesc]
+            return model
+        }
+        let genIDs = await MainActor.run { vm.generationModels.map(\.modelID) }
+        let asrIDs = await MainActor.run { vm.availableASRModels.map(\.modelID) }
+        #expect(genIDs == ["qwen3-4b-mlx"])
+        #expect(asrIDs.contains(parakeetDesc.modelID))
+        #expect(asrIDs.contains(whisperDesc.modelID))
+    }
+
+    @Test("RIFF/WAVE subchunk parser skips 4 KB FLLR alignment padding and resamples 48 kHz stereo to 16 kHz mono")
+    func testWAVDecodingWithFLLRAlignmentAndMultiRate() async throws {
+        // Build a 0.25s 48 kHz 2-channel 16-bit PCM WAV with a 4,096-byte zero-filled `FLLR` chunk before `data`
+        // (matching Apple AVAudioRecorder's page-aligned WAV output).
+        let srcRate: UInt32 = 48_000
+        let channels: UInt16 = 2
+        let frameCount = 12_000 // 0.25s @ 48 kHz
+        let fllrPayload = Data(repeating: 0, count: 4_096)
+
+        var stereoPCM = Data(capacity: frameCount * Int(channels) * 2)
+        for frame in 0..<frameCount {
+            let angle = 2.0 * Double.pi * 440.0 * Double(frame) / Double(srcRate)
+            let sample = Int16((sin(angle) * 16_384.0).rounded()).littleEndian
+            // Left + Right channels
+            withUnsafeBytes(of: sample) { stereoPCM.append(contentsOf: $0) }
+            withUnsafeBytes(of: sample) { stereoPCM.append(contentsOf: $0) }
+        }
+
+        let fmtSize: UInt32 = 16
+        let fllrSize = UInt32(fllrPayload.count)
+        let dataSize = UInt32(stereoPCM.count)
+        let riffBodySize: UInt32 = 4 + (8 + fmtSize) + (8 + fllrSize) + (8 + dataSize)
+
+        var wav = Data("RIFF".utf8)
+        var riffLE = riffBodySize.littleEndian
+        withUnsafeBytes(of: &riffLE) { wav.append(contentsOf: $0) }
+        wav.append(Data("WAVE".utf8))
+
+        // `fmt ` chunk
+        wav.append(Data("fmt ".utf8))
+        var fmtLenLE = fmtSize.littleEndian
+        var audioFmtLE = UInt16(1).littleEndian
+        var chanLE = channels.littleEndian
+        var srLE = srcRate.littleEndian
+        var byteRateLE = (srcRate * UInt32(channels) * 2).littleEndian
+        var blockAlignLE = (channels * 2).littleEndian
+        var bpsLE = UInt16(16).littleEndian
+        withUnsafeBytes(of: &fmtLenLE) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &audioFmtLE) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &chanLE) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &srLE) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &byteRateLE) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &blockAlignLE) { wav.append(contentsOf: $0) }
+        withUnsafeBytes(of: &bpsLE) { wav.append(contentsOf: $0) }
+
+        // `FLLR` 4 KB zero-alignment chunk (breaks naive byte-44 parsers!)
+        wav.append(Data("FLLR".utf8))
+        var fllrLenLE = fllrSize.littleEndian
+        withUnsafeBytes(of: &fllrLenLE) { wav.append(contentsOf: $0) }
+        wav.append(fllrPayload)
+
+        // `data` chunk
+        wav.append(Data("data".utf8))
+        var dataLenLE = dataSize.littleEndian
+        withUnsafeBytes(of: &dataLenLE) { wav.append(contentsOf: $0) }
+        wav.append(stereoPCM)
+
+        let decoded16k = await CoreAIProvider.decodeAudioMonoPCM(from: wav, targetSampleRate: 16_000)
+        // 0.25s @ 16 kHz = ~4,000 samples (never inflated by the 4,096 zero bytes of `FLLR`!)
+        #expect(abs(decoded16k.count - 4_000) <= 4)
+
+        // Early samples (first 200 samples = 12.5 ms) must carry real sine energy, NOT FLLR zeros!
+        let earlySlice = decoded16k.prefix(200)
+        let earlySumSq = earlySlice.reduce(0.0) { $0 + Double($1 * $1) }
+        let earlyRMS = sqrt(earlySumSq / Double(max(1, earlySlice.count)))
+        #expect(earlyRMS > 0.20)
+    }
+
+    @Test("ComputeScheduler persistent ANE ASR residency, POST /v1/audio/transcriptions, capabilities, and empty-speech 422")
+    func testComputeSchedulerPersistentASRResidencyAndVoiceRoutes() async throws {
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("heylook_phase15_routes_\(UUID().uuidString)", isDirectory: true)
+        let asrDir = tempDir.appendingPathComponent("parakeet-asr.aimodel", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: asrDir.appendingPathComponent("encoder.aimodel", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let meta: [String: Any] = [
+            "format_version": 1,
+            "kind": "speech_recognizer",
+            "config": ["architecture": "parakeet_tdt", "sample_rate": 16000]
+        ]
+        try JSONSerialization.data(withJSONObject: meta).write(to: asrDir.appendingPathComponent("metadata.json"))
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = try SQLiteStore(databaseURL: tempDir.appendingPathComponent("routes.sqlite"))
+        let scheduler = ComputeScheduler()
+
+        let llmDesc = EngineDescription(
+            modelID: "chat-gpu-mlx",
+            provider: .mlx,
+            modelPath: tempDir.path,
+            isLoaded: true
+        )
+        let asrDesc = try #require(HeylookConfig.discoverModels(in: [tempDir]).first)
+        await scheduler.register(
+            provider: MLXSwiftProvider(description: llmDesc, allowSyntheticFallback: true),
+            description: llmDesc
+        )
+        await scheduler.register(
+            provider: CoreAIProvider(description: asrDesc, allowSyntheticFallback: true),
+            description: asrDesc
+        )
+
+        let router = HeylookRouter(store: store, scheduler: scheduler, allowSyntheticFallback: true)
+        let hostHdr = ["Host": "127.0.0.1:8000"]
+
+        // 1. GET /v1/capabilities exposes `voice_asr` and `/v1/audio/transcriptions`
+        let capResp = await router.handle(method: "GET", path: "/v1/capabilities", headers: hostHdr)
+        #expect(capResp.status == 200)
+        let capJSON = try #require(try JSONSerialization.jsonObject(with: capResp.body) as? [String: Any])
+        let endpoints = (capJSON["endpoints"] as? [String]) ?? []
+        #expect(endpoints.contains("/v1/audio/transcriptions"))
+        let voiceASR = try #require(capJSON["voice_asr"] as? [String: Any])
+        #expect((voiceASR["available"] as? Bool) == true)
+        #expect(((voiceASR["models"] as? [String]) ?? []).contains(asrDesc.modelID))
+
+        // 2. Synthesize 16 kHz WAV with spoken fixture marker and call POST /v1/audio/transcriptions
+        var samples = [Float](repeating: 0.25, count: 4_000)
+        samples[0] = 0.3
+        var wavWithSpeech = CoreAIProvider.encodeCanonicalPCM16WAV(samples: samples, sampleRate: 16_000)
+        wavWithSpeech.append(Data("TEXT:Hello heterogeneous ANE lane".utf8))
+
+        let transReq = AudioTranscriptionRequest(
+            audioBase64: wavWithSpeech.base64EncodedString(),
+            languageHint: "en",
+            model: asrDesc.modelID
+        )
+        let transResp = await router.handle(
+            method: "POST",
+            path: "/v1/audio/transcriptions",
+            headers: hostHdr,
+            body: try JSONEncoder().encode(transReq)
+        )
+        #expect(transResp.status == 200)
+        let decodedTrans = try JSONDecoder().decode(CoreAIProvider.ANESpeechTranscriptionResult.self, from: transResp.body)
+        #expect(decodedTrans.text == "Hello heterogeneous ANE lane")
+        #expect(decodedTrans.modelID == asrDesc.modelID)
+        #expect(decodedTrans.computePlacement == .ane)
+
+        // Verify ANE ASR model stays resident alongside GPU LLM without evicting GPU LLM!
+        let metrics = await scheduler.metrics()
+        #expect(metrics.loadedGPUModels.contains("chat-gpu-mlx"))
+        #expect(metrics.loadedANEModels.contains(asrDesc.modelID))
+
+        // 3. Missing explicit ASR model returns 404
+        let missingReq = AudioTranscriptionRequest(
+            audioBase64: wavWithSpeech.base64EncodedString(),
+            model: "nonexistent-asr-bundle"
+        )
+        let missingResp = await router.handle(
+            method: "POST",
+            path: "/v1/audio/transcriptions",
+            headers: hostHdr,
+            body: try JSONEncoder().encode(missingReq)
+        )
+        #expect(missingResp.status == 404)
+
+        // 4. Blank/empty transcription in voice-generate returns 422 `empty_transcription` without creating empty user turns
+        var blankSpeechWAV = CoreAIProvider.encodeCanonicalPCM16WAV(samples: [Float](repeating: 0, count: 1_600), sampleRate: 16_000)
+        blankSpeechWAV.append(Data("TEXT:   ".utf8))
+        let emptyVoiceReq = ConversationVoiceGenerateRequest(
+            model: "chat-gpu-mlx",
+            audioBase64: blankSpeechWAV.base64EncodedString(),
+            languageHint: "en",
+            asrModel: asrDesc.modelID
+        )
+        let emptyVoiceResp = await router.handle(
+            method: "POST",
+            path: "/v1/conversations/conv_empty_voice/voice-generate",
+            headers: hostHdr,
+            body: try JSONEncoder().encode(emptyVoiceReq)
+        )
+        #expect(emptyVoiceResp.status == 422)
+        #expect(try store.listMessages(conversationID: "conv_empty_voice").isEmpty)
+    }
+
+    @Test("System SpeechTranscriber out-of-the-box ANE gate and Dictate-to-Composer Workbench behavior")
+    func testSystemSpeechTranscriberAvailabilityGate() async throws {
+        let scheduler = ComputeScheduler()
+        let summary = await scheduler.voiceASRSummary()
+        if CoreAIProvider.isSystemSpeechAvailable {
+            #expect(summary.available == true)
+            #expect(summary.models.contains(CoreAIProvider.systemSpeechModelID))
+
+            // Zero-energy silent WAV fast-paths cleanly to empty text with zero synthetic strings!
+            let silentWAV = CoreAIProvider.encodeCanonicalPCM16WAV(
+                samples: [Float](repeating: 0, count: 3_200),
+                sampleRate: 16_000
+            )
+            let silentResult = try await scheduler.transcribeVoice(
+                wavData: silentWAV,
+                languageHint: "en",
+                preferredASRModelID: CoreAIProvider.systemSpeechModelID,
+                allowSyntheticFallback: false
+            )
+            #expect(silentResult.text.isEmpty)
+            #expect(silentResult.backend == "apple_speech_transcriber")
+            #expect(silentResult.modelID == CoreAIProvider.systemSpeechModelID)
+            #expect(silentResult.computePlacement == .ane)
+
+            let metricsAfter = await scheduler.metrics()
+            #expect(metricsAfter.loadedANEModels.contains(CoreAIProvider.systemSpeechModelID))
+        }
+
+        // Verify Workbench default is Dictate-to-Composer (`autoSendVoiceTurn == false`)
+        let vm = await MainActor.run { HeylookWorkbenchViewModel(autoBootstrap: false) }
+        let autoSendDefault = await MainActor.run { vm.autoSendVoiceTurn }
+        #expect(autoSendDefault == false)
     }
 }

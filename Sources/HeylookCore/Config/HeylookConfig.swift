@@ -1374,11 +1374,20 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                     defaultPlacement = .mlxGPU
                 } else if ext == "aimodel" || ext == "mlmodelc" {
                     let parentDir = url.deletingLastPathComponent()
+                    let urlLower = url.lastPathComponent.lowercased()
                     // Skip auxiliary ANE tower sub-bundles inside an MLX checkpoint's `coreml/` or `ane/` folder
-                    if drafterSubfolderNames.contains(parentDir.lastPathComponent.lowercased()) {
+                    if drafterSubfolderNames.contains(parentDir.lastPathComponent.lowercased())
+                        || drafterSubfolderNames.contains(urlLower) {
+                        enumerator.skipDescendants()
                         continue
                     }
-                    candidateDir = parentDir
+                    guard let resolvedRoot = resolveCoreAIBundleRoot(for: url, scanRoot: expandedRoot) else {
+                        continue
+                    }
+                    if resolvedRoot.standardizedFileURL.path == url.standardizedFileURL.path {
+                        enumerator.skipDescendants()
+                    }
+                    candidateDir = resolvedRoot
                     detectedProvider = .coreai
                     defaultPlacement = .ane
                 } else if ext == "gguf" {
@@ -1470,6 +1479,52 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return byID.values.sorted { $0.modelID.localizedStandardCompare($1.modelID) == .orderedAscending }
     }
 
+    /// Resolves the canonical root directory for a discovered `.aimodel` or `.mlmodelc` entry without
+    /// ever collapsing a top-level `<model>.aimodel` directory into its parent `scanRoot`.
+    private static func resolveCoreAIBundleRoot(for url: URL, scanRoot: URL) -> URL? {
+        let fm = FileManager.default
+        let standardizedURL = url.standardizedFileURL
+        let standardizedScanRoot = scanRoot.standardizedFileURL
+        let parentDir = standardizedURL.deletingLastPathComponent()
+
+        var isDir: ObjCBool = false
+        let existsAsDir = fm.fileExists(atPath: standardizedURL.path, isDirectory: &isDir) && isDir.boolValue
+        if existsAsDir {
+            let hasManifest = fm.fileExists(atPath: standardizedURL.appendingPathComponent("metadata.json").path)
+            let hasWhisperAssets = fm.fileExists(atPath: standardizedURL.appendingPathComponent("encoder.aimodel").path)
+                && fm.fileExists(atPath: standardizedURL.appendingPathComponent("decoder.aimodel").path)
+            if hasManifest || hasWhisperAssets || parentDir.path == standardizedScanRoot.path {
+                return standardizedURL
+            }
+        }
+        guard parentDir.path != standardizedScanRoot.path else {
+            return existsAsDir ? standardizedURL : nil
+        }
+        return parentDir
+    }
+
+    /// Inspects a Core AI bundle directory for `speech_recognizer` metadata (`parakeet_tdt` / `whisper`)
+    /// or legacy Whisper `encoder.aimodel` + `decoder.aimodel` assets.
+    public static func inspectSpeechRecognizerArchitecture(in bundleDir: URL) -> String? {
+        let fm = FileManager.default
+        if let meta = loadJSONDictionary(at: bundleDir.appendingPathComponent("metadata.json")),
+           let kind = (meta["kind"] as? String)?.lowercased(),
+           kind == "speech_recognizer" {
+            if let cfg = meta["config"] as? [String: Any],
+               let arch = cfg["architecture"] as? String,
+               !arch.isEmpty {
+                return arch.lowercased()
+            }
+            return "whisper"
+        }
+        let hasWhisperEncoder = fm.fileExists(atPath: bundleDir.appendingPathComponent("encoder.aimodel").path)
+        let hasWhisperDecoder = fm.fileExists(atPath: bundleDir.appendingPathComponent("decoder.aimodel").path)
+        if hasWhisperEncoder && hasWhisperDecoder {
+            return "whisper"
+        }
+        return nil
+    }
+
     private static func buildEngineDescription(
         for candidateDir: URL,
         detectedProvider: EngineProviderKind,
@@ -1505,27 +1560,44 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         let placementProv: ProvenanceSource = sidecar?.computePlacement != nil ? .configured : .derived
 
         let ggufHeader = primaryGGUFURL.flatMap { GGUFHeaderReader.readFileHeader(at: $0) }
-        let archString = (configJSON?["model_type"] as? String)
+        let speechBundleArch = provider == .coreai ? inspectSpeechRecognizerArchitecture(in: candidateDir) : nil
+        let isSpeechBundle = speechBundleArch != nil
+        let coreAIMeta = provider == .coreai ? loadJSONDictionary(at: candidateDir.appendingPathComponent("metadata.json")) : nil
+        let coreAILangArch = ((coreAIMeta?["language"] as? [String: Any])?["architecture"] as? String)
+            ?? (coreAIMeta?["model_type"] as? String)
+        let archString = speechBundleArch
+            ?? (configJSON?["model_type"] as? String)
             ?? (configJSON?["architectures"] as? [String])?.first
+            ?? coreAILangArch
             ?? ggufHeader?.architecture
             ?? provider.rawValue
-        let isEmbedding = modelID.localizedCaseInsensitiveContains("embed")
+        let isEmbedding = !isSpeechBundle && (
+            modelID.localizedCaseInsensitiveContains("embed")
             || archString.localizedCaseInsensitiveContains("embedding")
+            || (coreAIMeta?["kind"] as? String)?.lowercased() == "embedding"
+        )
         let mmprojPath = provider == .gguf ? discoverMMProj(in: candidateDir) : nil
         let mmprojHeader = mmprojPath.flatMap { GGUFHeaderReader.readFileHeader(at: URL(fileURLWithPath: $0)) }
-        let rawHasVision = ModelTemplateInfo.hasVisionConfiguration(in: candidateDir, configJSON: configJSON)
+        let rawHasVision = !isSpeechBundle && (
+            ModelTemplateInfo.hasVisionConfiguration(in: candidateDir, configJSON: configJSON)
             || mmprojHeader?.hasVisionEncoder == true
             || mmprojPath != nil
             || isEmbedding
+        )
         let hasVision = sidecar?.supportsVision ?? rawHasVision
-        let hasAudio = configJSON?["audio_config"] != nil
+        let hasAudio = isSpeechBundle
+            || configJSON?["audio_config"] != nil
             || mmprojHeader?.hasAudioEncoder == true
             || isEmbedding
+        let coreAIMaxCtx = (coreAIMeta?["maxContextLength"] as? Int)
+            ?? (coreAIMeta?["max_context_length"] as? Int)
+            ?? ((coreAIMeta?["language"] as? [String: Any])?["max_context_length"] as? Int)
         let ctxValue = sidecar?.ctxSize
             ?? (configJSON?["max_position_embeddings"] as? Int)
             ?? ((configJSON?["text_config"] as? [String: Any])?["max_position_embeddings"] as? Int)
+            ?? coreAIMaxCtx
             ?? ggufHeader?.contextLength
-            ?? 8192
+            ?? (isSpeechBundle ? 448 : 8192)
 
         let templateInfo = ModelTemplateInfo.inspect(
             modelDirectory: candidateDir,
@@ -1539,6 +1611,12 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             } else {
                 templateField = ownTemplate.source
             }
+        } else if isSpeechBundle {
+            templateField = ProvenanceField(
+                value: "speech_recognizer",
+                provenance: .notApplicable,
+                effect: .reload
+            )
         } else {
             let resolvedSource = templateInfo.templateSource == "default_chatml"
                 ? "tokenizer_config.json"
@@ -1550,7 +1628,7 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             )
         }
         let derivedSupportsThinking: Bool
-        if isEmbedding {
+        if isEmbedding || isSpeechBundle {
             derivedSupportsThinking = false
         } else if templateInfo.templateSource != "default_chatml" {
             derivedSupportsThinking = templateInfo.thinkingControls.supportsThinking
@@ -1559,6 +1637,10 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         }
 
         var tags = sidecar?.tags ?? []
+        if isSpeechBundle {
+            if !tags.contains("asr") { tags.append("asr") }
+            if !tags.contains("speech") { tags.append("speech") }
+        }
         let drafter = discoverDrafter(in: candidateDir, provider: provider, sidecar: sidecar)
         if drafter.draftModelPath != nil || drafter.specType != nil || ggufHeader?.hasBuiltInMTP == true {
             if !tags.contains("mtp") {

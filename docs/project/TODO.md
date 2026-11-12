@@ -184,10 +184,24 @@ Tracks the phased port of `heylookitsanllm` + `mbed` into a unified Swift 6.2 mu
 
 ---
 
-## Next Horizons (Optional Post-Phase 14 Frontiers)
+## Phase 15 (H.1): On-Device ASR & Voice Turn Live Wiring (`System SpeechTranscriber` + `CoreAISpeech`) (Done)
 
-- [ ] **H.1 On-Device ASR Tower Integration (`CoreAISpeech` / `WhisperKit`)**:
-  - Link a compiled `WhisperKit` or `CoreAISpeech` speech-to-text bundle inside `CoreAIProvider.transcribeAudio` so `/v1/conversations/{id}/voice-generate` performs lexical speech transcription out of the box when an ASR model is installed.
+- [x] **15.1 Dual-Tier On-Device ANE Speech Recognition (`CoreAIProvider` & `Package.swift`)**:
+  - Linked `Speech` and `AVFoundation` on `HeylookEngines` plus optional `CoreAISpeech` (`apple/coreai-models` under `HEYLOOK_ENABLE_COREAI=1`), wiring **Tier A** out-of-the-box Apple `SpeechAnalyzer` + `SpeechTranscriber` (`apple-speech-transcriber`) and **Tier B** `CoreAISpeech.SpeechRecognitionModel` (`Whisper` & `Parakeet TDT` `.aimodel` bundles) inside `CoreAIProvider.transcribeAudio(wavData:languageHint:)`.
+  - Replaced naive byte-44 WAV slicing with `CoreAIProvider.decodeRIFFChunksMonoPCM` + `ArtifactProcessor.decodeMonoPCM` so `AVAudioRecorder` 4 KB `FLLR` alignment padding and arbitrary sample rates/channels decode accurately to 16 kHz mono `Float32`.
+- [x] **15.2 Speech Bundle Discovery, Persistent ANE Residency & `/v1/audio/transcriptions` (`HeylookCore`, `HeylookEngines`, `HeylookServer`)**:
+  - Added `EngineDescription.isSpeechRecognizer`, `HeylookConfig.resolveCoreAIBundleRoot(for:scanRoot:)`, and `inspectSpeechRecognizerArchitecture(in:)` so top-level `<model>.aimodel` directories never shift to their parent `scanRoot` and auto-derive `parakeet_tdt`/`whisper` capabilities.
+  - Added persistent ANE-lane ASR residency in `ComputeScheduler.transcribeVoice` + `voiceASRSummary()`, added standalone `POST /v1/audio/transcriptions`, upgraded `POST /v1/conversations/{id}/voice-generate` with `asr_model` override and `422 empty_transcription` silence protection, and enriched `GET /v1/capabilities` with `voice_asr`.
+- [x] **15.3 Workbench Composer Dictation, `heylook-cli transcribe` & Export Scripts (`HeylookUI`, `HeylookCLI`, `scripts/`)**:
+  - Enabled out-of-the-box composer Mic dictation (`transcribeVoiceToComposer` Dictate-to-Composer default + `⌥`-click / context-menu Hands-Free Auto-Send + microphone permission prompt + ASR model selector), filtered pure ASR bundles out of `generationModels`, added `heylook-cli transcribe <audio-path>` + `doctor` Voice ASR diagnostics, and added `whisper` & `parakeet` subcommands to `scripts/export_coreai.sh` + `NSSpeechRecognitionUsageDescription` in `scripts/build_native.sh`.
+- [x] **15.4 Verification Suite (`HeylookTests`)**:
+  - Expanded `HeylookTests` to `44/44` passing unit, lifecycle, RIFF/`FLLR` audio, ANE ASR residency, and `/v1/*` wire tests.
+
+---
+
+## Next Horizons (Optional Post-Phase 15 Frontiers)
+
+- [x] **H.1 On-Device ASR Tower Integration (`System SpeechTranscriber` + `CoreAISpeech`)**: Completed in Phase 15 above.
 - [ ] **H.2 Live Hardware Conversion & Throughput Certification**:
   - Run live `heylook-cli convert-mlx` (`4-bit affine`, `mxfp4`, `q4_zero`) and `scripts/export_coreai.sh` against resident unquantized BF16 checkpoints and compare prefill/decode behavior and memory residency across Tier 1 (`MLXSwiftProvider`) and Tier 2 (`CoreAIProvider`).
 - [ ] **H.3 Physical `iOS 27.2+` Device Deployment & Hybrid Failover**:

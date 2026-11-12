@@ -130,7 +130,9 @@ The right-hand `.inspector` column has two tabs:
 - **Images, Audio & Video Attachments**: Click the **Paperclip (`Attach Media`)** button (`NSOpenPanel` on macOS, `.fileImporter` on iOS) to stage `.png`, `.jpg`, `.webp`, `.wav`, or `.mp4` files.
   - Each staged **`ChatAttachmentPillView`** shows its modality icon, filename, estimated vision soft-token budget (`~280 tok`, derived from the model's vision config), and a `28×28` remove button.
   - If the active model does not support vision or audio, `ChatComposerBar` displays an inline capability warning before you send.
-- **Hands-Free ANE Voice Turn (`Mic`)**: Click the **Microphone** button to record `16 kHz` mono PCM audio and click **Stop (waveform)** to transcribe speech on the Apple Neural Engine (`CoreAIProvider.transcribeAudio`) and hand off into disconnect-resilient generation (`POST /v1/conversations/{id}/voice-generate`).
+- **On-Device ANE Voice Dictation & Hands-Free Turns (`Mic`)**:
+  - **Default (`Dictate-to-Composer`)**: Click the **Microphone** button to record `16 kHz` mono PCM audio and click **Stop (waveform)** to transcribe on the Apple Neural Engine (`CoreAIProvider.transcribeAudio`) directly into the composer text field so you can review or edit before sending.
+  - **Hands-Free Auto-Send (`⌥`-Click or Context Menu)**: `Option`-click the Microphone button—or right-click / long-press it to toggle **Auto-Send Voice Turn** and pick your active ASR engine (`Apple SpeechTranscriber` out of the box, or any discovered `CoreAISpeech` `Parakeet TDT` / `Whisper` bundle)—to stream directly into disconnect-resilient generation (`POST /v1/conversations/{id}/voice-generate`).
 
 ### Keyboard Shortcuts
 
@@ -263,6 +265,7 @@ Run via `./scripts/build_native.sh cli <subcommand>` (full Metal + MLX build) or
 | `status` | Print dual-lane scheduler state, memory budget, and vector store counts:<br>`./scripts/build_native.sh cli status` |
 | `models` | List all discovered models from `heylook.toml` with provider, placement, context length, thinking format, and template source:<br>`./scripts/build_native.sh cli models` |
 | `chat` | Stream live inference in the terminal with thinking & sampler flags:<br>`./scripts/build_native.sh cli chat --model Qwen3.5-0.8B-MLX-8bit --max-tokens 256 "Hello!"` |
+| `transcribe` | Transcribe an audio file (`WAV`, `M4A`, `MP3`, `FLAC`) on the Apple Neural Engine via `SpeechTranscriber` or an exported `CoreAISpeech` bundle:<br>`./scripts/build_native.sh cli transcribe ./clip.wav --lang en-US` |
 | `serve` | Start the standalone `/v1/*` HTTP/SSE server and Bonjour advertiser:<br>`./scripts/build_native.sh cli serve 8000` |
 | `index` | Index a directory or file into the SQLite Matryoshka vector store:<br>`./scripts/build_native.sh cli index ./docs --sampling content --audio-from-video --compute hybrid_ane` |
 | `search` | Search indexed artifacts with Matryoshka dimension slicing and task prompts:<br>`./scripts/build_native.sh cli search "dual-lane scheduler" --dim 512 --task query` |
@@ -312,4 +315,16 @@ curl http://127.0.0.1:8000/v1/embeddings \
     "task": "query",
     "input": ["heterogeneous Apple Silicon ANE and GPU scheduling"]
   }'
+```
+
+### On-Device Speech Transcription (`POST /v1/audio/transcriptions`)
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"audio_base64\": \"$(base64 -i ./clip.wav)\",
+    \"language_hint\": \"en-US\",
+    \"model\": \"apple-speech-transcriber\"
+  }"
 ```

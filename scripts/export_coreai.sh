@@ -68,6 +68,30 @@ case "${SUBCOMMAND}" in
     cd "${REPO}"
     exec uv run coreai.embedding.export "${MODEL_NAME}" --output-dir "${DEFAULT_OUT_DIR}" "$@"
     ;;
+  whisper)
+    MODEL_ID="${1:-openai/whisper-large-v3-turbo}"
+    if [[ $# -gt 0 && "${1}" != --* ]]; then
+      shift
+    else
+      MODEL_ID="openai/whisper-large-v3-turbo"
+    fi
+    REPO="$(resolve_coreai_repo)"
+    mkdir -p "${DEFAULT_OUT_DIR}"
+    cd "${REPO}/models/whisper"
+    exec uv run export.py --model "${MODEL_ID}" --output-dir "${DEFAULT_OUT_DIR}" "$@"
+    ;;
+  parakeet)
+    MODEL_ID="${1:-nvidia/parakeet-tdt-0.6b-v3}"
+    if [[ $# -gt 0 && "${1}" != --* ]]; then
+      shift
+    else
+      MODEL_ID="nvidia/parakeet-tdt-0.6b-v3"
+    fi
+    REPO="$(resolve_coreai_repo)"
+    mkdir -p "${DEFAULT_OUT_DIR}"
+    cd "${REPO}/models/parakeet"
+    exec uv run export.py --model "${MODEL_ID}" --output-dir "${DEFAULT_OUT_DIR}" "$@"
+    ;;
   compile)
     if [[ $# -lt 1 ]]; then
       echo "Usage: $0 compile <path/to/model.aimodel> [--platform macOS|iOS]" >&2
@@ -94,6 +118,14 @@ Subcommands:
 
   embedding [embeddinggemma-2] [--platform macOS|iOS] [--text-only] [args...]
       Export EmbeddingGemma 2 to `.aimodel` (macOS GPU or iOS ANE).
+
+  whisper [openai/whisper-large-v3-turbo|openai/whisper-large-v3] [--dtype float16|bfloat16|float32] [--overwrite]
+      Export a CoreAISpeech Whisper ASR bundle (`encoder.aimodel` + `decoder.aimodel`)
+      to `${HEYLOOK_MODELS_DIR:-~/.heylook/models}`.
+
+  parakeet [nvidia/parakeet-tdt-0.6b-v3|nvidia/parakeet-tdt-0.6b-v2] [--dtype float16|float32] [--dynamic] [--streaming] [--overwrite]
+      Export a CoreAISpeech Parakeet TDT ASR bundle (`metadata.json` + `encoder`/`decoder_step`/`joint` `.aimodel` + `processor/`)
+      to `${HEYLOOK_MODELS_DIR:-~/.heylook/models}`.
 
   compile <path/to/model.aimodel> [--platform macOS|iOS]
       Ahead-of-time compile a `.aimodel` asset using `xcrun coreai-build compile`.

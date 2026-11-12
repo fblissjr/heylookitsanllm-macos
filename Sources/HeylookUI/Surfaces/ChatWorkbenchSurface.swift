@@ -1143,6 +1143,60 @@ private struct ChatComposerBar: View {
                 }
             }
 
+            if viewModel.isRecordingVoice {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform.circle.fill")
+                        .foregroundStyle(.red)
+                    Text("Recording 16 kHz mono — \(viewModel.activeASRBackendLabel)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.red)
+                    Spacer()
+                    Button("Stop") {
+                        viewModel.toggleVoiceRecording()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2.weight(.semibold))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 7)
+                        .fill(Color.red.opacity(0.10))
+                )
+            } else if let voiceResult = viewModel.lastVoiceTranscription, !voiceResult.text.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform.badge.magnifyingglass")
+                        .foregroundStyle(.teal)
+                    Text(
+                        String(
+                            format: "ASR: %@ • %.1fs • %@ (%d mel)",
+                            voiceResult.modelID,
+                            voiceResult.durationSeconds,
+                            voiceResult.computePlacement.rawValue.uppercased(),
+                            voiceResult.melFrames
+                        )
+                    )
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        viewModel.lastVoiceTranscription = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss voice transcription summary")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 7)
+                        .fill(Color.teal.opacity(0.08))
+                )
+            }
+
             HStack(alignment: .bottom, spacing: 10) {
                 Button {
                     showAttachmentImporter = true
@@ -1171,15 +1225,48 @@ private struct ChatComposerBar: View {
 
                 if viewModel.isVoiceASRConfigured {
                     Button {
+                        #if os(macOS)
+                        let optionHeld = NSEvent.modifierFlags.contains(.option)
+                        viewModel.toggleVoiceRecording(autoSendOnStop: optionHeld ? true : nil)
+                        #else
                         viewModel.toggleVoiceRecording()
+                        #endif
                     } label: {
-                        Image(systemName: viewModel.isRecordingVoice ? "waveform.circle.fill" : "mic")
+                        Image(systemName: viewModel.isRecordingVoice ? "waveform.circle.fill" : (viewModel.autoSendVoiceTurn ? "mic.badge.plus" : "mic"))
                             .font(.system(size: 15, weight: .medium))
                             .foregroundStyle(viewModel.isRecordingVoice ? .red : .primary)
                             .padding(7)
                     }
                     .buttonStyle(.bordered)
-                    .help(viewModel.isRecordingVoice ? "Stop Recording & Transcribe" : "Voice Input (Local Whisper ASR)")
+                    .contextMenu {
+                        Toggle("Hands-Free Auto-Send on Stop", isOn: $viewModel.autoSendVoiceTurn)
+                        if !viewModel.availableASRModels.isEmpty {
+                            Divider()
+                            Button {
+                                viewModel.selectedASRModelID = nil
+                            } label: {
+                                Label(
+                                    "Automatic (\(viewModel.activeASRBackendLabel))",
+                                    systemImage: viewModel.selectedASRModelID == nil ? "checkmark" : "waveform"
+                                )
+                            }
+                            ForEach(viewModel.availableASRModels, id: \.modelID) { asrModel in
+                                Button {
+                                    viewModel.selectedASRModelID = asrModel.modelID
+                                } label: {
+                                    Label(
+                                        asrModel.modelID,
+                                        systemImage: viewModel.selectedASRModelID == asrModel.modelID ? "checkmark" : "cpu"
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    .help(
+                        viewModel.isRecordingVoice
+                            ? "Stop Recording & Transcribe"
+                            : "Dictate Voice Input — \(viewModel.activeASRBackendLabel) (⌥-click or right-click for Hands-Free Auto-Send)"
+                    )
                 }
 
                 TextField("Message \(viewModel.selectedModelID.isEmpty ? "model" : viewModel.selectedModelID)… (Shift+Return for newline, ⌘Return or Return to send)", text: $viewModel.draftPrompt, axis: .vertical)

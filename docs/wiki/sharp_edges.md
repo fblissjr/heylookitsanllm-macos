@@ -102,3 +102,17 @@ Every non-obvious mechanism in `heylookitsanllm-macos` exists because a real har
 - **Antigravity (`agy`) Skill Discovery vs. `~/.agents/skills` Sandbox Block**:
   - **What bit**: Exporting Xcode's `xcrun agent skills export` bundles only to `~/.agents/skills/` leaves them outside `agy`'s workspace discovery root (`<repo>/.agents/skills/`) and outside the terminal sandbox's readable paths (`Operation not permitted` when reading `references/*.md`).
   - **The mechanism**: `./scripts/sync_agent_skills.sh` exports Xcode 27.x skills, Xcode's `AdditionalDocumentation` guides, and `apple/coreai-models` skills directly into `<repo>/.agents/skills/` (gitignored), where `agy` discovers them at highest workspace precedence with full in-sandbox read access.
+
+---
+
+## 7. On-Device Audio & `.aimodel` Bundle Discovery Sharp Edges (`HeylookCore` & `HeylookEngines`)
+
+- **Apple `AVAudioRecorder` Writes a ~4 KB `FLLR` Alignment Chunk Before `data`**:
+  - **What bit**: Assuming a WAV file's PCM samples start at fixed byte offset `44` fails silently on recordings captured with macOS/iOS `AVAudioRecorder`: CoreAudio inserts a ~4,052-byte zero-padded `FLLR` subchunk between `fmt ` and `data` to page-align sample data, causing naive offset-44 readers to ingest ~127 ms of leading zeros (or misread stereo/48 kHz frames as 16 kHz mono).
+  - **The mechanism**: `CoreAIProvider.decodeRIFFChunksMonoPCM` walks actual RIFF subchunks (`fmt `, `FLLR`, `JUNK`, `LIST`, `data`), supports 8/16/24/32-bit PCM and IEEE Float32, downmixes multi-channel frames to mono, and resamples arbitrary sample rates to 16 kHz via `ArtifactProcessor.resampleMonoFloatPCM` (falling back to `ArtifactProcessor.decodeMonoPCM` for compressed `M4A`/`MP3`/`FLAC`/`CAF` containers).
+- **Top-Level `<model>.aimodel` Bundle Roots vs. Nested Component `.aimodel` / `.mlmodelc` Subdirectories**:
+  - **What bit**: `coreai-models` ships both single-directory `<name>.aimodel` bundles placed directly inside a scan folder AND multi-component speech/LLM folders whose inner components are named `encoder.aimodel`, `decoder.aimodel`, `decoder_step.aimodel`, `joint.aimodel`, or `main.mlmodelc`. Unconditionally calling `url.deletingLastPathComponent()` on every `.aimodel` directory shifts a top-level `<scanRoot>/parakeet.aimodel` bundle's `modelPath` up to `<scanRoot>` itself!
+  - **The mechanism**: `HeylookConfig.resolveCoreAIBundleRoot(for:scanRoot:)` shifts to the parent directory ONLY when the `.aimodel`/`.mlmodelc` directory is an inner component name (`encoder`, `decoder`, `decoder_step`, `joint`, `main`, `vision`, `audio`, `text`, `embed`, `drafter`) or lives inside an outer `.aimodel` container, and calls `enumerator.skipDescendants()` once a `.aimodel` or `.mlmodelc` package is matched.
+- **`CoreAISpeech.Decoder` Shadows `Swift.Decoder` in `Codable` Initializers**:
+  - **What bit**: When `HEYLOOK_ENABLE_COREAI=1` links `CoreAISpeech` from `apple/coreai-models`, any file importing `CoreAISpeech` inherits `CoreAISpeech.Decoder` (its acoustic speech decoder protocol), causing `init(from decoder: Decoder)` to fail with `value of type 'any Decoder' has no member 'container'`.
+  - **The mechanism**: Always qualify `Codable` initializers in `CoreAIProvider.swift` as `public init(from decoder: any Swift.Decoder) throws`.
