@@ -92,6 +92,17 @@ public enum CacheOutcome: String, Codable, Sendable, Equatable, Hashable {
 
 /// Per-request prompt cache reuse report (`performance.cache` on the Messages wire).
 public struct CacheReport: Codable, Sendable, Equatable, Hashable {
+    /// Canonical machine-readable cache cause tokens shared with the frontend and API spec.
+    public static let knownCauses: [String] = [
+        "cold",
+        "memory",
+        "new_image_set",
+        "no_common_prefix",
+        "probable_template_diverged",
+        "probable_budget_skipped",
+        "probable_evicted",
+    ]
+
     public let promptTokens: Int
     public let cachedTokens: Int
     public let processedTokens: Int
@@ -115,8 +126,44 @@ public struct CacheReport: Codable, Sendable, Equatable, Hashable {
         self.reason = reason
     }
 
+    /// Converts a machine cache cause token into human-readable words matching `frontend/js/utils.js`.
+    /// For example, `"probable_template_diverged"` becomes `"probably template diverged"`.
+    public static func causeWords(_ cause: String) -> String {
+        let trimmed = cause.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if trimmed.hasPrefix("probable_") {
+            let suffix = String(trimmed.dropFirst("probable_".count)).replacingOccurrences(of: "_", with: " ")
+            return "probably \(suffix)"
+        }
+        return trimmed.replacingOccurrences(of: "_", with: " ")
+    }
+
+    /// Human-readable form of `cause`, or `nil` when `cause` is absent/blank.
+    public var humanReadableCause: String? {
+        guard let cause else { return nil }
+        let words = Self.causeWords(cause)
+        return words.isEmpty ? nil : words
+    }
+
     public var summaryBadge: String {
-        "cache \(cachedTokens)/\(promptTokens)"
+        let why = humanReadableCause
+        switch outcome {
+        case .reused:
+            if let why {
+                return "cache \(cachedTokens)/\(promptTokens) (\(why))"
+            }
+            return "cache \(cachedTokens)/\(promptTokens)"
+        case .miss:
+            if let why {
+                return "cache miss: \(why)"
+            }
+            return "cache miss"
+        case .ineligible:
+            if let why {
+                return "cache not used: \(why)"
+            }
+            return "cache not used"
+        }
     }
 }
 
@@ -126,22 +173,100 @@ public struct SpeculativeReport: Codable, Sendable, Equatable, Hashable {
     public let mode: String
     public let draftedTokens: Int
     public let acceptedTokens: Int
+    public let emittedTokens: Int
 
-    public init(drafterID: String, mode: String = "mtp", draftedTokens: Int, acceptedTokens: Int) {
+    enum CodingKeys: String, CodingKey {
+        case drafterID
+        case mode
+        case draftedTokens
+        case acceptedTokens
+        case emittedTokens
+        // Alternate wire spellings for flexible decoding
+        case drafterIdSnake = "drafter_id"
+        case drafted
+        case accepted
+        case emitted
+    }
+
+    public init(
+        drafterID: String,
+        mode: String = "mtp",
+        draftedTokens: Int,
+        acceptedTokens: Int,
+        emittedTokens: Int = 0
+    ) {
         self.drafterID = drafterID
         self.mode = mode
         self.draftedTokens = draftedTokens
         self.acceptedTokens = acceptedTokens
+        self.emittedTokens = emittedTokens
     }
 
-    public var acceptanceShare: Double {
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.drafterID = try c.decodeIfPresent(String.self, forKey: .drafterID)
+            ?? c.decodeIfPresent(String.self, forKey: .drafterIdSnake)
+            ?? ""
+        self.mode = try c.decodeIfPresent(String.self, forKey: .mode) ?? "mtp"
+        self.draftedTokens = try c.decodeIfPresent(Int.self, forKey: .draftedTokens)
+            ?? c.decodeIfPresent(Int.self, forKey: .drafted)
+            ?? 0
+        self.acceptedTokens = try c.decodeIfPresent(Int.self, forKey: .acceptedTokens)
+            ?? c.decodeIfPresent(Int.self, forKey: .accepted)
+            ?? 0
+        self.emittedTokens = try c.decodeIfPresent(Int.self, forKey: .emittedTokens)
+            ?? c.decodeIfPresent(Int.self, forKey: .emitted)
+            ?? 0
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(drafterID, forKey: .drafterID)
+        try c.encode(mode, forKey: .mode)
+        try c.encode(draftedTokens, forKey: .draftedTokens)
+        try c.encode(acceptedTokens, forKey: .acceptedTokens)
+        try c.encode(emittedTokens, forKey: .emittedTokens)
+    }
+
+    /// Fraction of drafted tokens that were accepted (`acceptedTokens / draftedTokens`), or `0` when none drafted.
+    public var acceptanceRate: Double {
         guard draftedTokens > 0 else { return 0 }
         return Double(acceptedTokens) / Double(draftedTokens)
     }
 
+    /// Fraction of emitted tokens sourced from accepted drafts (`acceptedTokens / emittedTokens`), or `0` when none emitted.
+    public var draftShare: Double {
+        guard emittedTokens > 0 else { return 0 }
+        return Double(acceptedTokens) / Double(emittedTokens)
+    }
+
+    /// Nullable `acceptance_rate` for wire serialization matching `schema/responses.py`.
+    public var optionalAcceptanceRate: Double? {
+        guard draftedTokens > 0 else { return nil }
+        return Double(acceptedTokens) / Double(draftedTokens)
+    }
+
+    /// Nullable `draft_share` for wire serialization matching `schema/responses.py`.
+    public var optionalDraftShare: Double? {
+        guard emittedTokens > 0 else { return nil }
+        return Double(acceptedTokens) / Double(emittedTokens)
+    }
+
+    /// Legacy alias for `acceptanceRate` preserved for Wave 1 caller compatibility.
+    public var acceptanceShare: Double {
+        acceptanceRate
+    }
+
     public var summaryBadge: String {
-        let pct = Int((acceptanceShare * 100.0).rounded())
-        return "\(mode) \(acceptedTokens)/\(draftedTokens) (\(pct)%)"
+        if draftedTokens > 0 {
+            let pct = Int((acceptanceRate * 100.0).rounded())
+            return "\(mode) \(acceptedTokens)/\(draftedTokens) (\(pct)%)"
+        }
+        if emittedTokens > 0 {
+            let pct = Int((draftShare * 100.0).rounded())
+            return "\(pct)% from draft (\(acceptedTokens)/\(emittedTokens))"
+        }
+        return "\(mode) \(acceptedTokens)/0 (0%)"
     }
 }
 

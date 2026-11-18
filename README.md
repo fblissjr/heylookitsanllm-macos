@@ -1,8 +1,9 @@
 # heylookitsanllm-macos (`heylook`)
 
-Native Swift 6.2 multiplatform (`macOS 27.2+` and `iOS 27.2+`) personal inference workbench, multimodal embedding/retrieval studio, and embedded Anthropic Messages-conformant `/v1/*` HTTP/SSE server for Apple Silicon—orchestrating heterogeneous compute across **`MLX Swift` (Metal GPU)**, **`CoreAI` / `CoreML` (Apple Neural Engine)**, **`GGUF` (`llama-server` subprocesses)**, and **`RemoteHeylookProvider` (Bonjour `_heylook._tcp`)**.
+Native Swift 6.4 (`v6` language mode) multiplatform (`macOS 27.2+` and `iOS 27.2+` deployment floor supporting `27.2.1` hosts and `27.3+` SDK `#available` guards) personal inference workbench, multimodal embedding/retrieval studio, and embedded Anthropic Messages-conformant `/v1/*` HTTP/SSE server for Apple Silicon—orchestrating heterogeneous compute across **`MLX Swift` (Metal GPU)**, **`CoreAI` / `CoreML` (Apple Neural Engine)**, **`GGUF` (`llama-server` subprocesses)**, and **`RemoteHeylookProvider` (Bonjour `_heylook._tcp`)**.
 
 - **[User Guide (`docs/USER_GUIDE.md`)](./docs/USER_GUIDE.md)** — How to configure `heylook.toml`, drive all 6 workbench surfaces (`⌘1`–`⌘6`), manage presets, index & compare multimodal artifacts, quantize models, and use `heylook-cli` and `/v1/*`.
+- **[Current Status & Roadmap (`docs/project/CURRENT.md`)](./docs/project/CURRENT.md)** — Honest subsystem audit against `heylookitsanllm` `v2.0.251` and the active **Parity Completion Roadmap (Phases 16A–16E)**.
 - **[LLM Knowledge Wiki (`docs/wiki/README.md`)](./docs/wiki/README.md)** — Deep-dive subsystem architecture, engine contracts, and sharp edges.
 
 ---
@@ -55,19 +56,24 @@ Built on a unified 3-region `NavigationSplitView` + trailing `.inspector(isPrese
 ## Quick Start
 
 ```bash
-# Fast offline SwiftPM build & 44-test verification suite
+# Fast offline SwiftPM build & unit verification suite
 # (Prefix with `xcrun` if Homebrew `swift` precedes `/usr/bin/swift` in $PATH)
 xcrun swift build
 xcrun swift test
 xcrun swift run heylook-cli eval-lab
 
 # (Optional) One-command environment, Xcode, Metal, iOS Simulator, skills & swift-lsp updater
+# (Pass COREAI_REPO_DIR, MLX_SWIFT_LM_DIR, or HEYLOOK_SKILLS_PLUGIN_URL when overriding remote defaults)
 ./scripts/update_dev_env.sh
 
-# Full native Xcode build & test (compiles Cmlx default.metallib + links mlx-swift, mlx-swift-lm & swift-transformers)
+# Full native Xcode build & test (compiles Cmlx default.metallib, links mlx-swift / mlx-swift-lm / swift-transformers,
+# writes TCC usage keys in Info.plist, and signs HeylookWorkbench.app with Apple Development identity when available)
 ./scripts/build_native.sh build
 ./scripts/build_native.sh test
 ./scripts/build_native.sh app
+
+# Run with read-only model/template configuration guard enabled (returns HTTP 409 on config/sidecar writes)
+HEYLOOK_READONLY_MODEL_CONFIG=1 ./scripts/build_native.sh cli serve 8000
 
 # Inspect host unified memory, discovered models, Voice ASR engine readiness, and ANE tower compute plans
 ./scripts/build_native.sh cli doctor
@@ -108,7 +114,7 @@ HEYLOOK_ENABLE_COREAI=1 ./scripts/build_native.sh cli transcribe ./clip.wav --mo
 | Document | Purpose |
 | :--- | :--- |
 | **[docs/USER_GUIDE.md](./docs/USER_GUIDE.md)** | Operator guide to all 6 Workbench surfaces (`⌘1`–`⌘6`), `heylook.toml` setup, `heylook-cli`, and `/v1/*` API usage. |
-| **[VISION.md](./VISION.md)** | Core principles (*Visibility*, *Derive, Don't Copy*, *Truthful Runtime*, *Heterogeneous Compute*) and project boundaries. |
-| **[AGENTS.md](./AGENTS.md)** | Operating guide, module table, and **LLM Knowledge Wiki Index Router**. |
+| **[VISION.md](./VISION.md)** | Enduring purpose, 7 core beliefs, tradeoff compass, non-goals, and horizons (`LiteRT`, `27.3+` Siri/Spotlight/TCC). |
+| **[AGENTS.md](./AGENTS.md)** | Operating guide, module table, `HEYLOOK_READONLY_MODEL_CONFIG`, and **LLM Knowledge Wiki Index Router**. |
 | **[docs/wiki/README.md](./docs/wiki/README.md)** | Master hub for the 8-page **LLM Knowledge Wiki**:<br>• [architecture_overview.md](./docs/wiki/architecture_overview.md)<br>• [engine_contract_and_provenance.md](./docs/wiki/engine_contract_and_provenance.md)<br>• [providers_and_heterogeneous_compute.md](./docs/wiki/providers_and_heterogeneous_compute.md)<br>• [multimodal_embeddings_and_ane.md](./docs/wiki/multimodal_embeddings_and_ane.md)<br>• [wire_api_and_sqlite_store.md](./docs/wiki/wire_api_and_sqlite_store.md)<br>• [model_family_onboarding.md](./docs/wiki/model_family_onboarding.md)<br>• [ui_architecture_and_macos27.md](./docs/wiki/ui_architecture_and_macos27.md)<br>• [sharp_edges.md](./docs/wiki/sharp_edges.md) |
-| **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** & **[TODO.md](./docs/project/TODO.md)** | Subsystem readiness matrix (`SOLID`), completed **Phases 0–15** roadmap, and **Next Horizons (`H.2`–`H.4`)**. |
+| **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** & **[TODO.md](./docs/project/TODO.md)** | Honest subsystem audit matrix against `heylookitsanllm` `v2.0.251`, active **Parity Completion Roadmap (Phases 16A–16E)**, and **Post-Parity Horizons**. |

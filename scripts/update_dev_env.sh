@@ -19,6 +19,12 @@
 #   --skip-plugins      Skip updating Antigravity (agy) plugins
 #   --dry-run           Print actions without executing downloads or mutations
 #   -h, --help          Show this help message
+#
+# Environment variables (optional explicit overrides; no sibling path assumptions):
+#   COREAI_REPO_DIR           Path to a local `apple/coreai-models` checkout
+#   MLX_SWIFT_LM_DIR          Path to a local `ml-explore/mlx-swift-lm` checkout
+#   MLX_SWIFT_DIR             Path to a local `ml-explore/mlx-swift` checkout
+#   HEYLOOK_SKILLS_PLUGIN_URL URL or local path passed to `agy plugin install`
 
 set -euo pipefail
 
@@ -80,7 +86,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -173,15 +179,14 @@ if [[ "$PRUNE_OLD_SIMS" -eq 1 ]]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 3. Local Apple MLX & Core AI Reference Checkouts
+# 3. Local Apple MLX & Core AI Reference Checkouts (Explicit Env Vars or ./coderef)
 # ------------------------------------------------------------------------------
 echo ""
-echo "==> [3/6] Updating local Apple MLX & Core AI reference checkouts (if present)..."
+echo "==> [3/6] Updating local Apple MLX & Core AI reference checkouts (if configured)..."
 REF_REPOS=(
-    "$REPO_ROOT/../../mlx/apple-mlx/mlx-swift"
-    "$REPO_ROOT/../../mlx/apple-mlx/mlx-swift-lm"
-    "$REPO_ROOT/../../mlx/apple-mlx/mlx-swift-examples"
-    "$REPO_ROOT/../../mlx/apple-coreai/coreai-models"
+    "${MLX_SWIFT_DIR:-}"
+    "${MLX_SWIFT_LM_DIR:-}"
+    "${COREAI_REPO_DIR:-}"
     "$REPO_ROOT/coderef/mlx-swift"
     "$REPO_ROOT/coderef/mlx-swift-lm"
     "$REPO_ROOT/coderef/apple-coreai"
@@ -189,6 +194,7 @@ REF_REPOS=(
 
 UPDATED_REFS=0
 for repo in "${REF_REPOS[@]}"; do
+    [[ -z "$repo" ]] && continue
     if [[ -d "$repo/.git" ]]; then
         repo_name="$(basename "$repo")"
         echo "    Pulling latest in $repo_name..."
@@ -201,7 +207,7 @@ for repo in "${REF_REPOS[@]}"; do
     fi
 done
 if [[ "$UPDATED_REFS" -eq 0 ]]; then
-    echo "    [info] No git-backed local MLX/CoreAI reference checkouts found."
+    echo "    [info] No git-backed local MLX/CoreAI reference checkouts configured (set MLX_SWIFT_LM_DIR / COREAI_REPO_DIR to include)."
 fi
 
 # ------------------------------------------------------------------------------
@@ -220,16 +226,20 @@ if [[ -d "$HOME/.agents/skills" ]]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 5. Update Antigravity (agy) Plugins (swift-lsp, heylook-provider, path-privacy, etc.)
+# 5. Update Antigravity (agy) Plugins (Explicit HEYLOOK_SKILLS_PLUGIN_URL Only)
 # ------------------------------------------------------------------------------
 echo ""
 echo "==> [5/6] Updating Antigravity (agy) plugins..."
 if [[ "$SKIP_PLUGINS" -eq 1 ]]; then
     echo "    [skip] Skipping Antigravity plugin update (--skip-plugins)."
 elif command -v agy >/dev/null 2>&1; then
-    PLUGIN_SOURCE="${HEYLOOK_AGY_PLUGINS_SOURCE:-https://github.com/fblissjr/fb-gemini-plugins/tree/main/skills}"
-    echo "    Installing/updating plugins from $PLUGIN_SOURCE..."
-    run_cmd agy plugin install "$PLUGIN_SOURCE"
+    PLUGIN_SOURCE="${HEYLOOK_SKILLS_PLUGIN_URL:-}"
+    if [[ -n "$PLUGIN_SOURCE" ]]; then
+        echo "    Installing/updating plugins from $PLUGIN_SOURCE..."
+        run_cmd agy plugin install "$PLUGIN_SOURCE"
+    else
+        echo "    [info] HEYLOOK_SKILLS_PLUGIN_URL not set; skipping remote Antigravity plugin install/update."
+    fi
 else
     echo "    [info] 'agy' CLI not found on PATH; skipping plugin update."
 fi

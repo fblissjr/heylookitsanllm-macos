@@ -1,13 +1,13 @@
 # AGENTS.md
 
-Operating guide and **LLM Knowledge Wiki Index Router** for `heylookitsanllm-macos` — a native Swift 6.2 multiplatform (`macOS 27.2+` and `iOS 27.2+`) personal inference workbench, multimodal media/embedding studio, and embedded HTTP/SSE server for Apple Silicon.
+Operating guide and **LLM Knowledge Wiki Index Router** for `heylookitsanllm-macos` — a native Swift 6.4 (`v6` language mode) multiplatform (`macOS 27.2+` and `iOS 27.2+` deployment floor supporting `27.2.1` hosts and `27.3+` SDK features behind `#available(macOS 27.3, iOS 27.3, *)` guards) personal inference workbench, multimodal media/embedding studio, and embedded HTTP/SSE server for Apple Silicon.
 
 ## Where to Look First
 
-- **[VISION.md](./VISION.md)**: Core design principles (*Visibility*, *Derive, Don't Copy*, *Truthful Runtime*, *Heterogeneous Apple Silicon Co-Residency*). Breaks ties when a design choice is unclear.
+- **[VISION.md](./VISION.md)**: Core design principles (*Commodity Upstream, Surgical Specialization*, *Runtime-Agnostic Core*, *Truthful Runtime*, *Derive, Don't Copy*, *Heterogeneous Silicon Harmony*, *Intimate in the Hand, Effortless at the Desk*, *Sovereign by Construction*). Breaks ties when a design choice is unclear.
 - **[docs/USER_GUIDE.md](./docs/USER_GUIDE.md)**: Complete operator guide to the 6-surface Workbench app, `heylook.toml` setup, `heylook-cli`, and `/v1/*` API usage.
 - **[docs/wiki/README.md](./docs/wiki/README.md)**: Master entrypoint to the **LLM Knowledge Wiki**.
-- **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** and **[docs/project/TODO.md](./docs/project/TODO.md)**: Subsystem readiness matrix and phased roadmap.
+- **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** and **[docs/project/TODO.md](./docs/project/TODO.md)**: Honest subsystem audit matrix against `heylookitsanllm` `v2.0.251` and the Parity Completion Roadmap (**Phases 16A–16E**) + Post-Parity Horizons.
 
 ## LLM Knowledge Wiki Router (Read Before Editing an Area)
 
@@ -59,12 +59,12 @@ Before modifying a subsystem, read the corresponding wiki page from `docs/wiki/`
   - `swift run heylook-cli eval-lab`
   - `swift run heylook-cli serve 8000`
 - Model conversion, export & agent skills sync scripts:
-  - One-command environment, Xcode, Metal, iOS Simulator, skills & `swift-lsp` plugin updater: `./scripts/update_dev_env.sh [--upgrade-xcode] [--update-packages] [--build]`
-  - Sync Apple Xcode 27.x (`xcrun agent skills export`), Xcode `AdditionalDocumentation`, and `coreai-models` skills into `.agents/skills/`: `./scripts/sync_agent_skills.sh`
+  - One-command environment, Xcode, Metal, iOS Simulator, skills & `swift-lsp` plugin updater (set `MLX_SWIFT_LM_DIR`, `COREAI_REPO_DIR`, and `HEYLOOK_SKILLS_PLUGIN_URL` when overriding remote defaults): `./scripts/update_dev_env.sh [--upgrade-xcode] [--update-packages] [--build]`
+  - Sync Apple Xcode 27.x (`xcrun agent skills export`), Xcode `AdditionalDocumentation`, and `coreai-models` skills (`COREAI_REPO_DIR`) into `.agents/skills/`: `./scripts/sync_agent_skills.sh`
   - Pure-Swift MLX quantization (`MLXLMCommon.convert`): `./scripts/build_native.sh cli convert-mlx <src-dir> <dst-dir> --bits 4 --group-size 64 --mode affine`
   - Core AI `.aimodel` export (`coreai-models` + `xcrun coreai-build`): `./scripts/export_coreai.sh [list|llm|gemma4|whisper|parakeet|embedding|compile] ...`
   - 3-Tower CoreML ANE `EmbeddingGemma 2` export (`coremltools` + `xcrun coremlcompiler`): `uv run --python 3.12 --with coremltools --with safetensors --with "torch<2.8" --with "numpy<2" python ./scripts/export_ane_coreml.py --compile`
-- Full native Xcode build (compiling Metal shaders `default.metallib` + linking `mlx-swift`, `mlx-swift-lm`, `swift-transformers`, and optional `coreai-models` via remote GitHub packages):
+- Full native Xcode build (compiling Metal shaders `default.metallib` + linking `mlx-swift`, `mlx-swift-lm`, `swift-transformers`, and optional `coreai-models` via remote GitHub packages, plus TCC-hardened `Info.plist` and local `Apple Development` identity detection with ad-hoc fallback):
   - `./scripts/build_native.sh build`
   - `./scripts/build_native.sh test`
   - `./scripts/build_native.sh app`
@@ -72,9 +72,10 @@ Before modifying a subsystem, read the corresponding wiki page from `docs/wiki/`
 
 ## Repo Rules
 
-1. **Remote SwiftPM Dependencies Only in `Package.swift`**: Always declare external dependencies using canonical remote `.package(url: "https://github.com/...", ...)` references, never local filesystem paths (`.package(path: ...)`).
-2. **Path Privacy**: Never commit personal home-directory paths or personal full names in tracked files. Use repo-relative paths, `FileManager.default.homeDirectoryForCurrentUser`, or environment variables (`HEYLOOK_CONFIG`, `HEYLOOK_MODELS_DIR`, `HEYLOOK_DB_PATH`).
+1. **Remote SwiftPM Dependencies Only in `Package.swift`**: Always declare external dependencies using canonical remote `.package(url: "https://github.com/...", ...)` references (`mlx-swift`, `mlx-swift-lm`, `swift-transformers`, optional `coreai-models`), never local filesystem paths (`.package(path: ...)`), and never reference phantom packages not in `Package.swift`.
+2. **Path Privacy**: Never commit personal home-directory paths, relative sibling workspace traversals, or personal full names in tracked files. Use repo-relative paths, `FileManager.default.homeDirectoryForCurrentUser`, or environment variables (`HEYLOOK_CONFIG`, `HEYLOOK_MODELS_DIR`, `HEYLOOK_DB_PATH`, `HEYLOOK_READONLY_MODEL_CONFIG`, `COREAI_REPO_DIR`, `MLX_SWIFT_LM_DIR`, `HEYLOOK_SKILLS_PLUGIN_URL`).
 3. **Truthful Runtime (No Silent Synthetic Fallbacks)**: Production providers and embedding engines must never silently fabricate output or masquerade hash vectors as real model embeddings (`allowSyntheticFallback` defaults to `false`).
 4. **Derive, Don't Copy**: Derive capabilities, sampler schemas, and provenance fields from single canonical Swift definitions and model files.
 5. **No Migration Code**: Solo deployment. Schema updates in `SQLiteStore` and `VectorStore` use idempotent `CREATE TABLE IF NOT EXISTS` or clean table recreation.
 6. **Git Hygiene**: Stage files explicitly by name (`git add <file>`), never `git add -A` or `git add .`.
+7. **Read-Only Model Config Mode**: Use `HEYLOOK_READONLY_MODEL_CONFIG=1` when running read-only (`409` on model/config/template writes).

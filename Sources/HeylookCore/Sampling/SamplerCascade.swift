@@ -122,17 +122,18 @@ public struct SamplerSettings: Codable, Sendable, Equatable, Hashable {
     }
 
     /// Built-in baseline defaults when no model sidecar, preset, or request override is set.
+    /// Aligned with `heylookitsanllm/src/heylook_llm/samplers.py` (`GLOBAL_SAMPLER_FLOOR`).
     public static let builtinDefaults = SamplerSettings(
-        temperature: 0.7,
-        topP: 0.95,
-        topK: 40,
-        minP: 0.0,
-        repetitionPenalty: 1.0,
-        repetitionContextSize: 64,
-        presencePenalty: 0.0,
-        maxTokens: 2048,
+        temperature: SamplerCascade.fallbackTemperature,
+        topP: SamplerCascade.fallbackTopP,
+        topK: SamplerCascade.knobsOffTopK,
+        minP: SamplerCascade.knobsOffMinP,
+        repetitionPenalty: SamplerCascade.knobsOffRepetitionPenalty,
+        repetitionContextSize: SamplerCascade.defaultRepetitionContextSize,
+        presencePenalty: SamplerCascade.knobsOffPresencePenalty,
+        maxTokens: SamplerCascade.defaultMaxTokens,
         seed: nil,
-        thinking: true,
+        thinking: nil,
         thinkingDepth: nil,
         thinkingBudget: nil,
         stopSequences: []
@@ -143,8 +144,46 @@ public struct SamplerSettings: Codable, Sendable, Equatable, Hashable {
 /// Derived from `SamplerFieldKey.allCases` so adding a parameter automatically participates in
 /// cascade resolution and provenance tracking (`VISION.md` Principle 2: Derive, don't copy).
 public enum SamplerCascade {
+    /// Global temperature fallback when vendor, model, preset, and request are all silent (`samplers.py`).
+    public static let fallbackTemperature: Double = 1.0
+    /// Global top_p fallback (`samplers.py`).
+    public static let fallbackTopP: Double = 0.95
+    /// Safety stop on `max_tokens` (`samplers.py:DEFAULT_MAX_TOKENS`).
+    public static let defaultMaxTokens: Int = 16384
+    /// Default repetition window size.
+    public static let defaultRepetitionContextSize: Int = 64
 
-    /// Fine-grained 5-layer origin of a resolved sampler field (`GET /v1/models` `sampler_sources`).
+    /// Off-switches neutralizing engine-specific defaults (`samplers.py:KNOBS_OFF`).
+    public static let knobsOffTopK: Int = 0
+    public static let knobsOffMinP: Double = 0.0
+    public static let knobsOffRepetitionPenalty: Double = 1.0
+    public static let knobsOffPresencePenalty: Double = 0.0
+
+    /// Strict allowlist of keys read from `generation_config.json` / GGUF `general.sampling.*` (`samplers.py:VENDOR_SAMPLING_KEYS`).
+    public static let vendorSamplingKeys: [String] = ["temperature", "top_p", "top_k"]
+    public static let vendorSamplingKeySet: Set<String> = Set(vendorSamplingKeys)
+
+    /// Canonical field names on `/v1/models` `sampler_defaults` / `sampler_sources` (`ModelSamplerSummary`).
+    public struct ModelSamplerSummary: Sendable, Equatable {
+        public let thinkingDefault: Bool
+        public let samplerDefaults: [String: JSONValue]
+        public let samplerSources: [String: String]
+        public let resolved: ResolvedSampling
+
+        public init(
+            thinkingDefault: Bool,
+            samplerDefaults: [String: JSONValue],
+            samplerSources: [String: String],
+            resolved: ResolvedSampling
+        ) {
+            self.thinkingDefault = thinkingDefault
+            self.samplerDefaults = samplerDefaults
+            self.samplerSources = samplerSources
+            self.resolved = resolved
+        }
+    }
+
+    /// Fine-grained 5-layer origin of a resolved sampler field.
     public enum SamplerLayerSource: String, CaseIterable, Codable, Sendable {
         case builtin
         case vendor
@@ -158,6 +197,18 @@ public enum SamplerCascade {
                 return .derived
             case .modelConfig, .preset, .request:
                 return .configured
+            }
+        }
+
+        /// Coarse 3-way origin string reported in `GET /v1/models` `sampler_sources` (`"model"` | `"vendor"` | `"default"`).
+        public var publicSamplerSource: String {
+            switch self {
+            case .modelConfig, .preset, .request:
+                return "model"
+            case .vendor:
+                return "vendor"
+            case .builtin:
+                return "default"
             }
         }
     }
@@ -176,6 +227,24 @@ public enum SamplerCascade {
         case thinkingDepth = "thinking_depth"
         case thinkingBudget = "thinking_budget"
         case stopSequences = "stop_sequences"
+
+        /// Canonical wire key used in `sampler_defaults` (maps `.thinking` -> `"enable_thinking"`).
+        public var canonicalWireKey: String {
+            switch self {
+            case .thinking: return "enable_thinking"
+            default: return rawValue
+            }
+        }
+
+        /// All known config/wire spelling aliases accepted for this sampler parameter.
+        public var acceptedAliases: [String] {
+            switch self {
+            case .thinking: return ["enable_thinking", "thinking"]
+            case .thinkingDepth: return ["thinking_depth", "reasoning_effort", "reasoning_strength"]
+            case .thinkingBudget: return ["thinking_budget", "thinking_budget_tokens"]
+            default: return [rawValue]
+            }
+        }
     }
 
     public struct ResolvedSampling: Sendable, Equatable {
@@ -202,14 +271,20 @@ public enum SamplerCascade {
         }
     }
 
+    /// Resolves effective sampling parameters across all 5 cascade layers (`builtin` -> `vendor` -> `modelSidecar` -> `preset` -> `request`).
+    /// When `thinkingCapable` is supplied, `thinking` falls back to `thinkingCapable` (unless overridden by `modelSidecar`, `preset`, or `request`, ignoring `vendor`).
     public static func resolve(
         builtin: SamplerSettings = .builtinDefaults,
         vendor: SamplerSettings? = nil,
         modelSidecar: SamplerSettings? = nil,
         preset: SamplerSettings? = nil,
-        request: SamplerSettings? = nil
+        request: SamplerSettings? = nil,
+        thinkingCapable: Bool? = nil
     ) -> ResolvedSampling {
         var resolved = builtin
+        if let thinkingCapable {
+            resolved.thinking = thinkingCapable
+        }
         var provenance: [SamplerFieldKey: ProvenanceSource] = [:]
         var layerSource: [SamplerFieldKey: SamplerLayerSource] = [:]
         for key in SamplerFieldKey.allCases {
@@ -217,25 +292,27 @@ public enum SamplerCascade {
             layerSource[key] = .builtin
         }
 
-        func applyLayer(_ layer: SamplerSettings?, source: SamplerLayerSource) {
+        func applyLayer(_ layer: SamplerSettings?, source: SamplerLayerSource, allowVendorThinking: Bool = true) {
             guard let layer else { return }
             let prov = source.provenanceSource
             if let v = layer.temperature { resolved.temperature = v; provenance[.temperature] = prov; layerSource[.temperature] = source }
             if let v = layer.topP { resolved.topP = v; provenance[.topP] = prov; layerSource[.topP] = source }
             if let v = layer.topK { resolved.topK = v; provenance[.topK] = prov; layerSource[.topK] = source }
-            if let v = layer.minP { resolved.minP = v; provenance[.minP] = prov; layerSource[.minP] = source }
-            if let v = layer.repetitionPenalty { resolved.repetitionPenalty = v; provenance[.repetitionPenalty] = prov; layerSource[.repetitionPenalty] = source }
-            if let v = layer.repetitionContextSize { resolved.repetitionContextSize = v; provenance[.repetitionContextSize] = prov; layerSource[.repetitionContextSize] = source }
-            if let v = layer.presencePenalty { resolved.presencePenalty = v; provenance[.presencePenalty] = prov; layerSource[.presencePenalty] = source }
-            if let v = layer.maxTokens { resolved.maxTokens = v; provenance[.maxTokens] = prov; layerSource[.maxTokens] = source }
-            if let v = layer.seed { resolved.seed = v; provenance[.seed] = prov; layerSource[.seed] = source }
-            if let v = layer.thinking { resolved.thinking = v; provenance[.thinking] = prov; layerSource[.thinking] = source }
-            if let v = layer.thinkingDepth { resolved.thinkingDepth = v; provenance[.thinkingDepth] = prov; layerSource[.thinkingDepth] = source }
-            if let v = layer.thinkingBudget { resolved.thinkingBudget = v; provenance[.thinkingBudget] = prov; layerSource[.thinkingBudget] = source }
-            if let v = layer.stopSequences { resolved.stopSequences = v; provenance[.stopSequences] = prov; layerSource[.stopSequences] = source }
+            if source != .vendor {
+                if let v = layer.minP { resolved.minP = v; provenance[.minP] = prov; layerSource[.minP] = source }
+                if let v = layer.repetitionPenalty { resolved.repetitionPenalty = v; provenance[.repetitionPenalty] = prov; layerSource[.repetitionPenalty] = source }
+                if let v = layer.repetitionContextSize { resolved.repetitionContextSize = v; provenance[.repetitionContextSize] = prov; layerSource[.repetitionContextSize] = source }
+                if let v = layer.presencePenalty { resolved.presencePenalty = v; provenance[.presencePenalty] = prov; layerSource[.presencePenalty] = source }
+                if let v = layer.maxTokens { resolved.maxTokens = v; provenance[.maxTokens] = prov; layerSource[.maxTokens] = source }
+                if let v = layer.seed { resolved.seed = v; provenance[.seed] = prov; layerSource[.seed] = source }
+                if allowVendorThinking, let v = layer.thinking { resolved.thinking = v; provenance[.thinking] = prov; layerSource[.thinking] = source }
+                if let v = layer.thinkingDepth { resolved.thinkingDepth = v; provenance[.thinkingDepth] = prov; layerSource[.thinkingDepth] = source }
+                if let v = layer.thinkingBudget { resolved.thinkingBudget = v; provenance[.thinkingBudget] = prov; layerSource[.thinkingBudget] = source }
+                if let v = layer.stopSequences { resolved.stopSequences = v; provenance[.stopSequences] = prov; layerSource[.stopSequences] = source }
+            }
         }
 
-        applyLayer(vendor, source: .vendor)
+        applyLayer(vendor, source: .vendor, allowVendorThinking: false)
         applyLayer(modelSidecar, source: .modelConfig)
         applyLayer(preset, source: .preset)
         applyLayer(request, source: .request)
@@ -244,6 +321,72 @@ public enum SamplerCascade {
             effective: resolved,
             provenanceByField: provenance,
             sourceByField: layerSource
+        )
+    }
+
+    /// Computes `thinking_default`, `sampler_defaults`, and `sampler_sources` in ONE cascade pass
+    /// so `sampler_defaults.enable_thinking == thinking_default` by construction (`capabilities.py:derived_model_facts`).
+    public static func resolveModelDefaults(
+        vendor: SamplerSettings? = nil,
+        modelSidecar: SamplerSettings? = nil,
+        thinkingCapable: Bool
+    ) -> ModelSamplerSummary {
+        let resolved = resolve(
+            builtin: .builtinDefaults,
+            vendor: vendor,
+            modelSidecar: modelSidecar,
+            preset: nil,
+            request: nil,
+            thinkingCapable: thinkingCapable
+        )
+        let eff = resolved.effective
+        let thinkingDefault = eff.thinking ?? thinkingCapable
+
+        var defaults: [String: JSONValue] = [:]
+        var sources: [String: String] = [:]
+
+        for key in SamplerFieldKey.allCases {
+            let wireKey = key.canonicalWireKey
+            let src = (resolved.sourceByField[key] ?? .builtin).publicSamplerSource
+            switch key {
+            case .temperature:
+                if let v = eff.temperature { defaults[wireKey] = .double(v); sources[wireKey] = src }
+            case .topP:
+                if let v = eff.topP { defaults[wireKey] = .double(v); sources[wireKey] = src }
+            case .topK:
+                if let v = eff.topK { defaults[wireKey] = .int(v); sources[wireKey] = src }
+            case .minP:
+                if let v = eff.minP { defaults[wireKey] = .double(v); sources[wireKey] = src }
+            case .repetitionPenalty:
+                if let v = eff.repetitionPenalty { defaults[wireKey] = .double(v); sources[wireKey] = src }
+            case .repetitionContextSize:
+                if let v = eff.repetitionContextSize { defaults[wireKey] = .int(v); sources[wireKey] = src }
+            case .presencePenalty:
+                if let v = eff.presencePenalty { defaults[wireKey] = .double(v); sources[wireKey] = src }
+            case .maxTokens:
+                if let v = eff.maxTokens { defaults[wireKey] = .int(v); sources[wireKey] = src }
+            case .seed:
+                if let v = eff.seed { defaults[wireKey] = .int(v); sources[wireKey] = src }
+            case .thinking:
+                defaults[wireKey] = .bool(thinkingDefault)
+                // `enable_thinking` default provenance is reported via `thinking_default`; omit from `sampler_sources` matching `capabilities.py`.
+            case .thinkingDepth:
+                if let v = eff.thinkingDepth { defaults[wireKey] = .string(v); sources[wireKey] = src }
+            case .thinkingBudget:
+                if let v = eff.thinkingBudget { defaults[wireKey] = .int(v); sources[wireKey] = src }
+            case .stopSequences:
+                if let v = eff.stopSequences, !v.isEmpty {
+                    defaults[wireKey] = .array(v.map { .string($0) })
+                    sources[wireKey] = src
+                }
+            }
+        }
+
+        return ModelSamplerSummary(
+            thinkingDefault: thinkingDefault,
+            samplerDefaults: defaults,
+            samplerSources: sources,
+            resolved: resolved
         )
     }
 }

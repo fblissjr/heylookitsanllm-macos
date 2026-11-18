@@ -25,6 +25,10 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
     public var unsetKeys: [String]
     public var sampling: SamplerSettings
     public var tags: [String]
+    /// Explicitly populated key names parsed from `model.heylook.toml` or `[[models]]` (`exclude_unset`).
+    public var explicitKeys: Set<String>
+    /// Additional provider config fields (`cache_ram_mb`, `ctx_checkpoints`, `kv_bits`, `pipeline_ratios`, etc.).
+    public var extraConfig: [String: JSONValue]
 
     public init(
         id: String? = nil,
@@ -46,7 +50,9 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
         useSidecarChatTemplate: Bool? = nil,
         unsetKeys: [String] = [],
         sampling: SamplerSettings = SamplerSettings(),
-        tags: [String] = []
+        tags: [String] = [],
+        explicitKeys: Set<String> = [],
+        extraConfig: [String: JSONValue] = [:]
     ) {
         self.id = id
         self.provider = provider
@@ -68,18 +74,67 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
         self.unsetKeys = unsetKeys
         self.sampling = sampling
         self.tags = tags
+        self.explicitKeys = explicitKeys
+        self.extraConfig = extraConfig
     }
 
-    /// Parses a `model.heylook.toml` file content into a `ModelSidecarConfig`.
+    public static func == (lhs: ModelSidecarConfig, rhs: ModelSidecarConfig) -> Bool {
+        lhs.id == rhs.id
+            && lhs.provider == rhs.provider
+            && lhs.pinned == rhs.pinned
+            && lhs.computePlacement == rhs.computePlacement
+            && lhs.visionComputePlacement == rhs.visionComputePlacement
+            && lhs.audioComputePlacement == rhs.audioComputePlacement
+            && lhs.textComputePlacement == rhs.textComputePlacement
+            && lhs.ctxSize == rhs.ctxSize
+            && lhs.flashAttn == rhs.flashAttn
+            && lhs.supportsVision == rhs.supportsVision
+            && lhs.supportsThinking == rhs.supportsThinking
+            && lhs.imageMaxTokens == rhs.imageMaxTokens
+            && lhs.draftModel == rhs.draftModel
+            && lhs.specType == rhs.specType
+            && lhs.chatTemplate == rhs.chatTemplate
+            && lhs.chatTemplatePath == rhs.chatTemplatePath
+            && lhs.useSidecarChatTemplate == rhs.useSidecarChatTemplate
+            && lhs.unsetKeys == rhs.unsetKeys
+            && lhs.sampling == rhs.sampling
+            && lhs.tags == rhs.tags
+    }
+
+    /// Parses a `model.heylook.toml` file content into a `ModelSidecarConfig` using `TOMLCodec`.
     public static func parseTOML(_ text: String) -> ModelSidecarConfig {
-        let kv = SimpleTOML.parseFlatKeyValues(text)
-        return fromKeyValues(kv)
+        let parsed = TOMLCodec.parseBestEffort(text)
+        var flattened: [String: TOMLValue] = [:]
+        for (k, v) in parsed {
+            if k == "config", case .table(let sub) = v {
+                for (sk, sv) in sub { flattened[sk] = sv }
+            } else if case .table(let sub) = v {
+                for (sk, sv) in sub where flattened[sk] == nil { flattened[sk] = sv }
+            } else {
+                flattened[k] = v
+            }
+        }
+        return fromTOMLTable(flattened)
     }
 
-    static func fromKeyValues(_ kv: [String: SimpleTOML.Value]) -> ModelSidecarConfig {
+    private static let supersededAliasMap: [String: String] = [
+        "thinking": "enable_thinking",
+        "draft_model": "draft_model_path",
+        "context_size": "ctx_size",
+        "context_length": "ctx_size",
+        "cache_size": "ctx_size",
+        "vision": "supports_vision",
+        "thinking_capable": "supports_thinking",
+        "reasoning_effort": "thinking_depth",
+        "reasoning_strength": "thinking_depth",
+        "thinking_budget_tokens": "thinking_budget",
+        "path": "model_path",
+    ]
+
+    static func fromTOMLTable(_ kv: [String: TOMLValue]) -> ModelSidecarConfig {
         var config = ModelSidecarConfig()
         config.id = kv["id"]?.stringValue
-        if let p = kv["provider"]?.stringValue.lowercased() {
+        if let p = kv["provider"]?.stringValue?.lowercased() {
             config.provider = EngineProviderKind(rawValue: p)
         }
         config.pinned = kv["pinned"]?.boolValue
@@ -97,9 +152,18 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
         }
         config.ctxSize = kv["ctx_size"]?.intValue
             ?? kv["context_size"]?.intValue
+            ?? kv["context_length"]?.intValue
             ?? kv["cache_size"]?.intValue
-        config.flashAttn = kv["flash_attn"]?.boolValue
-        config.supportsVision = kv["vision"]?.boolValue
+        if let faBool = kv["flash_attn"]?.boolValue {
+            config.flashAttn = faBool
+        } else if let faStr = kv["flash_attn"]?.stringValue?.lowercased() {
+            if faStr == "on" || faStr == "true" {
+                config.flashAttn = true
+            } else if faStr == "off" || faStr == "false" {
+                config.flashAttn = false
+            }
+        }
+        config.supportsVision = kv["vision"]?.boolValue ?? kv["supports_vision"]?.boolValue
         config.supportsThinking = kv["thinking_capable"]?.boolValue ?? kv["supports_thinking"]?.boolValue
         config.imageMaxTokens = kv["image_max_tokens"]?.intValue
         config.draftModel = kv["draft_model"]?.stringValue ?? kv["draft_model_path"]?.stringValue
@@ -125,49 +189,133 @@ public struct ModelSidecarConfig: Codable, Sendable, Equatable {
                 ?? kv["reasoning_effort"]?.stringValue
                 ?? kv["reasoning_strength"]?.stringValue,
             thinkingBudget: kv["thinking_budget"]?.intValue
+                ?? kv["thinking_budget_tokens"]?.intValue,
+            stopSequences: kv["stop_sequences"]?.stringArrayValue
         )
+
+        var normalizedKeys: Set<String> = []
+        var extras: [String: JSONValue] = [:]
+        for (rawKey, rawVal) in kv {
+            let canonical = Self.supersededAliasMap[rawKey] ?? rawKey
+            normalizedKeys.insert(canonical)
+            if rawKey == canonical || extras[canonical] == nil {
+                extras[canonical] = rawVal.toJSONValue()
+            }
+        }
+        config.explicitKeys = normalizedKeys
+        config.extraConfig = extras
         return config
     }
 
-    /// Serializes this sidecar into clean `model.heylook.toml` format.
+    static func fromKeyValues(_ kv: [String: SimpleTOML.Value]) -> ModelSidecarConfig {
+        var mapped: [String: TOMLValue] = [:]
+        mapped.reserveCapacity(kv.count)
+        for (k, v) in kv {
+            mapped[k] = v.tomlValue
+        }
+        return fromTOMLTable(mapped)
+    }
+
+    /// Exports only explicitly set canonical keys as `[String: JSONValue]` for `AdminModelWireRow.config` (`exclude_unset`).
+    public func toExplicitJSONDictionary() -> [String: JSONValue] {
+        var out: [String: JSONValue] = [:]
+        for (rawKey, v) in extraConfig {
+            let k = Self.supersededAliasMap[rawKey] ?? rawKey
+            let isExplicit = explicitKeys.isEmpty || explicitKeys.contains(rawKey) || explicitKeys.contains(k)
+            guard isExplicit else { continue }
+            if rawKey == k || out[k] == nil {
+                out[k] = v
+            }
+        }
+        if let pinned { out["pinned"] = .bool(pinned) }
+        if let cu = computePlacement { out["compute_unit"] = .string(cu.rawValue) }
+        if let vcu = visionComputePlacement { out["vision_compute_unit"] = .string(vcu.rawValue) }
+        if let acu = audioComputePlacement { out["audio_compute_unit"] = .string(acu.rawValue) }
+        if let tcu = textComputePlacement { out["text_compute_unit"] = .string(tcu.rawValue) }
+        if let ctxSize { out["ctx_size"] = .int(ctxSize) }
+        if let flashAttn {
+            if case .string? = out["flash_attn"] {
+                // Preserve explicit string representation ("on" / "off" / "auto") stored in TOML
+            } else {
+                out["flash_attn"] = .bool(flashAttn)
+            }
+        }
+        if let supportsVision { out["supports_vision"] = .bool(supportsVision) }
+        if let supportsThinking { out["supports_thinking"] = .bool(supportsThinking) }
+        if let imageMaxTokens { out["image_max_tokens"] = .int(imageMaxTokens) }
+        if let draftModel { out["draft_model_path"] = .string(draftModel) }
+        if let specType { out["spec_type"] = .string(specType) }
+        if let chatTemplate { out["chat_template"] = .string(chatTemplate) }
+        if let chatTemplatePath { out["chat_template_path"] = .string(chatTemplatePath) }
+        if let useSidecarChatTemplate { out["use_sidecar_chat_template"] = .bool(useSidecarChatTemplate) }
+        if !tags.isEmpty { out["tags"] = .array(tags.map { .string($0) }) }
+        if let v = sampling.temperature { out["temperature"] = .double(v) }
+        if let v = sampling.topP { out["top_p"] = .double(v) }
+        if let v = sampling.topK { out["top_k"] = .int(v) }
+        if let v = sampling.minP { out["min_p"] = .double(v) }
+        if let v = sampling.repetitionPenalty { out["repetition_penalty"] = .double(v) }
+        if let v = sampling.repetitionContextSize { out["repetition_context_size"] = .int(v) }
+        if let v = sampling.presencePenalty { out["presence_penalty"] = .double(v) }
+        if let v = sampling.maxTokens { out["max_tokens"] = .int(v) }
+        if let v = sampling.seed { out["seed"] = .int(v) }
+        if let v = sampling.thinking { out["enable_thinking"] = .bool(v) }
+        if let v = sampling.thinkingDepth { out["thinking_depth"] = .string(v) }
+        if let v = sampling.thinkingBudget { out["thinking_budget"] = .int(v) }
+        if let v = sampling.stopSequences, !v.isEmpty { out["stop_sequences"] = .array(v.map { .string($0) }) }
+        return out
+    }
+
+    /// Serializes this sidecar into clean `model.heylook.toml` format via `TOMLCodec`.
     public func toTOML() -> String {
         var lines: [String] = ["# model.heylook.toml — Per-model override sidecar"]
-        if let id { lines.append("id = \"\(id)\"") }
-        if let provider { lines.append("provider = \"\(provider.rawValue)\"") }
-        if let pinned { lines.append("pinned = \(pinned)") }
-        if let computePlacement { lines.append("compute_unit = \"\(computePlacement.rawValue)\"") }
-        if let visionComputePlacement { lines.append("vision_compute_unit = \"\(visionComputePlacement.rawValue)\"") }
-        if let audioComputePlacement { lines.append("audio_compute_unit = \"\(audioComputePlacement.rawValue)\"") }
-        if let textComputePlacement { lines.append("text_compute_unit = \"\(textComputePlacement.rawValue)\"") }
-        if let ctxSize { lines.append("ctx_size = \(ctxSize)") }
-        if let flashAttn { lines.append("flash_attn = \(flashAttn)") }
-        if let supportsVision { lines.append("vision = \(supportsVision)") }
-        if let supportsThinking { lines.append("thinking_capable = \(supportsThinking)") }
-        if let imageMaxTokens { lines.append("image_max_tokens = \(imageMaxTokens)") }
-        if let draftModel { lines.append("draft_model = \"\(draftModel)\"") }
-        if let specType { lines.append("spec_type = \"\(specType)\"") }
-        if let chatTemplate { lines.append("chat_template = \"\(chatTemplate)\"") }
-        if let chatTemplatePath { lines.append("chat_template_path = \"\(chatTemplatePath)\"") }
-        if let useSidecarChatTemplate { lines.append("use_sidecar_chat_template = \(useSidecarChatTemplate)") }
-        if !unsetKeys.isEmpty {
-            let quoted = unsetKeys.map { "\"\($0)\"" }.joined(separator: ", ")
-            lines.append("unset = [\(quoted)]")
+        var emitted: Set<String> = []
+        func appendKV(_ key: String, _ val: TOMLValue) {
+            emitted.insert(key)
+            lines.append("\(TOMLCodec.formatKey(key)) = \(TOMLCodec.formatValue(val))")
         }
-        if !tags.isEmpty {
-            let quoted = tags.map { "\"\($0)\"" }.joined(separator: ", ")
-            lines.append("tags = [\(quoted)]")
+        if let id { appendKV("id", .string(id)) }
+        if let provider { appendKV("provider", .string(provider.rawValue)) }
+        if let pinned { appendKV("pinned", .bool(pinned)) }
+        if let computePlacement { appendKV("compute_unit", .string(computePlacement.rawValue)) }
+        if let visionComputePlacement { appendKV("vision_compute_unit", .string(visionComputePlacement.rawValue)) }
+        if let audioComputePlacement { appendKV("audio_compute_unit", .string(audioComputePlacement.rawValue)) }
+        if let textComputePlacement { appendKV("text_compute_unit", .string(textComputePlacement.rawValue)) }
+        if let ctxSize { appendKV("ctx_size", .int(ctxSize)) }
+        if let flashAttn { appendKV("flash_attn", .bool(flashAttn)) }
+        if let supportsVision { appendKV("vision", .bool(supportsVision)) }
+        if let supportsThinking { appendKV("thinking_capable", .bool(supportsThinking)) }
+        if let imageMaxTokens { appendKV("image_max_tokens", .int(imageMaxTokens)) }
+        if let draftModel { appendKV("draft_model", .string(draftModel)) }
+        if let specType { appendKV("spec_type", .string(specType)) }
+        if let chatTemplate { appendKV("chat_template", .string(chatTemplate)) }
+        if let chatTemplatePath { appendKV("chat_template_path", .string(chatTemplatePath)) }
+        if let useSidecarChatTemplate { appendKV("use_sidecar_chat_template", .bool(useSidecarChatTemplate)) }
+        if !unsetKeys.isEmpty { appendKV("unset", .array(unsetKeys.map { .string($0) })) }
+        if !tags.isEmpty { appendKV("tags", .array(tags.map { .string($0) })) }
+        if let v = sampling.temperature { appendKV("temperature", .double(v)) }
+        if let v = sampling.topP { appendKV("top_p", .double(v)) }
+        if let v = sampling.topK { appendKV("top_k", .int(v)) }
+        if let v = sampling.minP { appendKV("min_p", .double(v)) }
+        if let v = sampling.repetitionPenalty { appendKV("repetition_penalty", .double(v)) }
+        if let v = sampling.repetitionContextSize { appendKV("repetition_context_size", .int(v)) }
+        if let v = sampling.presencePenalty { appendKV("presence_penalty", .double(v)) }
+        if let v = sampling.maxTokens { appendKV("max_tokens", .int(v)) }
+        if let v = sampling.seed { appendKV("seed", .int(v)) }
+        if let v = sampling.thinking { appendKV("thinking", .bool(v)) }
+        if let v = sampling.thinkingDepth { appendKV("thinking_depth", .string(v)) }
+        if let v = sampling.thinkingBudget { appendKV("thinking_budget", .int(v)) }
+        if let v = sampling.stopSequences, !v.isEmpty {
+            appendKV("stop_sequences", .array(v.map { .string($0) }))
         }
-        if let v = sampling.temperature { lines.append("temperature = \(v)") }
-        if let v = sampling.topP { lines.append("top_p = \(v)") }
-        if let v = sampling.topK { lines.append("top_k = \(v)") }
-        if let v = sampling.minP { lines.append("min_p = \(v)") }
-        if let v = sampling.repetitionPenalty { lines.append("repetition_penalty = \(v)") }
-        if let v = sampling.repetitionContextSize { lines.append("repetition_context_size = \(v)") }
-        if let v = sampling.presencePenalty { lines.append("presence_penalty = \(v)") }
-        if let v = sampling.maxTokens { lines.append("max_tokens = \(v)") }
-        if let v = sampling.thinking { lines.append("thinking = \(v)") }
-        if let v = sampling.thinkingDepth { lines.append("thinking_depth = \"\(v)\"") }
-        if let v = sampling.thinkingBudget { lines.append("thinking_budget = \(v)") }
+        let handMappedAliases: Set<String> = [
+            "context_size", "context_length", "cache_size", "supports_vision", "supports_thinking",
+            "draft_model_path", "enable_thinking", "reasoning_effort", "reasoning_strength", "thinking_budget_tokens",
+        ]
+        for key in extraConfig.keys.sorted() where !emitted.contains(key) && !handMappedAliases.contains(key) {
+            if let tv = TOMLValue.fromJSONValue(extraConfig[key]!) {
+                appendKV(key, tv)
+            }
+        }
         return lines.joined(separator: "\n") + "\n"
     }
 }
@@ -281,7 +429,8 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
     public static func resolveEffectiveSampling(
         modelPath: String?,
         preset: SamplerSettings? = nil,
-        request: SamplerSettings? = nil
+        request: SamplerSettings? = nil,
+        thinkingCapable: Bool? = nil
     ) -> SamplerCascade.ResolvedSampling {
         var vendorSettings: SamplerSettings?
         var modelSidecarSettings: SamplerSettings?
@@ -297,7 +446,8 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             vendor: vendorSettings,
             modelSidecar: modelSidecarSettings,
             preset: preset,
-            request: request
+            request: request,
+            thinkingCapable: thinkingCapable
         )
     }
 
@@ -341,11 +491,13 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return config
     }
 
+    /// Parses `heylook.toml` using the spec-accurate recursive-descent `TOMLCodec`
+    /// supporting `[scan]`, `[settings]`, `[server]`, and `[[models]]` + `[models.config]`.
     public static func parseTOML(_ text: String) -> HeylookConfig {
-        let doc = SimpleTOML.parseDocument(text)
-        let root = doc.root
-        let scanSec = doc.sections["scan"] ?? [:]
-        let serverSec = doc.sections["server"] ?? [:]
+        let root = TOMLCodec.parseBestEffort(text)
+        let scanSec = root["scan"]?.tableValue ?? [:]
+        let settingsSec = root["settings"]?.tableValue ?? [:]
+        let serverSec = root["server"]?.tableValue ?? [:]
 
         let folders = root["scan_folders"]?.stringArrayValue
             ?? scanSec["folders"]?.stringArrayValue
@@ -353,39 +505,59 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             ?? []
 
         var explicit: [ExplicitModelEntry] = []
-        if let modelTables = doc.arrayOfTables["models"] {
-            for table in modelTables {
-                let rawPath = table["model_path"]?.stringValue ?? table["path"]?.stringValue ?? ""
+        if let modelTables = root["models"]?.arrayValue {
+            for item in modelTables {
+                guard case .table(let rawTable) = item else { continue }
+                let subCfg = rawTable["config"]?.tableValue
+                var configSource = subCfg ?? rawTable
+                if subCfg == nil {
+                    // Strip [[models]] table-header identity keys from flat entries so they do not leak into AdminModelWireRow.config.
+                    configSource.removeValue(forKey: "id")
+                    configSource.removeValue(forKey: "provider")
+                }
+                if let legacyPath = configSource.removeValue(forKey: "path"), configSource["model_path"] == nil {
+                    configSource["model_path"] = legacyPath
+                }
+
+                let rawPath = configSource["model_path"]?.stringValue
+                    ?? rawTable["model_path"]?.stringValue
+                    ?? rawTable["path"]?.stringValue
+                    ?? ""
                 guard !rawPath.isEmpty else { continue }
-                let id = table["id"]?.stringValue ?? URL(fileURLWithPath: rawPath).lastPathComponent
-                let provRaw = table["provider"]?.stringValue.lowercased() ?? ""
+                let id = rawTable["id"]?.stringValue
+                    ?? configSource["id"]?.stringValue
+                    ?? URL(fileURLWithPath: rawPath).lastPathComponent
+                let provRaw = (rawTable["provider"]?.stringValue ?? configSource["provider"]?.stringValue)?.lowercased() ?? ""
                 let prov = EngineProviderKind(rawValue: provRaw)
                     ?? (rawPath.lowercased().hasSuffix(".gguf") ? .gguf : .mlx)
-                let sidecar = ModelSidecarConfig.fromKeyValues(table)
+                let sidecar = ModelSidecarConfig.fromTOMLTable(configSource)
                 explicit.append(ExplicitModelEntry(id: id, path: rawPath, provider: prov, sidecar: sidecar))
             }
         }
 
         return HeylookConfig(
-            defaultModel: root["default_model"]?.stringValue,
-            maxLoadedModels: root["max_loaded_models"]?.intValue ?? 3,
-            maxQueueDepth: root["max_queue_depth"]?.intValue ?? 2,
+            defaultModel: root["default_model"]?.stringValue ?? settingsSec["default_model"]?.stringValue,
+            maxLoadedModels: settingsSec["max_loaded_models"]?.intValue ?? root["max_loaded_models"]?.intValue ?? 3,
+            maxQueueDepth: settingsSec["max_queue_depth"]?.intValue ?? root["max_queue_depth"]?.intValue ?? 2,
             scanFolders: folders,
-            allowedHosts: root["allowed_hosts"]?.stringArrayValue ?? [],
-            serverHost: root["host"]?.stringValue ?? serverSec["host"]?.stringValue ?? "127.0.0.1",
-            serverPort: root["port"]?.intValue ?? serverSec["port"]?.intValue ?? 8000,
-            adminToken: root["admin_token"]?.stringValue ?? serverSec["admin_token"]?.stringValue,
+            allowedHosts: settingsSec["allowed_hosts"]?.stringArrayValue ?? root["allowed_hosts"]?.stringArrayValue ?? [],
+            serverHost: settingsSec["host"]?.stringValue ?? root["host"]?.stringValue ?? serverSec["host"]?.stringValue ?? "127.0.0.1",
+            serverPort: settingsSec["port"]?.intValue ?? root["port"]?.intValue ?? serverSec["port"]?.intValue ?? 8000,
+            adminToken: settingsSec["admin_token"]?.stringValue ?? root["admin_token"]?.stringValue ?? serverSec["admin_token"]?.stringValue,
             explicitModels: explicit
         )
     }
 
-    /// True when `HEYLOOK_READONLY_MODEL_CONFIG` is enabled (`1` or `true`), blocking disk writes to model configs and overrides.
-    public static var isModelConfigReadOnly: Bool {
+    /// Canonical single source of truth for `HEYLOOK_READONLY_MODEL_CONFIG` (`1`, `true`, `yes`).
+    public static var isReadOnlyModelConfig: Bool {
         guard let raw = ProcessInfo.processInfo.environment["HEYLOOK_READONLY_MODEL_CONFIG"]?.lowercased() else {
             return false
         }
         return raw == "1" || raw == "true" || raw == "yes"
     }
+
+    /// Bridged alias for `isReadOnlyModelConfig` preserving Wave 1 caller compatibility.
+    public static var isModelConfigReadOnly: Bool { isReadOnlyModelConfig }
 
     /// Resolves the active `heylook.toml` file URL used for reading and persisting operator configuration updates.
     public static func activeConfigURL() -> URL {
@@ -419,13 +591,24 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         try sidecar.toTOML().write(to: sidecarURL, atomically: true, encoding: .utf8)
     }
 
+    /// Surgically patches `model.heylook.toml` via `TOMLCodec`, preserving `#` comments and untouched keys.
+    /// Deletes `model.heylook.toml` if unsetting keys (`JSONValue.null`) leaves it empty.
+    @discardableResult
+    public static func applySidecarPatch(
+        _ updates: [String: JSONValue],
+        in candidateDir: URL
+    ) throws -> Bool {
+        let dir = resolveModelDirectoryURL(from: candidateDir.path)
+        let sidecarURL = dir.appendingPathComponent("model.heylook.toml")
+        return try TOMLCodec.applyModelSidecarPatch(at: sidecarURL, updates: updates)
+    }
+
     /// Convenience static discovery entry point matching `loadDefault().discoverConfiguredModels()`.
     public static func discoverConfiguredModels() -> [EngineDescription] {
         loadDefault().discoverConfiguredModels()
     }
 
-    /// Persists this `HeylookConfig` atomically to `configURL` (or `activeConfigURL()` when omitted),
-    /// preserving `default_model`, `admin_token`, `allowed_hosts`, `scan_folders`, and all `[[models]]` entries.
+    /// Persists this `HeylookConfig` atomically to `configURL` (or `activeConfigURL()` when omitted).
     public func save(to configURL: URL? = nil) throws {
         let targetURL = configURL ?? Self.activeConfigURL()
         try FileManager.default.createDirectory(
@@ -471,62 +654,104 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return scanFolders.count != before
     }
 
-    /// Non-destructively adds a watched/scan folder to `heylook.toml` on disk, preserving `[[models]]`,
-    /// `admin_token`, `allowed_hosts`, and server limits.
+    /// Non-destructively adds a watched/scan folder to `heylook.toml` on disk via surgical TOML editing,
+    /// preserving `#` comments, `[settings]`, `[[models]]`, `admin_token`, and `allowed_hosts`.
     @discardableResult
     public static func addScanFolder(_ folderPath: String, configURL: URL? = nil) throws -> HeylookConfig {
         let targetURL = configURL ?? activeConfigURL()
-        var cfg: HeylookConfig
         if let existingText = try? String(contentsOf: targetURL, encoding: .utf8) {
-            cfg = parseTOML(existingText)
-        } else {
-            cfg = configURL == nil ? loadDefault() : HeylookConfig()
+            var cfg = parseTOML(existingText)
+            if cfg.addScanFolder(folderPath) {
+                let parsed = TOMLCodec.parseBestEffort(existingText)
+                let updated: String
+                if parsed["scan_folders"] != nil && parsed["scan"] == nil {
+                    updated = TOMLCodec.updateKey(
+                        in: existingText,
+                        section: nil,
+                        key: "scan_folders",
+                        value: .array(cfg.scanFolders.map { .string($0) })
+                    )
+                } else {
+                    updated = TOMLCodec.updateScanConfig(in: existingText, folders: cfg.scanFolders)
+                }
+                try updated.write(to: targetURL, atomically: true, encoding: .utf8)
+            }
+            return cfg
         }
+        var cfg = configURL == nil ? loadDefault() : HeylookConfig()
         _ = cfg.addScanFolder(folderPath)
         try cfg.save(to: targetURL)
         return cfg
     }
 
-    /// Non-destructively removes a watched/scan folder from `heylook.toml` on disk, preserving `[[models]]`,
-    /// `admin_token`, `allowed_hosts`, and server limits.
+    /// Non-destructively removes a watched/scan folder from `heylook.toml` on disk via surgical TOML editing,
+    /// preserving `#` comments, `[settings]`, `[[models]]`, `admin_token`, and `allowed_hosts`.
     @discardableResult
     public static func removeScanFolder(_ folderPath: String, configURL: URL? = nil) throws -> HeylookConfig {
         let targetURL = configURL ?? activeConfigURL()
-        var cfg: HeylookConfig
         if let existingText = try? String(contentsOf: targetURL, encoding: .utf8) {
-            cfg = parseTOML(existingText)
-        } else {
-            cfg = configURL == nil ? loadDefault() : HeylookConfig()
+            var cfg = parseTOML(existingText)
+            if cfg.removeScanFolder(folderPath) {
+                let parsed = TOMLCodec.parseBestEffort(existingText)
+                let updated: String
+                if parsed["scan_folders"] != nil && parsed["scan"] == nil {
+                    updated = TOMLCodec.updateKey(
+                        in: existingText,
+                        section: nil,
+                        key: "scan_folders",
+                        value: .array(cfg.scanFolders.map { .string($0) })
+                    )
+                } else {
+                    updated = TOMLCodec.updateScanConfig(in: existingText, folders: cfg.scanFolders)
+                }
+                try updated.write(to: targetURL, atomically: true, encoding: .utf8)
+            }
+            return cfg
         }
+        var cfg = configURL == nil ? loadDefault() : HeylookConfig()
         _ = cfg.removeScanFolder(folderPath)
         try cfg.save(to: targetURL)
         return cfg
     }
 
+    /// Surgically updates `[settings]` keys in `heylook.toml`, preserving `#` comments and untouched sections.
+    @discardableResult
+    public static func updateSettingsSection(
+        _ updates: [String: JSONValue],
+        configURL: URL? = nil
+    ) throws -> HeylookConfig {
+        let targetURL = configURL ?? activeConfigURL()
+        let fm = FileManager.default
+        let existingText = (try? String(contentsOf: targetURL, encoding: .utf8))
+            ?? "# heylook.toml — Global server & model discovery configuration\n"
+        let updated = TOMLCodec.updateSettings(in: existingText, updates: updates)
+        try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try updated.write(to: targetURL, atomically: true, encoding: .utf8)
+        return parseTOML(updated)
+    }
+
     public func toTOML() -> String {
         var lines: [String] = ["# heylook.toml — Global server & model discovery configuration"]
-        if let defaultModel { lines.append("default_model = \"\(defaultModel)\"") }
+        if let defaultModel { lines.append("default_model = \(TOMLCodec.formatValue(.string(defaultModel)))") }
         lines.append("max_loaded_models = \(maxLoadedModels)")
         lines.append("max_queue_depth = \(maxQueueDepth)")
-        lines.append("host = \"\(serverHost)\"")
+        lines.append("host = \(TOMLCodec.formatValue(.string(serverHost)))")
         lines.append("port = \(serverPort)")
         if let adminToken, !adminToken.isEmpty {
-            lines.append("admin_token = \"\(adminToken)\"")
+            lines.append("admin_token = \(TOMLCodec.formatValue(.string(adminToken)))")
         }
         if !allowedHosts.isEmpty {
-            let quoted = allowedHosts.map { "\"\($0)\"" }.joined(separator: ", ")
-            lines.append("allowed_hosts = [\(quoted)]")
+            lines.append("allowed_hosts = \(TOMLCodec.formatValue(.array(allowedHosts.map { .string($0) })))")
         }
         if !scanFolders.isEmpty {
-            let quoted = scanFolders.map { "\"\($0)\"" }.joined(separator: ", ")
-            lines.append("scan_folders = [\(quoted)]")
+            lines.append("scan_folders = \(TOMLCodec.formatValue(.array(scanFolders.map { .string($0) })))")
         }
         for entry in explicitModels {
             lines.append("")
             lines.append("[[models]]")
-            lines.append("id = \"\(entry.id)\"")
-            lines.append("path = \"\(entry.path)\"")
-            lines.append("provider = \"\(entry.provider.rawValue)\"")
+            lines.append("id = \(TOMLCodec.formatValue(.string(entry.id)))")
+            lines.append("path = \(TOMLCodec.formatValue(.string(entry.path)))")
+            lines.append("provider = \(TOMLCodec.formatValue(.string(entry.provider.rawValue)))")
             for extra in entry.sidecar.toTOML().components(separatedBy: .newlines) {
                 let t = extra.trimmingCharacters(in: .whitespaces)
                 if t.isEmpty || t.hasPrefix("#") || t.hasPrefix("id =") || t.hasPrefix("provider =") {
@@ -646,40 +871,96 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                     return (nestedMTP.standardizedFileURL.path, "draft-mtp")
                 }
             }
+
+            let targetConfig = loadJSONDictionary(at: candidateDir.appendingPathComponent("config.json"))
+            let targetHiddenSize = extractTargetHiddenSize(from: targetConfig)
+
             let parentDir = candidateDir.deletingLastPathComponent()
             let baseLower = candidateDir.lastPathComponent.lowercased()
             if let siblings = try? fm.contentsOfDirectory(at: parentDir, includingPropertiesForKeys: [.isDirectoryKey]) {
                 for sibling in siblings.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                    var isDir: ObjCBool = false
+                    guard fm.fileExists(atPath: sibling.path, isDirectory: &isDir), isDir.boolValue else { continue }
                     let sLower = sibling.lastPathComponent.lowercased()
                     guard sLower != baseLower else { continue }
+
+                    let siblingConfig = loadJSONDictionary(at: sibling.appendingPathComponent("config.json"))
+                    let siblingModelType = (siblingConfig?["model_type"] as? String)?.lowercased() ?? ""
+                    let siblingArchs = (siblingConfig?["architectures"] as? [String]) ?? []
+                    let isAssistantCheckpoint = sLower.hasSuffix("-assistant")
+                        || siblingModelType == "gemma4_assistant"
+                        || siblingArchs.contains(where: { $0.localizedCaseInsensitiveContains("assistant") })
+
                     let stem: String?
                     if let range = sLower.range(of: "-mtp") {
                         stem = String(sLower[..<range.lowerBound])
                     } else if sLower.hasSuffix("-assistant") {
                         stem = String(sLower.dropLast("-assistant".count))
+                    } else if isAssistantCheckpoint, let lastDash = sLower.lastIndex(of: "-") {
+                        stem = String(sLower[..<lastDash])
                     } else {
                         stem = nil
                     }
-                    if let stem, !stem.isEmpty, baseLower.hasPrefix(stem) {
-                        let spec = sLower.hasSuffix("-assistant") ? "draft-model" : "draft-mtp"
-                        return (sibling.standardizedFileURL.path, spec)
+
+                    guard let stem, !stem.isEmpty, baseLower.hasPrefix(stem) else { continue }
+
+                    // Verify `backbone_hidden_size` / `target_hidden_size` matches target `hidden_size` when both exist.
+                    let drafterHidden = extractDrafterBackboneHiddenSize(from: siblingConfig)
+                    if let want = targetHiddenSize, let got = drafterHidden, want != got {
+                        continue
                     }
+
+                    // Both `-mtp` and `-assistant` / `model_type == "gemma4_assistant"` pair as `"draft-mtp"`.
+                    let spec = (isAssistantCheckpoint || sLower.contains("-mtp") || siblingModelType.contains("mtp"))
+                        ? "draft-mtp"
+                        : "draft-model"
+                    return (sibling.standardizedFileURL.path, spec)
                 }
             }
         }
         return (nil, nil)
     }
 
-    /// Loads vendor sampling defaults (`temperature`, `top_p`, `top_k`, `min_p`) from `generation_config.json`
-    /// or `.gguf` header `general.sampling.*` metadata in a model directory.
+    private static func extractTargetHiddenSize(from configJSON: [String: Any]?) -> Int? {
+        guard let configJSON else { return nil }
+        if let h = (configJSON["hidden_size"] as? NSNumber)?.intValue {
+            return h
+        }
+        if let textCfg = configJSON["text_config"] as? [String: Any],
+           let h = (textCfg["hidden_size"] as? NSNumber)?.intValue {
+            return h
+        }
+        return nil
+    }
+
+    private static func extractDrafterBackboneHiddenSize(from configJSON: [String: Any]?) -> Int? {
+        guard let configJSON else { return nil }
+        if let h = (configJSON["backbone_hidden_size"] as? NSNumber)?.intValue {
+            return h
+        }
+        if let h = (configJSON["target_hidden_size"] as? NSNumber)?.intValue {
+            return h
+        }
+        if let textCfg = configJSON["text_config"] as? [String: Any] {
+            if let h = (textCfg["backbone_hidden_size"] as? NSNumber)?.intValue {
+                return h
+            }
+            if let h = (textCfg["target_hidden_size"] as? NSNumber)?.intValue {
+                return h
+            }
+        }
+        return (configJSON["hidden_size"] as? NSNumber)?.intValue
+    }
+
+    /// Loads vendor sampling defaults strictly from `SamplerCascade.vendorSamplingKeys`
+    /// (`temperature`, `top_p`, `top_k`) in `generation_config.json` or `.gguf` header `general.sampling.*`.
     public static func loadVendorSampling(in candidateDir: URL) -> SamplerSettings? {
         if let json = loadJSONDictionary(at: candidateDir.appendingPathComponent("generation_config.json")) {
             let temp = (json["temperature"] as? NSNumber)?.doubleValue
             let topP = (json["top_p"] as? NSNumber)?.doubleValue
             let topK = (json["top_k"] as? NSNumber)?.intValue
-            let minP = (json["min_p"] as? NSNumber)?.doubleValue
-            if temp != nil || topP != nil || topK != nil || minP != nil {
-                return SamplerSettings(temperature: temp, topP: topP, topK: topK, minP: minP)
+            if temp != nil || topP != nil || topK != nil {
+                return SamplerSettings(temperature: temp, topP: topP, topK: topK)
             }
         }
         if let ggufURL = firstGGUFFile(in: candidateDir),
@@ -737,6 +1018,71 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
 
     public typealias ChatTemplateInspection = ChatTemplateState
 
+    /// One copy of a chat template discovered in ladder order (`chat_template_files.py:template_sources`).
+    public struct ChatTemplateSourceEntry: Codable, Sendable, Equatable {
+        public let source: String
+        public let file: String?
+        public let sha256: String
+        public let inForce: Bool
+        public let provenance: String
+        public let downloadCommit: String?
+        public let prefixStable: Bool?
+        public let prefixNote: String?
+        public let thinking: EngineThinkingFacts?
+        public let template: String
+
+        enum CodingKeys: String, CodingKey {
+            case source
+            case file
+            case sha256
+            case inForce = "in_force"
+            case provenance
+            case downloadCommit = "download_commit"
+            case prefixStable = "prefix_stable"
+            case prefixNote = "prefix_note"
+            case thinking
+            case template
+        }
+
+        public init(
+            source: String,
+            file: String? = nil,
+            sha256: String,
+            inForce: Bool,
+            provenance: String,
+            downloadCommit: String? = nil,
+            prefixStable: Bool? = nil,
+            prefixNote: String? = nil,
+            thinking: EngineThinkingFacts? = nil,
+            template: String
+        ) {
+            self.source = source
+            self.file = file
+            self.sha256 = sha256
+            self.inForce = inForce
+            self.provenance = provenance
+            self.downloadCommit = downloadCommit
+            self.prefixStable = prefixStable
+            self.prefixNote = prefixNote
+            self.thinking = thinking
+            self.template = template
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(source, forKey: .source)
+            if let file { try c.encode(file, forKey: .file) } else { try c.encodeNil(forKey: .file) }
+            try c.encode(sha256, forKey: .sha256)
+            try c.encode(inForce, forKey: .inForce)
+            try c.encode(provenance, forKey: .provenance)
+            if let downloadCommit { try c.encode(downloadCommit, forKey: .downloadCommit) } else { try c.encodeNil(forKey: .downloadCommit) }
+            if let prefixStable { try c.encode(prefixStable, forKey: .prefixStable) } else { try c.encodeNil(forKey: .prefixStable) }
+            if let prefixNote { try c.encode(prefixNote, forKey: .prefixNote) } else { try c.encodeNil(forKey: .prefixNote) }
+            if let thinking { try c.encode(thinking, forKey: .thinking) } else { try c.encodeNil(forKey: .thinking) }
+            try c.encode(template, forKey: .template)
+        }
+    }
+
     public struct ChatTemplateState: Codable, Sendable, Equatable {
         public let source: String
         public let hasOverride: Bool
@@ -744,11 +1090,21 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         public let origin: String
         public let writable: Bool
         public let inertReason: String?
-        public let stale: Bool
+        /// Truthful runtime staleness: `nil` when no loaded template/hash was provided (unloaded),
+        /// `true`/`false` when compared against the loaded process template (`chat_template_files.py`).
+        public let observedStale: Bool?
+        /// Non-optional Wave 1 bridge (`observedStale ?? false`) so callers expecting `Bool` compile cleanly until Wave 2 upgrades `ChatTemplateResponse.stale` to `Bool?`.
+        public var stale: Bool { observedStale ?? false }
         public let prefixStable: Bool
         public let prefixNote: String?
         public let modifiedSinceDownload: Bool?
         public let caps: TemplateCapabilities
+        /// Body of `chat_template.heylook.jinja` on disk even when outranked by an explicit path/override.
+        public let overrideTemplate: String?
+        /// Every copy of the chat template present in ladder order (`chat_template_files.py:template_sources`).
+        public let sources: [ChatTemplateSourceEntry]
+        /// Conversation shapes rejected by this template when probed.
+        public let refusedShapes: [String]
 
         public var overridePresent: Bool { hasOverride }
         public var detectedCapabilities: TemplateCapabilities { caps }
@@ -767,6 +1123,9 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             case prefixNote = "prefix_note"
             case modifiedSinceDownload = "modified_since_download"
             case caps
+            case overrideTemplate = "override_template"
+            case sources
+            case refusedShapes = "refused_shapes"
         }
 
         public init(
@@ -774,13 +1133,16 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             hasOverride: Bool,
             template: String,
             origin: String? = nil,
-            writable: Bool = !HeylookConfig.isModelConfigReadOnly,
+            writable: Bool = !HeylookConfig.isReadOnlyModelConfig,
             inertReason: String? = nil,
-            stale: Bool = false,
+            stale: Bool? = nil,
             prefixStable: Bool? = nil,
             prefixNote: String? = nil,
             modifiedSinceDownload: Bool? = nil,
-            caps: TemplateCapabilities? = nil
+            caps: TemplateCapabilities? = nil,
+            overrideTemplate: String? = nil,
+            sources: [ChatTemplateSourceEntry] = [],
+            refusedShapes: [String] = []
         ) {
             self.source = source
             self.hasOverride = hasOverride
@@ -788,7 +1150,7 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             self.origin = origin ?? (hasOverride ? "operator_override" : (source == "gguf_embedded" ? "gguf_header" : "vendor_file"))
             self.writable = writable
             self.inertReason = inertReason
-            self.stale = stale
+            self.observedStale = stale
             if let prefixStable {
                 self.prefixStable = prefixStable
                 self.prefixNote = prefixNote
@@ -799,6 +1161,9 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             }
             self.modifiedSinceDownload = modifiedSinceDownload
             self.caps = caps ?? HeylookJinjaRenderer.detectCapabilities(template: template)
+            self.overrideTemplate = overrideTemplate
+            self.sources = sources
+            self.refusedShapes = refusedShapes
         }
 
         public init(from decoder: Decoder) throws {
@@ -809,13 +1174,16 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 ?? false
             let template = try c.decode(String.self, forKey: .template)
             let origin = try c.decodeIfPresent(String.self, forKey: .origin)
-            let writable = try c.decodeIfPresent(Bool.self, forKey: .writable) ?? !HeylookConfig.isModelConfigReadOnly
+            let writable = try c.decodeIfPresent(Bool.self, forKey: .writable) ?? !HeylookConfig.isReadOnlyModelConfig
             let inertReason = try c.decodeIfPresent(String.self, forKey: .inertReason)
-            let stale = try c.decodeIfPresent(Bool.self, forKey: .stale) ?? false
+            let stale = try c.decodeIfPresent(Bool.self, forKey: .stale)
             let prefixStable = try c.decodeIfPresent(Bool.self, forKey: .prefixStable)
             let prefixNote = try c.decodeIfPresent(String.self, forKey: .prefixNote)
             let modified = try c.decodeIfPresent(Bool.self, forKey: .modifiedSinceDownload)
             let caps = try c.decodeIfPresent(TemplateCapabilities.self, forKey: .caps)
+            let overrideTemplate = try c.decodeIfPresent(String.self, forKey: .overrideTemplate)
+            let sources = try c.decodeIfPresent([ChatTemplateSourceEntry].self, forKey: .sources) ?? []
+            let refusedShapes = try c.decodeIfPresent([String].self, forKey: .refusedShapes) ?? []
             self.init(
                 source: source,
                 hasOverride: hasOverride,
@@ -827,7 +1195,10 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 prefixStable: prefixStable,
                 prefixNote: prefixNote,
                 modifiedSinceDownload: modified,
-                caps: caps
+                caps: caps,
+                overrideTemplate: overrideTemplate,
+                sources: sources,
+                refusedShapes: refusedShapes
             )
         }
 
@@ -840,24 +1211,39 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             try c.encode(origin, forKey: .origin)
             try c.encode(writable, forKey: .writable)
             try c.encode(inertReason, forKey: .inertReason)
-            try c.encode(stale, forKey: .stale)
+            if let observedStale {
+                try c.encode(observedStale, forKey: .stale)
+            } else {
+                try c.encodeNil(forKey: .stale)
+            }
             try c.encode(prefixStable, forKey: .prefixStable)
             try c.encode(prefixNote, forKey: .prefixNote)
             try c.encode(modifiedSinceDownload, forKey: .modifiedSinceDownload)
             try c.encode(caps, forKey: .caps)
+            if let overrideTemplate {
+                try c.encode(overrideTemplate, forKey: .overrideTemplate)
+            } else {
+                try c.encodeNil(forKey: .overrideTemplate)
+            }
+            try c.encode(sources, forKey: .sources)
+            try c.encode(refusedShapes, forKey: .refusedShapes)
         }
     }
 
-    /// Checks HuggingFace Hub `.cache/huggingface/download/<filename>.metadata` git-blob SHA-1 / LFS SHA-256 ETag
-    /// to detect whether a vendor file on disk was edited after download (`chat_template_files.py`).
-    /// Returns `nil` when no `.metadata` file exists, `false` when clean, and `true` when modified.
-    public static func checkModifiedSinceDownload(fileURL: URL, repoRoot: URL? = nil) -> Bool? {
+    public static func sha256Hex(_ text: String) -> String {
+        let digest = SHA256.hash(data: Data(text.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func hfFileProvenance(fileURL: URL, repoRoot: URL) -> (provenance: String, commit: String?, modifiedSinceDownload: Bool?) {
         let fm = FileManager.default
-        guard let fileData = try? Data(contentsOf: fileURL) else { return nil }
+        guard let fileData = try? Data(contentsOf: fileURL) else {
+            return ("no download record", nil, nil)
+        }
         let fileName = fileURL.lastPathComponent
         let dir = fileURL.deletingLastPathComponent()
         var candidateRoots = [dir]
-        if let repoRoot, repoRoot.standardizedFileURL.path != dir.standardizedFileURL.path {
+        if repoRoot.standardizedFileURL.path != dir.standardizedFileURL.path {
             candidateRoots.append(repoRoot)
         } else {
             candidateRoots.append(dir.deletingLastPathComponent())
@@ -877,6 +1263,8 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 .components(separatedBy: .newlines)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             guard lines.count >= 2 else { continue }
+            let commitRaw = lines[0]
+            let commit: String? = commitRaw.isEmpty ? nil : commitRaw
             let rawETag = lines[1].trimmingCharacters(in: CharacterSet(charactersIn: "\"'")).lowercased()
             if rawETag.count == 40, rawETag.allSatisfy({ $0.isHexDigit }) {
                 var gitBlob = Data("blob \(fileData.count)\0".utf8)
@@ -884,24 +1272,54 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 let digest = Insecure.SHA1.hash(data: gitBlob)
                     .map { String(format: "%02x", $0) }
                     .joined()
-                return digest != rawETag
+                let modified = (digest != rawETag)
+                return (modified ? "modified since download" : "downloaded", commit, modified)
             } else if rawETag.count == 64, rawETag.allSatisfy({ $0.isHexDigit }) {
                 let digest = SHA256.hash(data: fileData)
                     .map { String(format: "%02x", $0) }
                     .joined()
-                return digest != rawETag
+                let modified = (digest != rawETag)
+                return (modified ? "modified since download" : "downloaded", commit, modified)
+            }
+        }
+        return ("no download record", nil, nil)
+    }
+
+    /// Checks HuggingFace Hub `.cache/huggingface/download/<filename>.metadata` git-blob SHA-1 / LFS SHA-256 ETag
+    /// to detect whether a vendor file on disk was edited after download (`chat_template_files.py`).
+    /// Returns `nil` when no `.metadata` file exists, `false` when clean, and `true` when modified.
+    public static func checkModifiedSinceDownload(fileURL: URL, repoRoot: URL? = nil) -> Bool? {
+        let dir = fileURL.deletingLastPathComponent()
+        return hfFileProvenance(fileURL: fileURL, repoRoot: repoRoot ?? dir).modifiedSinceDownload
+    }
+
+    /// Extracts default chat template string from `tokenizer_config.json` or `chat_template.json`.
+    private static func readTemplateFromJSONFile(at url: URL) -> String? {
+        guard let dict = loadJSONDictionary(at: url) else { return nil }
+        if let str = dict["chat_template"] as? String {
+            return str
+        }
+        if let list = dict["chat_template"] as? [[String: Any]] {
+            if let defEntry = list.first(where: { ($0["name"] as? String) == "default" }),
+               let tpl = defEntry["template"] as? String {
+                return tpl
+            }
+            if let firstTpl = list.first?["template"] as? String {
+                return firstTpl
             }
         }
         return nil
     }
 
-    /// Inspects the active chat template in `candidateDir` across the 4-rung ladder:
-    /// `chat_template.heylook.jinja` (operator override) -> `chat_template.jinja` (vendor ship) ->
-    /// `tokenizer_config.json` -> `.gguf` header `tokenizer.chat_template` (`gguf_embedded`).
+    /// Inspects the active chat template in `candidateDir` across the full template ladder:
+    /// inline/sidecar `chat_template` -> `chat_template_path` -> `chat_template.heylook.jinja` ->
+    /// `chat_template.jinja` -> `tokenizer_config.json` -> `chat_template.json` -> `gguf_embedded`.
     public static func inspectChatTemplate(
         in candidateDir: URL,
-        fallbackSource: String = "default_chatml",
-        loadedTemplateText: String? = nil
+        fallbackSource: String = "none",
+        loadedTemplateText: String? = nil,
+        loadedTemplateSHA256: String? = nil,
+        refusedShapes: [String]? = nil
     ) -> ChatTemplateState {
         let dir = candidateDir.pathExtension.lowercased() == "gguf"
             ? candidateDir.deletingLastPathComponent()
@@ -911,19 +1329,16 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         let overrideURL = dir.appendingPathComponent("chat_template.heylook.jinja")
         let sidecarURL = dir.appendingPathComponent("chat_template.jinja")
         let tokConfigURL = dir.appendingPathComponent("tokenizer_config.json")
-        let writable = !isModelConfigReadOnly
+        let chatTemplateJSONURL = dir.appendingPathComponent("chat_template.json")
+        let writable = !isReadOnlyModelConfig && fm.isWritableFile(atPath: dir.path)
 
-        let inertReason: String?
-        if let explicitPath = sidecar?.chatTemplatePath, !explicitPath.isEmpty {
-            inertReason = "Explicit chat_template_path ('\(explicitPath)') in model.heylook.toml overrides chat_template.heylook.jinja."
-        } else {
-            inertReason = nil
-        }
+        let overrideOnDisk: String? = fm.fileExists(atPath: overrideURL.path)
+            ? (try? String(contentsOf: overrideURL, encoding: .utf8))
+            : nil
+        let hasOverride = overrideOnDisk != nil
 
-        func isStale(against diskTemplate: String) -> Bool {
-            guard let loadedTemplateText else { return false }
-            return loadedTemplateText != diskTemplate
-        }
+        // Gather all candidate template copies in ladder order so `sources` reports every copy present.
+        var rawCandidates: [(label: String, fileURL: URL?, body: String, fixedProv: String?, origin: String, sourceName: String)] = []
 
         if let inlineOrRef = sidecar?.chatTemplate, !inlineOrRef.isEmpty {
             let candidateFile = inlineOrRef.hasPrefix("/")
@@ -931,27 +1346,10 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 : dir.appendingPathComponent(inlineOrRef)
             if fm.fileExists(atPath: candidateFile.path),
                let t = try? String(contentsOf: candidateFile, encoding: .utf8) {
-                return ChatTemplateState(
-                    source: candidateFile.lastPathComponent,
-                    hasOverride: fm.fileExists(atPath: overrideURL.path),
-                    template: t,
-                    origin: "sidecar",
-                    writable: writable,
-                    inertReason: inertReason,
-                    stale: isStale(against: t),
-                    modifiedSinceDownload: checkModifiedSinceDownload(fileURL: candidateFile, repoRoot: dir)
-                )
+                rawCandidates.append(("explicit path", candidateFile, t, "explicit path", "sidecar", candidateFile.lastPathComponent))
+            } else {
+                rawCandidates.append(("model.heylook.toml", nil, inlineOrRef, "configured", "sidecar", "model.heylook.toml"))
             }
-            return ChatTemplateState(
-                source: "model.heylook.toml",
-                hasOverride: fm.fileExists(atPath: overrideURL.path),
-                template: inlineOrRef,
-                origin: "sidecar",
-                writable: writable,
-                inertReason: inertReason,
-                stale: isStale(against: inlineOrRef),
-                modifiedSinceDownload: nil
-            )
         }
 
         if let explicitPath = sidecar?.chatTemplatePath, !explicitPath.isEmpty {
@@ -959,84 +1357,141 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 ? URL(fileURLWithPath: explicitPath)
                 : dir.appendingPathComponent(explicitPath)
             if let t = try? String(contentsOf: explicitURL, encoding: .utf8) {
-                return ChatTemplateState(
-                    source: explicitURL.lastPathComponent,
-                    hasOverride: fm.fileExists(atPath: overrideURL.path),
-                    template: t,
-                    origin: "explicit_path",
-                    writable: writable,
-                    inertReason: inertReason,
-                    stale: isStale(against: t),
-                    modifiedSinceDownload: checkModifiedSinceDownload(fileURL: explicitURL, repoRoot: dir)
-                )
+                rawCandidates.append(("explicit path", explicitURL, t, "explicit path", "explicit_path", explicitURL.lastPathComponent))
             }
         }
 
-        if fm.fileExists(atPath: overrideURL.path),
-           let t = try? String(contentsOf: overrideURL, encoding: .utf8) {
-            return ChatTemplateState(
-                source: "chat_template.heylook.jinja",
-                hasOverride: true,
-                template: t,
-                origin: "operator_override",
-                writable: writable,
-                inertReason: inertReason,
-                stale: isStale(against: t),
-                modifiedSinceDownload: nil
-            )
+        if let overrideOnDisk {
+            rawCandidates.append(("heylook override", overrideURL, overrideOnDisk, "heylook override", "operator_override", "chat_template.heylook.jinja"))
         }
+
         let allowSidecar = sidecar?.useSidecarChatTemplate ?? true
-        if allowSidecar,
-           fm.fileExists(atPath: sidecarURL.path),
-           let t = try? String(contentsOf: sidecarURL, encoding: .utf8) {
-            return ChatTemplateState(
-                source: "chat_template.jinja",
-                hasOverride: false,
-                template: t,
-                origin: "vendor_sidecar",
-                writable: writable,
-                inertReason: inertReason,
-                stale: isStale(against: t),
-                modifiedSinceDownload: checkModifiedSinceDownload(fileURL: sidecarURL, repoRoot: dir)
-            )
+        if fm.fileExists(atPath: sidecarURL.path),
+           let t = try? String(contentsOf: sidecarURL, encoding: .utf8),
+           !t.isEmpty {
+            if allowSidecar {
+                rawCandidates.append(("chat_template.jinja", sidecarURL, t, nil, "vendor_sidecar", "chat_template.jinja"))
+            }
         }
-        if let tokJSON = loadJSONDictionary(at: tokConfigURL),
-           let t = tokJSON["chat_template"] as? String {
-            return ChatTemplateState(
-                source: "tokenizer_config.json",
-                hasOverride: false,
-                template: t,
-                origin: "tokenizer_config",
-                writable: writable,
-                inertReason: inertReason,
-                stale: isStale(against: t),
-                modifiedSinceDownload: checkModifiedSinceDownload(fileURL: tokConfigURL, repoRoot: dir)
-            )
+
+        if let tokTpl = readTemplateFromJSONFile(at: tokConfigURL), !tokTpl.isEmpty {
+            rawCandidates.append(("tokenizer_config.json (its chat_template)", tokConfigURL, tokTpl, nil, "tokenizer_config", "tokenizer_config.json"))
         }
+
+        if let jsonTpl = readTemplateFromJSONFile(at: chatTemplateJSONURL), !jsonTpl.isEmpty {
+            rawCandidates.append(("chat_template.json (its chat_template)", chatTemplateJSONURL, jsonTpl, nil, "chat_template_json", "chat_template.json"))
+        }
+
         if let ggufURL = firstGGUFFile(in: candidateDir),
            let ggufHeader = GGUFHeaderReader.readFileHeader(at: ggufURL),
            let embedded = ggufHeader.embeddedChatTemplate,
            !embedded.isEmpty {
-            return ChatTemplateState(
-                source: "gguf_embedded",
-                hasOverride: false,
-                template: embedded,
-                origin: "gguf_header",
-                writable: writable,
-                inertReason: inertReason,
-                stale: isStale(against: embedded),
-                modifiedSinceDownload: nil
-            )
+            rawCandidates.append(("embedded in the GGUF", nil, embedded, "embedded", "gguf_header", "gguf_embedded"))
         }
+
+        let winner = rawCandidates.first
+        let activeTemplate = winner?.body ?? ""
+        let activeSource = winner?.sourceName ?? fallbackSource
+        let activeOrigin = winner?.origin ?? "fallback"
+
+        let inertReason: String?
+        if let explicitPath = sidecar?.chatTemplatePath, !explicitPath.isEmpty {
+            inertReason = "Explicit chat_template_path ('\(explicitPath)') in model.heylook.toml overrides chat_template.heylook.jinja."
+        } else if hasOverride, winner?.origin != "operator_override" {
+            inertReason = "chat_template.heylook.jinja is on disk but not in force — the model resolves to '\(activeSource)' instead."
+        } else {
+            inertReason = nil
+        }
+
+        // Truthful staleness: `nil` when unloaded (neither loadedTemplateText nor loadedTemplateSHA256 known).
+        let activeSHA = activeTemplate.isEmpty ? nil : sha256Hex(activeTemplate)
+        let observedStale: Bool?
+        if let loadedSHA = loadedTemplateSHA256 {
+            observedStale = (activeSHA != nil) ? (loadedSHA != activeSHA) : false
+        } else if let loadedTemplateText {
+            observedStale = loadedTemplateText != activeTemplate
+        } else {
+            observedStale = nil
+        }
+
+        var modifiedWinner: Bool? = nil
+        if let winnerFile = winner?.fileURL, winner?.fixedProv == nil {
+            modifiedWinner = checkModifiedSinceDownload(fileURL: winnerFile, repoRoot: dir)
+        }
+
+        // Build full `sources` ladder entries
+        var claimed = false
+        var sourceEntries: [ChatTemplateSourceEntry] = []
+        sourceEntries.reserveCapacity(rawCandidates.count)
+        for cand in rawCandidates {
+            let prov: String
+            let commit: String?
+            if let fixed = cand.fixedProv {
+                prov = fixed
+                commit = nil
+            } else if let url = cand.fileURL {
+                let hf = hfFileProvenance(fileURL: url, repoRoot: dir)
+                prov = hf.provenance
+                commit = hf.commit
+            } else {
+                prov = "no download record"
+                commit = nil
+            }
+            let isInForce = !claimed && !activeTemplate.isEmpty && cand.body == activeTemplate
+            claimed = claimed || isInForce
+            let stability = HeylookJinjaRenderer.checkPrefixStability(template: cand.body)
+            let copyInfo = ModelTemplateInfo.analyze(
+                templateText: cand.body,
+                templateSource: cand.fileURL?.lastPathComponent ?? cand.sourceName
+            )
+            sourceEntries.append(ChatTemplateSourceEntry(
+                source: cand.label,
+                file: cand.fileURL?.lastPathComponent,
+                sha256: sha256Hex(cand.body),
+                inForce: isInForce,
+                provenance: prov,
+                downloadCommit: commit,
+                prefixStable: stability.stable,
+                prefixNote: stability.note,
+                thinking: copyInfo.thinkingControls.toEngineThinkingFacts(templateName: cand.fileURL?.lastPathComponent ?? cand.sourceName),
+                template: cand.body
+            ))
+        }
+
+        // If `chat_template.jinja` exists when `use_sidecar_chat_template == false`, still list it in `sources` (with `in_force: false`).
+        if !allowSidecar,
+           fm.fileExists(atPath: sidecarURL.path),
+           let disabledBody = try? String(contentsOf: sidecarURL, encoding: .utf8),
+           !disabledBody.isEmpty {
+            let hf = hfFileProvenance(fileURL: sidecarURL, repoRoot: dir)
+            let stability = HeylookJinjaRenderer.checkPrefixStability(template: disabledBody)
+            let copyInfo = ModelTemplateInfo.analyze(templateText: disabledBody, templateSource: "chat_template.jinja")
+            sourceEntries.append(ChatTemplateSourceEntry(
+                source: "chat_template.jinja (bypassed by use_sidecar_chat_template = false)",
+                file: "chat_template.jinja",
+                sha256: sha256Hex(disabledBody),
+                inForce: false,
+                provenance: hf.provenance,
+                downloadCommit: hf.commit,
+                prefixStable: stability.stable,
+                prefixNote: stability.note,
+                thinking: copyInfo.thinkingControls.toEngineThinkingFacts(templateName: "chat_template.jinja"),
+                template: disabledBody
+            ))
+        }
+
         return ChatTemplateState(
-            source: fallbackSource,
-            hasOverride: false,
-            template: "",
-            origin: "fallback",
+            source: activeSource,
+            hasOverride: hasOverride,
+            template: activeTemplate,
+            origin: activeOrigin,
             writable: writable,
             inertReason: inertReason,
-            stale: false,
-            modifiedSinceDownload: nil
+            stale: observedStale,
+            modifiedSinceDownload: modifiedWinner,
+            overrideTemplate: overrideOnDisk,
+            sources: sourceEntries,
+            refusedShapes: refusedShapes ?? []
         )
     }
 
@@ -1048,20 +1503,22 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         return FileManager.default.fileExists(atPath: dir.appendingPathComponent("chat_template.heylook.jinja").path)
     }
 
-    /// Validates Jinja2 syntax and writes `chat_template.heylook.jinja` inside `candidateDir` without mutating vendor files.
+    /// Validates Jinja2 syntax and standard message shapes, then writes `chat_template.heylook.jinja`
+    /// inside `candidateDir` without mutating vendor files.
     @discardableResult
     public static func writeChatTemplateOverride(
         _ template: String,
         in candidateDir: URL
     ) throws -> ChatTemplateState {
         try HeylookJinjaRenderer.validateSyntax(template)
+        let refused = HeylookJinjaRenderer.probeRefusedShapes(template: template)
         let dir = candidateDir.pathExtension.lowercased() == "gguf"
             ? candidateDir.deletingLastPathComponent()
             : candidateDir
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let overrideURL = dir.appendingPathComponent("chat_template.heylook.jinja")
         try template.write(to: overrideURL, atomically: true, encoding: .utf8)
-        return inspectChatTemplate(in: candidateDir)
+        return inspectChatTemplate(in: candidateDir, refusedShapes: refused)
     }
 
     /// Removes `chat_template.heylook.jinja` from `candidateDir` and returns the reverted template state.
@@ -1426,6 +1883,10 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 }
 
                 let configJSON = loadJSONDictionary(at: candidateDir.appendingPathComponent("config.json"))
+                let modelTypeLower = (configJSON?["model_type"] as? String)?.lowercased() ?? ""
+                if modelTypeLower == "gemma4_assistant" || modelTypeLower.hasSuffix("_assistant") {
+                    continue
+                }
                 if let archs = configJSON?["architectures"] as? [String],
                    archs.contains(where: { $0.localizedCaseInsensitiveContains("assistant") || $0 == "D1Model" }) {
                     continue
@@ -1579,24 +2040,39 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             ?? coreAILangArch
             ?? ggufHeader?.architecture
             ?? provider.rawValue
+
+        // Truthful embedding classification derived strictly from checkpoint artifacts — never from `modelID` substrings.
+        let hasSentenceTransformers = fm.fileExists(atPath: candidateDir.appendingPathComponent("modules.json").path)
+            || fm.fileExists(atPath: candidateDir.appendingPathComponent("config_sentence_transformers.json").path)
+        let configModelType = (configJSON?["model_type"] as? String)?.lowercased() ?? ""
+        let isBidirectional = (configJSON?["use_bidirectional_attention"] as? Bool) == true
         let isEmbedding = !isSpeechBundle && (
-            modelID.localizedCaseInsensitiveContains("embed")
-            || archString.localizedCaseInsensitiveContains("embedding")
+            hasSentenceTransformers
+            || isBidirectional
+            || configModelType == "embedding_gemma2"
+            || configModelType.contains("embedding")
             || (coreAIMeta?["kind"] as? String)?.lowercased() == "embedding"
+            || (ggufHeader?.isEmbedding == true)
         )
+
         let mmprojPath = provider == .gguf ? discoverMMProj(in: candidateDir) : nil
         let mmprojHeader = mmprojPath.flatMap { GGUFHeaderReader.readFileHeader(at: URL(fileURLWithPath: $0)) }
-        let rawHasVision = !isSpeechBundle && (
-            ModelTemplateInfo.hasVisionConfiguration(in: candidateDir, configJSON: configJSON)
-            || mmprojHeader?.hasVisionEncoder == true
-            || mmprojPath != nil
-            || isEmbedding
-        )
+        let coreAIComponents = coreAIMeta?["components"] as? [String: Any]
+        let hasCoreAIVision = coreAIComponents?["vision"] != nil
+        let hasCoreAIAudio = coreAIComponents?["audio"] != nil
+        let rawHasVision: Bool = if isSpeechBundle {
+            false
+        } else if provider == .gguf {
+            (mmprojHeader?.hasVisionEncoder == true) || (mmprojPath != nil && mmprojHeader == nil)
+        } else {
+            ModelTemplateInfo.hasVisionConfiguration(in: candidateDir, configJSON: configJSON) || hasCoreAIVision
+        }
         let hasVision = sidecar?.supportsVision ?? rawHasVision
         let hasAudio = isSpeechBundle
             || configJSON?["audio_config"] != nil
-            || mmprojHeader?.hasAudioEncoder == true
-            || isEmbedding
+            || configJSON?["audio_token_id"] != nil
+            || (mmprojHeader?.hasAudioEncoder == true)
+            || hasCoreAIAudio
         let coreAIMaxCtx = (coreAIMeta?["maxContextLength"] as? Int)
             ?? (coreAIMeta?["max_context_length"] as? Int)
             ?? ((coreAIMeta?["language"] as? [String: Any])?["max_context_length"] as? Int)
@@ -1625,10 +2101,14 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
                 provenance: .notApplicable,
                 effect: .reload
             )
+        } else if templateInfo.templateSource == "none" || templateInfo.templateSource == "default_chatml" || templateInfo.templateSource.isEmpty {
+            templateField = ProvenanceField(
+                value: "none",
+                provenance: .unknown,
+                effect: .reload
+            )
         } else {
-            let resolvedSource = templateInfo.templateSource == "default_chatml"
-                ? "tokenizer_config.json"
-                : templateInfo.templateSource
+            let resolvedSource = templateInfo.templateSource
             templateField = ProvenanceField(
                 value: resolvedSource,
                 provenance: resolvedSource == "chat_template.heylook.jinja" ? .configured : .derived,
@@ -1638,10 +2118,10 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
         let derivedSupportsThinking: Bool
         if isEmbedding || isSpeechBundle {
             derivedSupportsThinking = false
-        } else if templateInfo.templateSource != "default_chatml" {
+        } else if templateField.value != "none" {
             derivedSupportsThinking = templateInfo.thinkingControls.supportsThinking
         } else {
-            derivedSupportsThinking = true
+            derivedSupportsThinking = false
         }
 
         var tags = sidecar?.tags ?? []
@@ -1748,6 +2228,358 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
             speculativeDrafter: specDrafterField,
             estimatedMemoryMB: estimatedMB,
             tags: tags
+        )
+    }
+
+    // MARK: - Canonical Wire & EngineContract Builders (contract.py + capabilities.py + admin_api.py)
+
+    /// Derives `EngineContract` from a registered `EngineDescription` plus optional sidecar & live loaded snapshot.
+    /// Guarantees zero host paths are leaked (`EngineSanitization.publicValue`).
+    public static func buildEngineContract(
+        for description: EngineDescription,
+        sidecar: ModelSidecarConfig? = nil,
+        loadedSnapshot: [String: JSONValue]? = nil,
+        loadedTemplateText: String? = nil,
+        runningContextLength: Int? = nil,
+        runtimeCaps: [String: Bool]? = nil,
+        speculativeInForce: Bool? = nil
+    ) -> EngineContract {
+        let dirURL = resolveModelDirectoryURL(from: description.modelPath)
+        let activeSidecar = sidecar ?? loadSidecar(in: dirURL)
+        let tplState = inspectChatTemplate(
+            in: dirURL,
+            fallbackSource: "none",
+            loadedTemplateText: loadedTemplateText
+        )
+
+        let runtimeName: String
+        let runtimeDesc: String
+        let engineDefaultName: String
+        switch description.provider {
+        case .mlx:
+            runtimeName = "mlx-swift"
+            runtimeDesc = "every MLX model runs on the MLX Swift engine"
+            engineDefaultName = "mlx-swift-lm"
+        case .gguf:
+            runtimeName = "llama.cpp"
+            runtimeDesc = "every GGUF model runs on a llama-server subprocess"
+            engineDefaultName = "llama.cpp"
+        case .coreai:
+            runtimeName = "coreai"
+            runtimeDesc = "runs on Apple Neural Engine / CoreML runtime"
+            engineDefaultName = "coreai"
+        case .remote:
+            runtimeName = "remote-heylook"
+            runtimeDesc = "proxied to a peer Heylook instance over LAN HTTP"
+            engineDefaultName = "remote"
+        }
+
+        let lengthFact = Fact<Int>(
+            value: description.contextSize.value,
+            provenance: description.contextSize.provenance,
+            source: description.contextSize.provenance == .configured
+                ? "ctx_size configured for this model"
+                : "model checkpoint metadata"
+        )
+        let runningFact: Fact<Int> = if description.provider == .mlx || description.provider == .coreai {
+            Fact<Int>(
+                provenance: .notApplicable,
+                source: "\(runtimeName) grows KV allocations dynamically rather than fixing a context slot"
+            )
+        } else if let runningContextLength, description.isLoaded {
+            Fact<Int>(value: runningContextLength, provenance: .observed, source: "llama-server /props at ready")
+        } else {
+            Fact<Int>(provenance: .unknown, source: "not loaded")
+        }
+
+        let tplOrigin = Fact<String>(
+            value: tplState.template.isEmpty ? nil : tplState.origin,
+            provenance: tplState.template.isEmpty ? .unknown : .derived,
+            source: "chat template ladder"
+        )
+        let tplPathStr: String? = tplState.source == "gguf_embedded" || tplState.template.isEmpty
+            ? nil
+            : EngineSanitization.publicPathString(tplState.source)
+        let tplPathFact = Fact<String>(
+            value: tplPathStr,
+            provenance: tplPathStr != nil ? .derived : .unknown,
+            source: tplPathStr != nil ? "template file in force" : "embedded or absent"
+        )
+        let tplShaFact = Fact<String>(
+            value: tplState.template.isEmpty ? nil : sha256Hex(tplState.template),
+            provenance: tplState.template.isEmpty ? .unknown : .derived,
+            source: tplPathStr ?? "chat template ladder"
+        )
+        let runningShaFact: Fact<String> = if let loadedTemplateText {
+            Fact<String>(value: sha256Hex(loadedTemplateText), provenance: .observed, source: "template active in loaded provider")
+        } else {
+            Fact<String>(provenance: .unknown, source: "not loaded")
+        }
+        let prefixFact = Fact<Bool>(
+            value: tplState.template.isEmpty ? nil : tplState.prefixStable,
+            provenance: tplState.template.isEmpty ? .unknown : .derived,
+            source: tplState.prefixNote ?? "evaluated in HeylookJinjaRenderer"
+        )
+        let capsFact: Fact<[String: Bool]> = if let runtimeCaps {
+            Fact<[String: Bool]>(value: runtimeCaps, provenance: .observed, source: "running engine capability report")
+        } else if description.provider == .gguf {
+            Fact<[String: Bool]>(provenance: .unknown, source: "not loaded")
+        } else {
+            Fact<[String: Bool]>(provenance: .notApplicable, source: "\(runtimeName) evaluates templates natively")
+        }
+
+        let templateFacts = EngineTemplateFacts(
+            origin: tplOrigin,
+            path: tplPathFact,
+            sha256: tplShaFact,
+            runningSha256: runningShaFact,
+            prefixStable: prefixFact,
+            caps: capsFact
+        )
+
+        let isEmbedding = description.supportsEmbeddings.value
+        let resolvedVendorSamplers = isEmbedding
+            ? nil
+            : (description.provider == .gguf
+                ? firstGGUFFile(in: dirURL).flatMap { GGUFHeaderReader.readFileHeader(at: $0)?.vendorSampling }
+                : loadVendorSampling(in: dirURL))
+        let samplerSummary: SamplerCascade.ModelSamplerSummary? = isEmbedding
+            ? nil
+            : SamplerCascade.resolveModelDefaults(
+                vendor: resolvedVendorSamplers,
+                modelSidecar: activeSidecar?.sampling,
+                thinkingCapable: description.supportsThinking.value
+            )
+        let unstoredSamplerSummary: SamplerCascade.ModelSamplerSummary? = (!isEmbedding && activeSidecar != nil)
+            ? SamplerCascade.resolveModelDefaults(
+                vendor: resolvedVendorSamplers,
+                modelSidecar: nil,
+                thinkingCapable: description.supportsThinking.value
+            )
+            : nil
+
+        let explicitDict = activeSidecar?.toExplicitJSONDictionary() ?? [:]
+        var effectiveCfg = explicitDict
+        effectiveCfg["model_path"] = .string(description.modelPath)
+        effectiveCfg["ctx_size"] = .int(description.contextSize.value)
+
+        let settings = ProviderConfigSchema.buildEngineSettings(
+            provider: description.provider,
+            effectiveConfig: effectiveCfg,
+            explicitKeys: activeSidecar?.explicitKeys ?? [],
+            writtenStoreName: activeSidecar != nil ? "model.heylook.toml" : nil,
+            engineDefaultName: engineDefaultName,
+            samplerSummary: samplerSummary,
+            unstoredSamplerSummary: unstoredSamplerSummary
+        )
+
+        let discoveredDrafter = discoverDrafter(
+            in: dirURL,
+            provider: description.provider,
+            sidecar: activeSidecar
+        )
+        let drafterStr = description.speculativeDrafter.value.map(EngineSanitization.publicPathString)
+        let resolvedSpecType = activeSidecar?.specType ?? discoveredDrafter.specType
+        let drafterFact = Fact<String>(
+            value: drafterStr,
+            provenance: drafterStr != nil ? description.speculativeDrafter.provenance : .derived,
+            source: drafterStr != nil ? "discovered or configured speculative drafter" : "no speculative drafter attached"
+        )
+        let specTypeFact = Fact<String>(
+            value: resolvedSpecType,
+            provenance: activeSidecar?.specType != nil
+                ? .configured
+                : (resolvedSpecType != nil ? .derived : (drafterStr != nil ? .unknown : .notApplicable)),
+            source: activeSidecar?.specType != nil
+                ? "configured spec_type"
+                : (resolvedSpecType != nil ? "derived drafter mode" : (drafterStr != nil ? "unspecified drafter mode" : "no drafter"))
+        )
+        let inForceFact: Fact<Bool> = if let speculativeInForce {
+            Fact<Bool>(value: speculativeInForce, provenance: .observed, source: "running provider speculative status")
+        } else {
+            Fact<Bool>(provenance: .unknown, source: "not loaded")
+        }
+
+        let speculativeFacts = EngineSpeculativeFacts(
+            drafter: drafterFact,
+            type: specTypeFact,
+            inForce: inForceFact
+        )
+
+        let decodingFacts = EngineDecodingFacts(
+            mode: Fact<String>(
+                value: description.supportsEmbeddings.value ? "embedding" : "autoregressive",
+                provenance: .derived,
+                source: "derived from checkpoint configuration"
+            ),
+            requestFields: Fact<[String]>(
+                value: ProviderConfigSchema.wireSamplerFieldNames,
+                provenance: .derived,
+                source: "SamplerCascade.SamplerFieldKey"
+            )
+        )
+
+        let cacheFacts: [String: Fact<JSONValue>] = [
+            "reuse": Fact(
+                value: .string(description.provider == .gguf ? "host RAM prompt cache" : "in-memory prefix cache"),
+                provenance: .derived,
+                source: "derived from \(runtimeName) KV cache architecture"
+            ),
+            "disk": Fact(
+                value: .bool(false),
+                provenance: .derived,
+                source: "prompt-derived state is kept strictly in memory"
+            ),
+        ]
+
+        let thinkingFacts: EngineThinkingFacts? = description.supportsEmbeddings.value || description.isSpeechRecognizer
+            ? nil
+            : description.thinkingControls?.toEngineThinkingFacts(
+                templateName: tplState.template.isEmpty ? nil : EngineSanitization.publicPathString(tplState.source)
+            )
+
+        let embeddingFacts: EngineEmbeddingFacts? = if description.supportsEmbeddings.value {
+            {
+                var mods = ["text"]
+                if description.supportsVision.value { mods.append(contentsOf: ["image", "video"]) }
+                if description.supportsAudio.value { mods.append("audio") }
+                let prompts = (loadJSONDictionary(at: dirURL.appendingPathComponent("config_sentence_transformers.json"))?["prompts"] as? [String: String]) ?? [:]
+                return EngineEmbeddingFacts(
+                    modalities: mods,
+                    dimensions: [128, 256, 512, 768],
+                    nativeDimensions: 768,
+                    maxInputTokens: description.contextSize.value,
+                    prompts: prompts,
+                    normalization: "l2",
+                    videoAudio: "separate_audio_block",
+                    limits: EngineEmbeddingLimits(),
+                    computePlacement: description.computePlacement.value.rawValue
+                )
+            }()
+        } else {
+            nil
+        }
+
+        return EngineContract(
+            runtime: Fact<String>(value: runtimeName, provenance: .derived, source: runtimeDesc),
+            context: EngineContextFacts(length: lengthFact, running: runningFact),
+            template: templateFacts,
+            settings: settings,
+            cache: cacheFacts,
+            thinking: thinkingFacts,
+            speculative: speculativeFacts,
+            decoding: decodingFacts,
+            embedding: embeddingFacts
+        )
+    }
+
+    /// Derives `PublicModelWireRow` for `GET /v1/models` with zero host path leakage (`NEVER modelPath`).
+    public static func buildPublicWireRow(
+        for description: EngineDescription,
+        sidecar: ModelSidecarConfig? = nil
+    ) -> PublicModelWireRow {
+        let dirURL = resolveModelDirectoryURL(from: description.modelPath)
+        let activeSidecar = sidecar ?? loadSidecar(in: dirURL)
+        let isEmbedding = description.supportsEmbeddings.value
+
+        let thinkingDefault: Bool
+        let samplerDefaults: [String: JSONValue]
+        let samplerSources: [String: String]
+        if isEmbedding {
+            thinkingDefault = false
+            samplerDefaults = [:]
+            samplerSources = [:]
+        } else {
+            let vendorSamplers = description.provider == .gguf
+                ? firstGGUFFile(in: dirURL).flatMap { GGUFHeaderReader.readFileHeader(at: $0)?.vendorSampling }
+                : loadVendorSampling(in: dirURL)
+            let samplerSummary = SamplerCascade.resolveModelDefaults(
+                vendor: vendorSamplers,
+                modelSidecar: activeSidecar?.sampling,
+                thinkingCapable: description.supportsThinking.value
+            )
+            thinkingDefault = samplerSummary.thinkingDefault
+            samplerDefaults = samplerSummary.samplerDefaults
+            samplerSources = samplerSummary.samplerSources
+        }
+
+        var modalities = ["text"]
+        if description.supportsVision.value { modalities.append("vision") }
+        if description.supportsAudio.value { modalities.append("audio") }
+
+        var capabilities: [String] = []
+        if isEmbedding {
+            capabilities.append("embeddings")
+        } else if description.isSpeechRecognizer {
+            capabilities.append("transcription")
+        } else {
+            capabilities.append("chat")
+        }
+        if description.supportsVision.value { capabilities.append("vision") }
+        if description.supportsAudio.value { capabilities.append("audio") }
+        if !isEmbedding && description.supportsThinking.value {
+            capabilities.append("thinking")
+            if let depthVar = description.thinkingControls?.depthVariable, !depthVar.isEmpty {
+                capabilities.append("reasoning_effort")
+            }
+            if description.thinkingControls?.budgetEnforced == true {
+                capabilities.append("thinking_budget")
+            }
+        }
+
+        return PublicModelWireRow(
+            id: description.modelID,
+            provider: description.provider,
+            modalities: modalities,
+            capabilities: capabilities,
+            thinkingDefault: thinkingDefault,
+            samplerDefaults: samplerDefaults,
+            samplerSources: samplerSources,
+            engine: buildEngineContract(for: description, sidecar: activeSidecar)
+        )
+    }
+
+    /// Derives `AdminModelWireRow` for `GET /v1/admin/models` with `config` restricted strictly to explicitly stored keys.
+    public static func buildAdminWireRow(
+        for description: EngineDescription,
+        sidecar: ModelSidecarConfig? = nil,
+        isFromConfig: Bool = false,
+        loadedSnapshot: [String: JSONValue]? = nil,
+        loadedTemplateText: String? = nil
+    ) -> AdminModelWireRow {
+        let dirURL = resolveModelDirectoryURL(from: description.modelPath)
+        let activeSidecar = sidecar ?? loadSidecar(in: dirURL)
+        let publicRow = buildPublicWireRow(for: description, sidecar: activeSidecar)
+        let explicitConfig = activeSidecar?.toExplicitJSONDictionary() ?? [:]
+        let tplState = inspectChatTemplate(in: dirURL, loadedTemplateText: loadedTemplateText)
+        let staleFields = description.isLoaded
+            ? ProviderConfigSchema.staleReloadFields(
+                provider: description.provider,
+                loadedSnapshot: loadedSnapshot,
+                currentConfig: explicitConfig,
+                chatTemplateStale: tplState.observedStale
+            )
+            : []
+
+        return AdminModelWireRow(
+            id: description.modelID,
+            provider: description.provider,
+            description: nil,
+            tags: description.tags,
+            capabilities: publicRow.capabilities,
+            config: explicitConfig,
+            loaded: description.isLoaded,
+            source: (isFromConfig || activeSidecar != nil) ? .config : .discovered,
+            staleReloadFields: staleFields,
+            engine: buildEngineContract(
+                for: description,
+                sidecar: activeSidecar,
+                loadedSnapshot: loadedSnapshot,
+                loadedTemplateText: loadedTemplateText
+            ),
+            thinkingDefault: publicRow.thinkingDefault,
+            samplerDefaults: publicRow.samplerDefaults,
+            samplerSources: publicRow.samplerSources
         )
     }
 
@@ -1869,41 +2701,45 @@ public struct HeylookConfig: Codable, Sendable, Equatable {
     }
 }
 
-/// Zero-dependency TOML parser supporting flat keys, `[section]` tables, `[[array_of_tables]]`,
-/// and multi-line array values (`folders = [\n  "...",\n]`) for `heylook.toml` and `model.heylook.toml`.
+/// Legacy `SimpleTOML` interface bridged cleanly over the spec-accurate recursive-descent `TOMLCodec`
+/// so all quoted strings containing commas, escapes, inline tables, and nested tables parse accurately.
 enum SimpleTOML {
     struct Value {
         let raw: String
+        let tomlValue: TOMLValue
+
+        init(raw: String) {
+            self.raw = raw
+            if let parsed = try? TOMLCodec.parse("v = \(raw)"), let v = parsed["v"] {
+                self.tomlValue = v
+            } else {
+                var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if (s.hasPrefix("\"") && s.hasSuffix("\"")) || (s.hasPrefix("'") && s.hasSuffix("'")), s.count >= 2 {
+                    s.removeFirst(); s.removeLast()
+                }
+                self.tomlValue = .string(s)
+            }
+        }
+
+        init(_ tomlValue: TOMLValue) {
+            self.tomlValue = tomlValue
+            self.raw = TOMLCodec.formatValue(tomlValue)
+        }
 
         var stringValue: String {
-            var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if (s.hasPrefix("\"") && s.hasSuffix("\"")) || (s.hasPrefix("'") && s.hasSuffix("'")), s.count >= 2 {
-                s.removeFirst()
-                s.removeLast()
-            }
-            return s
+            tomlValue.stringValue ?? {
+                var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if (s.hasPrefix("\"") && s.hasSuffix("\"")) || (s.hasPrefix("'") && s.hasSuffix("'")), s.count >= 2 {
+                    s.removeFirst(); s.removeLast()
+                }
+                return s
+            }()
         }
 
-        var intValue: Int? { Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) }
-        var doubleValue: Double? { Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)) }
-        var boolValue: Bool? {
-            switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "true": return true
-            case "false": return false
-            default: return nil
-            }
-        }
-
-        var stringArrayValue: [String]? {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmed.hasPrefix("[") && trimmed.hasSuffix("]") else { return nil }
-            let inner = trimmed.dropFirst().dropLast().trimmingCharacters(in: .whitespacesAndNewlines)
-            if inner.isEmpty { return [] }
-            return inner
-                .split(separator: ",")
-                .map { Value(raw: String($0)).stringValue }
-                .filter { !$0.isEmpty }
-        }
+        var intValue: Int? { tomlValue.intValue }
+        var doubleValue: Double? { tomlValue.doubleValue }
+        var boolValue: Bool? { tomlValue.boolValue }
+        var stringArrayValue: [String]? { tomlValue.stringArrayValue }
     }
 
     struct Document {
@@ -1924,93 +2760,40 @@ enum SimpleTOML {
     }
 
     static func parseDocument(_ text: String) -> Document {
+        let parsed = TOMLCodec.parseBestEffort(text)
         var doc = Document()
-        enum Target {
-            case root
-            case section(String)
-            case arrayItem(String, Int)
-        }
-        var currentTarget: Target = .root
-        var pendingKey: String?
-        var pendingArrayBuffer = ""
-
-        func store(key: String, value: Value) {
-            switch currentTarget {
-            case .root:
-                doc.root[key] = value
-            case .section(let name):
-                var sec = doc.sections[name] ?? [:]
-                sec[key] = value
-                doc.sections[name] = sec
-            case .arrayItem(let name, let idx):
-                doc.arrayOfTables[name]?[idx][key] = value
-            }
-        }
-
-        for rawLine in text.components(separatedBy: .newlines) {
-            let line = stripInlineComment(from: rawLine)
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty { continue }
-
-            if let key = pendingKey {
-                pendingArrayBuffer.append(" " + trimmed)
-                if trimmed.hasSuffix("]") {
-                    store(key: key, value: Value(raw: pendingArrayBuffer))
-                    pendingKey = nil
-                    pendingArrayBuffer = ""
+        for (k, v) in parsed {
+            switch v {
+            case .table(let sub):
+                var sec: [String: Value] = [:]
+                for (sk, sv) in sub { sec[sk] = Value(sv) }
+                doc.sections[k] = sec
+            case .array(let items) where !items.isEmpty && items.allSatisfy({ if case .table = $0 { return true }; return false }):
+                var rows: [[String: Value]] = []
+                for item in items {
+                    if case .table(let rowTable) = item {
+                        var flat: [String: Value] = [:]
+                        for (rk, rv) in rowTable {
+                            if rk == "config", case .table(let cfgSub) = rv {
+                                for (ck, cv) in cfgSub { flat[ck] = Value(cv) }
+                            } else {
+                                flat[rk] = Value(rv)
+                            }
+                        }
+                        rows.append(flat)
+                    }
                 }
-                continue
-            }
-
-            if trimmed.hasPrefix("[[") && trimmed.hasSuffix("]]") && trimmed.count > 4 {
-                let tableName = String(trimmed.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespaces)
-                var list = doc.arrayOfTables[tableName] ?? []
-                list.append([:])
-                doc.arrayOfTables[tableName] = list
-                currentTarget = .arrayItem(tableName, list.count - 1)
-                continue
-            }
-
-            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") && trimmed.count > 2 {
-                let secName = String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
-                currentTarget = .section(secName)
-                continue
-            }
-
-            let parts = trimmed.split(separator: "=", maxSplits: 1)
-            guard parts.count == 2 else { continue }
-            let key = parts[0].trimmingCharacters(in: .whitespaces)
-            let val = parts[1].trimmingCharacters(in: .whitespaces)
-            if val.hasPrefix("[") && !val.hasSuffix("]") {
-                pendingKey = key
-                pendingArrayBuffer = val
-            } else {
-                store(key: key, value: Value(raw: val))
+                doc.arrayOfTables[k] = rows
+            default:
+                doc.root[k] = Value(v)
             }
         }
         return doc
     }
-
-    private static func stripInlineComment(from line: String) -> String {
-        var inDoubleQuotes = false
-        var inSingleQuotes = false
-        var result = ""
-        for ch in line {
-            if ch == "\"" && !inSingleQuotes {
-                inDoubleQuotes.toggle()
-            } else if ch == "'" && !inDoubleQuotes {
-                inSingleQuotes.toggle()
-            } else if ch == "#" && !inDoubleQuotes && !inSingleQuotes {
-                break
-            }
-            result.append(ch)
-        }
-        return result
-    }
 }
 
 /// Pure-Swift GGUF v2/v3 binary header reader that inspects magic bytes, version,
-/// tensor/KV counts, and string/integer/boolean/float metadata without spawning a C++ process.
+/// tensor/KV counts, tensor names, and string/integer/boolean/float metadata without spawning a C++ process.
 public enum GGUFHeaderReader {
     public struct HeaderSummary: Sendable, Equatable {
         public let version: UInt32
@@ -2020,6 +2803,7 @@ public enum GGUFHeaderReader {
         public let uintMetadata: [String: UInt64]
         public let boolMetadata: [String: Bool]
         public let doubleMetadata: [String: Double]
+        public let tensorNames: [String]
 
         public init(
             version: UInt32,
@@ -2028,7 +2812,8 @@ public enum GGUFHeaderReader {
             stringMetadata: [String: String] = [:],
             uintMetadata: [String: UInt64] = [:],
             boolMetadata: [String: Bool] = [:],
-            doubleMetadata: [String: Double] = [:]
+            doubleMetadata: [String: Double] = [:],
+            tensorNames: [String] = []
         ) {
             self.version = version
             self.tensorCount = tensorCount
@@ -2037,6 +2822,7 @@ public enum GGUFHeaderReader {
             self.uintMetadata = uintMetadata
             self.boolMetadata = boolMetadata
             self.doubleMetadata = doubleMetadata
+            self.tensorNames = tensorNames
         }
 
         public var architecture: String? {
@@ -2057,6 +2843,21 @@ public enum GGUFHeaderReader {
             return nil
         }
 
+        /// Pooling type from `<arch>.pooling_type` (> 0 indicates sentence/multimodal embedding checkpoint).
+        public var poolingType: UInt64? {
+            if let arch = architecture, let val = uintMetadata["\(arch).pooling_type"] {
+                return val
+            }
+            return uintMetadata.first(where: { $0.key.hasSuffix(".pooling_type") })?.value
+        }
+
+        /// True when GGUF architecture or `pooling_type` indicates an embedding checkpoint.
+        public var isEmbedding: Bool {
+            if architecture == "gemma-embedding2" { return true }
+            if let p = poolingType, p > 0 { return true }
+            return false
+        }
+
         public var hasVisionEncoder: Bool {
             boolMetadata["clip.has_vision_encoder"] == true
         }
@@ -2066,51 +2867,100 @@ public enum GGUFHeaderReader {
         }
 
         public var clipProjectorType: String? {
-            stringMetadata["clip.projector_type"]
+            stringMetadata["clip.projector_type"] ?? stringMetadata["clip.vision.projector_type"]
         }
 
-        /// True when `clip.projector_type` is a non-causal vision projector (`gemma4v`, `qwen2vl`,
+        /// True when `clip.projector_type` is a non-causal vision projector (`gemma4`, `siglip`, `qwen2vl`,
         /// `qwen2.5vl`, `qwen3vl`, `pixtral`, `internvl`) where `llama-server` requires
         /// `--image-max-tokens <= n_ubatch` so `llama_context::decode` does not abort.
         public var hasNonCausalVisionProjector: Bool {
             guard let proj = clipProjectorType?.lowercased() else { return false }
-            let nonCausal = ["gemma4", "qwen2vl", "qwen2.5vl", "qwen3vl", "qwen3_5", "pixtral", "internvl", "minicpmv"]
+            let nonCausal = ["gemma4", "siglip", "qwen2vl", "qwen2.5vl", "qwen3vl", "qwen3_5", "pixtral", "internvl", "minicpmv"]
             return nonCausal.contains(where: { proj.contains($0) })
         }
 
-        /// True when the GGUF header declares a hybrid-recurrent SSM architecture (`*.ssm.conv_kernel`,
-        /// `*.ssm.inner_size`, or `*.ssm.state_size`), requiring `--cache-ram 8192` in `llama-server`.
+        /// True when the GGUF header declares sliding-window attention (`*.attention.sliding_window > 0`).
+        public var hasSlidingWindowAttention: Bool {
+            uintMetadata.contains { key, val in
+                key.hasSuffix(".attention.sliding_window") && val > 0
+            }
+        }
+
+        /// True when the GGUF header declares linear-attention / delta-net SSM layers (`linear_attention` or `*.ssm.time_step_rank`).
+        public var hasLinearAttention: Bool {
+            let allKeys = Array(uintMetadata.keys) + Array(stringMetadata.keys) + Array(boolMetadata.keys)
+            return allKeys.contains { key in
+                let lower = key.lowercased()
+                return lower.contains("linear_attention") || lower.hasSuffix(".ssm.time_step_rank")
+            }
+        }
+
+        /// Memory kind classification matching `gguf_metadata.py:memory_kind` (`"hybrid_recurrent"` | `"sliding_window"` | `"full_attention"`).
+        public var memoryKind: String? {
+            guard architecture != nil else { return nil }
+            let hasSSM = uintMetadata.keys.contains { key in
+                key.hasSuffix(".ssm.conv_kernel")
+                    || key.hasSuffix(".ssm.inner_size")
+                    || key.hasSuffix(".ssm.state_size")
+            } || hasLinearAttention
+            if hasSSM {
+                return "hybrid_recurrent"
+            }
+            if hasSlidingWindowAttention {
+                return "sliding_window"
+            }
+            return "full_attention"
+        }
+
+        /// True when the GGUF header declares recurrent/SSM, linear-attention, or sliding-window checkpointed memory,
+        /// requiring `--cache-ram` / context checkpoints in `llama-server`.
         public var isHybridRecurrent: Bool {
             uintMetadata.keys.contains { key in
                 key.hasSuffix(".ssm.conv_kernel")
                     || key.hasSuffix(".ssm.inner_size")
                     || key.hasSuffix(".ssm.state_size")
-            }
+            } || hasLinearAttention || hasSlidingWindowAttention
         }
 
-        /// True when the GGUF header declares built-in Multi-Token Prediction layers (`*.nextn_predict_layers > 0`).
+        /// Derived speculative drafter type matching `gguf_metadata.py:spec_type_from_gguf` (`"draft-dflash"`, `"draft-eagle3"`, `"draft-mtp"`).
+        public var speculativeType: String? {
+            if let arch = architecture?.lowercased() {
+                if arch == "dflash" {
+                    return "draft-dflash"
+                }
+                if arch == "eagle" || arch == "eagle3" || arch == "draft-eagle3" {
+                    return "draft-eagle3"
+                }
+            }
+            if uintMetadata.contains(where: { $0.key.hasSuffix(".nextn_predict_layers") && $0.value > 0 }) {
+                return "draft-mtp"
+            }
+            if tensorNames.contains(where: { $0.contains(".nextn.") || $0.hasPrefix("nextn.") }) {
+                return "draft-mtp"
+            }
+            return nil
+        }
+
+        /// True when the GGUF header declares built-in Multi-Token Prediction layers (`*.nextn_predict_layers > 0` or `nextn.*` tensors).
         public var hasBuiltInMTP: Bool {
             uintMetadata.contains { key, val in
                 key.hasSuffix(".nextn_predict_layers") && val > 0
-            }
+            } || tensorNames.contains(where: { $0.contains(".nextn.") || $0.hasPrefix("nextn.") })
         }
 
-        /// Extracts vendor sampling recommendations (`general.sampling.*`) embedded in the GGUF header.
+        /// Extracts vendor sampling recommendations strictly from `SamplerCascade.vendorSamplingKeys`
+        /// (`general.sampling.temp`, `general.sampling.top_p`, `general.sampling.top_k`) embedded in the GGUF header.
         public var vendorSampling: SamplerSettings? {
-            let temp = doubleMetadata["general.sampling.temp"]
-            let topP = doubleMetadata["general.sampling.top_p"]
-            let minP = doubleMetadata["general.sampling.min_p"]
+            let temp = doubleMetadata["general.sampling.temp"].map { (($0 * 1_000_000).rounded() / 1_000_000) }
+            let topP = doubleMetadata["general.sampling.top_p"].map { (($0 * 1_000_000).rounded() / 1_000_000) }
             let topK = uintMetadata["general.sampling.top_k"].map(Int.init)
-            let repPen = doubleMetadata["general.sampling.penalty_repeat"]
-            guard temp != nil || topP != nil || minP != nil || topK != nil || repPen != nil else {
+            guard temp != nil || topP != nil || topK != nil else {
                 return nil
             }
             return SamplerSettings(
                 temperature: temp,
                 topP: topP,
-                topK: topK,
-                minP: minP,
-                repetitionPenalty: repPen
+                topK: topK
             )
         }
     }
@@ -2275,11 +3125,27 @@ public enum GGUFHeaderReader {
             }
 
             let maxEntries = min(kvCount, 1_000_000)
+            var kvComplete = true
             for _ in 0..<maxEntries {
-                guard offset < totalBytes else { break }
-                guard let key = readString(), let valType = readUInt32() else { break }
+                guard offset < totalBytes else { kvComplete = false; break }
+                guard let key = readString(), let valType = readUInt32() else { kvComplete = false; break }
                 if !skipOrReadValue(type: valType, key: key) {
+                    kvComplete = false
                     break
+                }
+            }
+
+            var tensorNames: [String] = []
+            if kvComplete && tensorCount > 0 {
+                let maxTensors = min(tensorCount, 200_000)
+                tensorNames.reserveCapacity(Int(min(maxTensors, 4096)))
+                for _ in 0..<maxTensors {
+                    guard offset < totalBytes else { break }
+                    guard let name = readString(), let nDims = readUInt32() else { break }
+                    let tailBytes = Int(nDims) * 8 + 4 + 8
+                    guard nDims <= 16, offset + tailBytes <= totalBytes else { break }
+                    tensorNames.append(name)
+                    offset += tailBytes
                 }
             }
 
@@ -2290,7 +3156,8 @@ public enum GGUFHeaderReader {
                 stringMetadata: strings,
                 uintMetadata: uints,
                 boolMetadata: bools,
-                doubleMetadata: doubles
+                doubleMetadata: doubles,
+                tensorNames: tensorNames
             )
         }
     }

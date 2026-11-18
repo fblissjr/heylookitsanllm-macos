@@ -611,6 +611,486 @@ public enum HeylookJinjaRenderer {
 
         return (true, nil)
     }
+
+    // MARK: - AST Inspection & Compiled Probe Helpers (thinking_controls.py & chat_template_files.py)
+
+    /// Pre-parsed Jinja template AST for fast repeated probe rendering and variable inspection.
+    public struct CompiledTemplate: Sendable {
+        public let source: String
+        fileprivate let statements: [Stmt]
+
+        /// Evaluates this pre-parsed template against `context`.
+        public func render(context: [String: JinjaValue]) throws -> String {
+            let evaluator = TemplateEvaluator(rootGlobals: context)
+            return try evaluator.evaluate(statements)
+        }
+
+        /// Returns all undeclared free variables referenced by the template (`jinja2.meta.find_undeclared_variables`).
+        public func undeclaredVariables() -> Set<String> {
+            var collector = ASTInspector()
+            return collector.findUndeclaredVariables(in: statements)
+        }
+
+        /// Returns valid depth identifier literals directly associated with `variable` in comparisons, tests,
+        /// `default` filters, conditionals, or assignments (`thinking_controls.py:_associated_literals`).
+        public func associatedDepthLiterals(for variable: String) -> [String] {
+            let collector = ASTInspector()
+            return collector.associatedDepthLiterals(in: statements, variable: variable)
+        }
+
+        /// Returns words assigned to a single target that receives values from at least 2 distinct render outputs
+        /// (`thinking_controls.py:_normalized_spellings`).
+        public func normalizedDepthWords(groupByWord: [String: String]) -> Set<String> {
+            let collector = ASTInspector()
+            return collector.normalizedDepthWords(in: statements, groupByWord: groupByWord)
+        }
+    }
+
+    /// Parses and compiles a Jinja2 template once for repeated inspection/rendering.
+    public static func compile(_ template: String, lstripBlocks: Bool = true, trimBlocks: Bool = true) throws -> CompiledTemplate {
+        let tokens = try TemplateLexer.lex(template, lstripBlocks: lstripBlocks, trimBlocks: trimBlocks)
+        let stmts = try TemplateParser.parse(tokens)
+        return CompiledTemplate(source: template, statements: stmts)
+    }
+
+    /// Returns all undeclared variables read by `template`.
+    public static func findUndeclaredVariables(in template: String) throws -> Set<String> {
+        try compile(template).undeclaredVariables()
+    }
+
+    /// Returns string constants directly tied to `variable` in `template`'s AST.
+    public static func associatedDepthLiterals(in template: String, variable: String) -> [String] {
+        (try? compile(template).associatedDepthLiterals(for: variable)) ?? []
+    }
+
+    /// Returns candidate words normalized into shared variables across 2+ render groups.
+    public static func normalizedDepthWords(in template: String, groupByWord: [String: String]) -> Set<String> {
+        (try? compile(template).normalizedDepthWords(groupByWord: groupByWord)) ?? []
+    }
+
+    /// Standard conversation shapes probed when inspecting or saving chat templates (`chat_template_files.py:_PROBE_SHAPES`).
+    public static func probeRefusedShapes(template: String) -> [String] {
+        guard !template.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+        guard let compiled = try? compile(template) else {
+            return ["syntax: invalid Jinja template"]
+        }
+
+        let probeShapes: [(label: String, messages: [[String: String]])] = [
+            (
+                "user+assistant+user",
+                [
+                    ["role": "user", "content": "ping"],
+                    ["role": "assistant", "content": "pong"],
+                    ["role": "user", "content": "ping"],
+                ]
+            ),
+            (
+                "system+user",
+                [
+                    ["role": "system", "content": "be brief"],
+                    ["role": "user", "content": "ping"],
+                ]
+            ),
+            (
+                "user+assistant",
+                [
+                    ["role": "user", "content": "ping"],
+                    ["role": "assistant", "content": "pong"],
+                ]
+            ),
+            (
+                "system+system+user",
+                [
+                    ["role": "system", "content": "be brief"],
+                    ["role": "system", "content": "and kind"],
+                    ["role": "user", "content": "ping"],
+                ]
+            ),
+        ]
+
+        var refused: [String] = []
+        for shape in probeShapes {
+            let msgValues: [JinjaValue] = shape.messages.map { msg in
+                .object([
+                    "role": .string(msg["role"] ?? ""),
+                    "content": .string(msg["content"] ?? ""),
+                ])
+            }
+            let ctx: [String: JinjaValue] = [
+                "messages": .array(msgValues),
+                "add_generation_prompt": .bool(true),
+                "bos_token": .string(""),
+                "eos_token": .string(""),
+                "enable_thinking": .bool(false),
+            ]
+            do {
+                _ = try compiled.render(context: ctx)
+            } catch {
+                refused.append("\(shape.label): \(error.localizedDescription)")
+            }
+        }
+        return refused
+    }
+}
+
+private struct ASTInspector {
+    private static let builtins: Set<String> = [
+        "loop", "namespace", "range", "dict", "strftime_now", "raise_exception",
+        "true", "false", "none", "null"
+    ]
+
+    mutating func findUndeclaredVariables(in stmts: [Stmt]) -> Set<String> {
+        var declared = Self.builtins
+        var undeclared: Set<String> = []
+
+        func walkBlock(_ block: [Stmt], scopeDeclared: inout Set<String>) {
+            for stmt in block {
+                switch stmt {
+                case .text:
+                    break
+                case .output(let expr):
+                    walkExpr(expr, scopeDeclared: scopeDeclared)
+                case .ifStmt(let branches, let elseBody):
+                    for branch in branches {
+                        walkExpr(branch.cond, scopeDeclared: scopeDeclared)
+                        var branchScope = scopeDeclared
+                        walkBlock(branch.body, scopeDeclared: &branchScope)
+                    }
+                    var elseScope = scopeDeclared
+                    walkBlock(elseBody, scopeDeclared: &elseScope)
+                case .forStmt(let targets, let iter, let filter, let body, let elseBody):
+                    walkExpr(iter, scopeDeclared: scopeDeclared)
+                    var loopScope = scopeDeclared
+                    for t in targets { loopScope.insert(t) }
+                    if let filter { walkExpr(filter, scopeDeclared: loopScope) }
+                    walkBlock(body, scopeDeclared: &loopScope)
+                    var elseScope = scopeDeclared
+                    walkBlock(elseBody, scopeDeclared: &elseScope)
+                case .setAssign(let targets, let attr, let value):
+                    walkExpr(value, scopeDeclared: scopeDeclared)
+                    if attr == nil {
+                        for t in targets { scopeDeclared.insert(t) }
+                    } else if let rootVar = targets.first, !scopeDeclared.contains(rootVar) {
+                        undeclared.insert(rootVar)
+                    }
+                case .setBlock(let target, let body):
+                    var innerScope = scopeDeclared
+                    walkBlock(body, scopeDeclared: &innerScope)
+                    scopeDeclared.insert(target)
+                case .macroDef(let name, let params, let body):
+                    scopeDeclared.insert(name)
+                    var macroScope = scopeDeclared
+                    for param in params {
+                        if let defExpr = param.defaultVal {
+                            walkExpr(defExpr, scopeDeclared: macroScope)
+                        }
+                        macroScope.insert(param.name)
+                    }
+                    walkBlock(body, scopeDeclared: &macroScope)
+                case .doStmt(let expr):
+                    walkExpr(expr, scopeDeclared: scopeDeclared)
+                case .breakStmt, .continueStmt:
+                    break
+                }
+            }
+        }
+
+        func walkExpr(_ expr: Expr, scopeDeclared: Set<String>) {
+            switch expr {
+            case .literal:
+                break
+            case .variable(let name):
+                if !scopeDeclared.contains(name) {
+                    undeclared.insert(name)
+                }
+            case .list(let items), .tuple(let items):
+                for item in items { walkExpr(item, scopeDeclared: scopeDeclared) }
+            case .dict(let pairs):
+                for (k, v) in pairs {
+                    walkExpr(k, scopeDeclared: scopeDeclared)
+                    walkExpr(v, scopeDeclared: scopeDeclared)
+                }
+            case .unary(_, let inner):
+                walkExpr(inner, scopeDeclared: scopeDeclared)
+            case .binary(_, let lhs, let rhs):
+                walkExpr(lhs, scopeDeclared: scopeDeclared)
+                walkExpr(rhs, scopeDeclared: scopeDeclared)
+            case .conditional(let cond, let ifTrue, let ifFalse):
+                walkExpr(cond, scopeDeclared: scopeDeclared)
+                walkExpr(ifTrue, scopeDeclared: scopeDeclared)
+                if let ifFalse { walkExpr(ifFalse, scopeDeclared: scopeDeclared) }
+            case .getattr(let base, _):
+                walkExpr(base, scopeDeclared: scopeDeclared)
+            case .getitem(let base, let key):
+                walkExpr(base, scopeDeclared: scopeDeclared)
+                walkExpr(key, scopeDeclared: scopeDeclared)
+            case .slice(let base, let start, let stop, let step):
+                walkExpr(base, scopeDeclared: scopeDeclared)
+                if let start { walkExpr(start, scopeDeclared: scopeDeclared) }
+                if let stop { walkExpr(stop, scopeDeclared: scopeDeclared) }
+                if let step { walkExpr(step, scopeDeclared: scopeDeclared) }
+            case .call(let callee, let args, let kwargs):
+                // Do not count bare global call names like `namespace()` as undeclared if built-in,
+                // otherwise walk callee normally (so macro or callable vars are checked).
+                walkExpr(callee, scopeDeclared: scopeDeclared)
+                for a in args { walkExpr(a, scopeDeclared: scopeDeclared) }
+                for (_, v) in kwargs { walkExpr(v, scopeDeclared: scopeDeclared) }
+            case .filter(let target, _, let args, let kwargs):
+                walkExpr(target, scopeDeclared: scopeDeclared)
+                for a in args { walkExpr(a, scopeDeclared: scopeDeclared) }
+                for (_, v) in kwargs { walkExpr(v, scopeDeclared: scopeDeclared) }
+            case .test(let target, _, let args, _):
+                walkExpr(target, scopeDeclared: scopeDeclared)
+                for a in args { walkExpr(a, scopeDeclared: scopeDeclared) }
+            }
+        }
+
+        walkBlock(stmts, scopeDeclared: &declared)
+        return undeclared
+    }
+
+    func associatedDepthLiterals(in stmts: [Stmt], variable: String) -> [String] {
+        var collected: [String] = []
+        var seen: Set<String> = []
+
+        func appendStringConstants(from expr: Expr) {
+            switch expr {
+            case .literal(.string(let s)):
+                if isValidLiteral(s) && seen.insert(s).inserted {
+                    collected.append(s)
+                }
+            case .list(let items), .tuple(let items):
+                for item in items { appendStringConstants(from: item) }
+            case .binary(_, let lhs, let rhs):
+                appendStringConstants(from: lhs)
+                appendStringConstants(from: rhs)
+            case .conditional(_, let a, let b):
+                appendStringConstants(from: a)
+                if let b { appendStringConstants(from: b) }
+            default:
+                break
+            }
+        }
+
+        func namesVariable(_ expr: Expr) -> Bool {
+            switch expr {
+            case .literal: return false
+            case .variable(let name): return name == variable
+            case .list(let items), .tuple(let items): return items.contains(where: namesVariable)
+            case .dict(let pairs): return pairs.contains { namesVariable($0.0) || namesVariable($0.1) }
+            case .unary(_, let inner): return namesVariable(inner)
+            case .binary(_, let lhs, let rhs): return namesVariable(lhs) || namesVariable(rhs)
+            case .conditional(let c, let a, let b):
+                return namesVariable(c) || namesVariable(a) || (b.map(namesVariable) ?? false)
+            case .getattr(let base, _): return namesVariable(base)
+            case .getitem(let base, let key): return namesVariable(base) || namesVariable(key)
+            case .slice(let base, let s, let e, let st):
+                return namesVariable(base) || (s.map(namesVariable) ?? false)
+                    || (e.map(namesVariable) ?? false) || (st.map(namesVariable) ?? false)
+            case .call(let callee, let args, let kwargs):
+                return namesVariable(callee) || args.contains(where: namesVariable) || kwargs.contains { namesVariable($0.1) }
+            case .filter(let target, _, let args, let kwargs):
+                return namesVariable(target) || args.contains(where: namesVariable) || kwargs.contains { namesVariable($0.1) }
+            case .test(let target, _, let args, _):
+                return namesVariable(target) || args.contains(where: namesVariable)
+            }
+        }
+
+        func inspectExpr(_ expr: Expr) {
+            switch expr {
+            case .literal, .variable:
+                break
+            case .list(let items), .tuple(let items):
+                items.forEach(inspectExpr)
+            case .dict(let pairs):
+                for (k, v) in pairs { inspectExpr(k); inspectExpr(v) }
+            case .unary(_, let inner):
+                inspectExpr(inner)
+            case .binary(let op, let lhs, let rhs):
+                if ["==", "!=", "<", "<=", ">", ">=", "in", "not in"].contains(op),
+                   namesVariable(lhs) || namesVariable(rhs) {
+                    appendStringConstants(from: lhs)
+                    appendStringConstants(from: rhs)
+                }
+                inspectExpr(lhs)
+                inspectExpr(rhs)
+            case .conditional(let cond, let ifTrue, let ifFalse):
+                if namesVariable(cond) {
+                    appendStringConstants(from: ifTrue)
+                    if let ifFalse { appendStringConstants(from: ifFalse) }
+                }
+                inspectExpr(cond); inspectExpr(ifTrue)
+                if let ifFalse { inspectExpr(ifFalse) }
+            case .getattr(let base, _):
+                inspectExpr(base)
+            case .getitem(let base, let key):
+                inspectExpr(base); inspectExpr(key)
+            case .slice(let base, let s, let e, let st):
+                inspectExpr(base)
+                if let s { inspectExpr(s) }
+                if let e { inspectExpr(e) }
+                if let st { inspectExpr(st) }
+            case .call(let callee, let args, let kwargs):
+                inspectExpr(callee); args.forEach(inspectExpr); kwargs.forEach { inspectExpr($0.1) }
+            case .filter(let target, let name, let args, let kwargs):
+                if (name == "default" || name == "d") && namesVariable(target) {
+                    args.forEach(appendStringConstants(from:))
+                    for (k, v) in kwargs where k == "default_value" || k == "value" {
+                        appendStringConstants(from: v)
+                    }
+                }
+                inspectExpr(target); args.forEach(inspectExpr); kwargs.forEach { inspectExpr($0.1) }
+            case .test(let target, _, let args, _):
+                if namesVariable(target) || args.contains(where: namesVariable) {
+                    appendStringConstants(from: target)
+                    args.forEach(appendStringConstants(from:))
+                }
+                inspectExpr(target); args.forEach(inspectExpr)
+            }
+        }
+
+        func inspectBlock(_ block: [Stmt]) {
+            for stmt in block {
+                switch stmt {
+                case .text:
+                    break
+                case .output(let expr), .doStmt(let expr):
+                    inspectExpr(expr)
+                case .ifStmt(let branches, let elseBody):
+                    for branch in branches {
+                        inspectExpr(branch.cond)
+                        inspectBlock(branch.body)
+                    }
+                    inspectBlock(elseBody)
+                case .forStmt(_, let iter, let filter, let body, let elseBody):
+                    inspectExpr(iter)
+                    if let filter { inspectExpr(filter) }
+                    inspectBlock(body)
+                    inspectBlock(elseBody)
+                case .setAssign(let targets, let attr, let value):
+                    if attr == nil && targets == [variable] {
+                        appendStringConstants(from: value)
+                    }
+                    inspectExpr(value)
+                case .setBlock(_, let body):
+                    inspectBlock(body)
+                case .macroDef(_, let params, let body):
+                    for param in params {
+                        if let defExpr = param.defaultVal { inspectExpr(defExpr) }
+                    }
+                    inspectBlock(body)
+                case .breakStmt, .continueStmt:
+                    break
+                }
+            }
+        }
+
+        inspectBlock(stmts)
+        return collected
+    }
+
+    func normalizedDepthWords(in stmts: [Stmt], groupByWord: [String: String]) -> Set<String> {
+        var byTarget: [String: [String]] = [:]
+
+        func collectMatchingConstants(from expr: Expr, into out: inout [String]) {
+            switch expr {
+            case .literal(.string(let s)):
+                if groupByWord[s] != nil { out.append(s) }
+            case .list(let items), .tuple(let items):
+                items.forEach { collectMatchingConstants(from: $0, into: &out) }
+            case .dict(let pairs):
+                for (k, v) in pairs {
+                    collectMatchingConstants(from: k, into: &out)
+                    collectMatchingConstants(from: v, into: &out)
+                }
+            case .unary(_, let inner):
+                collectMatchingConstants(from: inner, into: &out)
+            case .binary(_, let lhs, let rhs):
+                collectMatchingConstants(from: lhs, into: &out)
+                collectMatchingConstants(from: rhs, into: &out)
+            case .conditional(let c, let a, let b):
+                collectMatchingConstants(from: c, into: &out)
+                collectMatchingConstants(from: a, into: &out)
+                if let b { collectMatchingConstants(from: b, into: &out) }
+            case .getattr(let base, _):
+                collectMatchingConstants(from: base, into: &out)
+            case .getitem(let base, let key):
+                collectMatchingConstants(from: base, into: &out)
+                collectMatchingConstants(from: key, into: &out)
+            case .slice(let base, let s, let e, let st):
+                collectMatchingConstants(from: base, into: &out)
+                if let s { collectMatchingConstants(from: s, into: &out) }
+                if let e { collectMatchingConstants(from: e, into: &out) }
+                if let st { collectMatchingConstants(from: st, into: &out) }
+            case .call(let callee, let args, let kwargs):
+                collectMatchingConstants(from: callee, into: &out)
+                args.forEach { collectMatchingConstants(from: $0, into: &out) }
+                kwargs.forEach { collectMatchingConstants(from: $0.1, into: &out) }
+            case .filter(let target, _, let args, let kwargs):
+                collectMatchingConstants(from: target, into: &out)
+                args.forEach { collectMatchingConstants(from: $0, into: &out) }
+                kwargs.forEach { collectMatchingConstants(from: $0.1, into: &out) }
+            case .test(let target, _, let args, _):
+                collectMatchingConstants(from: target, into: &out)
+                args.forEach { collectMatchingConstants(from: $0, into: &out) }
+            default:
+                break
+            }
+        }
+
+        func walkBlock(_ block: [Stmt]) {
+            for stmt in block {
+                switch stmt {
+                case .text, .output, .doStmt, .breakStmt, .continueStmt:
+                    break
+                case .ifStmt(let branches, let elseBody):
+                    branches.forEach { walkBlock($0.body) }
+                    walkBlock(elseBody)
+                case .forStmt(_, _, _, let body, let elseBody):
+                    walkBlock(body)
+                    walkBlock(elseBody)
+                case .setAssign(let targets, let attr, let value):
+                    let targetName = attr ?? targets.first
+                    if let targetName {
+                        var words: [String] = []
+                        collectMatchingConstants(from: value, into: &words)
+                        if !words.isEmpty {
+                            byTarget[targetName, default: []].append(contentsOf: words)
+                        }
+                    }
+                case .setBlock(_, let body):
+                    walkBlock(body)
+                case .macroDef(_, _, let body):
+                    walkBlock(body)
+                }
+            }
+        }
+
+        walkBlock(stmts)
+
+        var canonical: Set<String> = []
+        for words in byTarget.values {
+            let distinctGroups = Set(words.compactMap { groupByWord[$0] })
+            if distinctGroups.count >= 2 {
+                canonical.formUnion(words)
+            }
+        }
+        return canonical
+    }
+
+    private func isValidLiteral(_ s: String) -> Bool {
+        guard !s.isEmpty, s.count <= 24 else { return false }
+        let scalars = Array(s.unicodeScalars)
+        guard let first = scalars.first,
+              ("A"..."Z").contains(first) || ("a"..."z").contains(first) else {
+            return false
+        }
+        return scalars.dropFirst().allSatisfy {
+            ("A"..."Z").contains($0) || ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "_" || $0 == "-"
+        }
+    }
 }
 
 // MARK: - Jinja2 Lexer
@@ -969,7 +1449,7 @@ private enum ExprTokenizer {
     }
 }
 
-private indirect enum Expr {
+private indirect enum Expr: Sendable {
     case literal(JinjaValue)
     case variable(String)
     case list([Expr])
@@ -1380,7 +1860,7 @@ private struct ExprParser {
 
 // MARK: - Statement AST & Recursive-Descent Parser
 
-private indirect enum Stmt {
+private indirect enum Stmt: Sendable {
     case text(String)
     case output(Expr)
     case ifStmt(branches: [(cond: Expr, body: [Stmt])], elseBody: [Stmt])

@@ -11,6 +11,10 @@
 #
 # Usage:
 #   ./scripts/sync_agent_skills.sh [--include-xcode | --prune-only] [target-skills-dir]
+#
+# Environment variables:
+#   COREAI_REPO_DIR : Path to a local `apple/coreai-models` checkout (or parent workspace)
+#                     to sync CoreAI skills from (falls back to `./coderef/apple-coreai` if present).
 
 set -euo pipefail
 
@@ -32,7 +36,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -112,7 +116,7 @@ else
         cat > "$GUIDES_SKILL_DIR/SKILL.md" <<'EOF'
 ---
 name: xcode-27-guides
-description: "Authoritative Apple Xcode 27 AdditionalDocumentation guides covering Liquid Glass in SwiftUI/AppKit/UIKit/WidgetKit, SwiftUI New Toolbar Features, Styled Text Editing (AttributedString/AttributedTextSelection), Swift 6.2/6.4 Concurrency Updates, InlineArray & Span, FoundationModels on-device LLM, AppIntents Updates, SwiftData Class Inheritance, StoreKit, WebKit, and 3D Swift Charts."
+description: "Authoritative Apple Xcode 27 AdditionalDocumentation guides covering Liquid Glass in SwiftUI/AppKit/UIKit/WidgetKit, SwiftUI New Toolbar Features, Styled Text Editing (AttributedString/AttributedTextSelection), Swift 6.4 Concurrency Updates, InlineArray & Span, FoundationModels on-device LLM, AppIntents Updates, SwiftData Class Inheritance, StoreKit, WebKit, and 3D Swift Charts."
 ---
 
 # Xcode 27 Additional Documentation Guides (`xcode-27-guides`)
@@ -149,15 +153,17 @@ if [[ "$PRUNE_ONLY" -eq 1 ]]; then
 fi
 
 COREAI_CANDIDATES=(
+    "${COREAI_REPO_DIR:-}"
     "${HEYLOOK_COREAI_DIR:-}"
+    "${COREAI_MODELS_DIR:-}"
     "$REPO_ROOT/coderef/apple-coreai"
-    "$REPO_ROOT/../../mlx/apple-coreai"
 )
 
 SYNCED_COREAI=0
 for candidate in "${COREAI_CANDIDATES[@]}"; do
     [[ -z "$candidate" || ! -d "$candidate" ]] && continue
     for skill_src in \
+        "$candidate/skills/skills"/* \
         "$candidate/coreai-models/skills/skills"/* \
         "$candidate/coreai/coreai-model-zoo/skills/skills"/*; do
         if [[ -d "$skill_src" && -f "$skill_src/SKILL.md" ]]; then
@@ -175,7 +181,7 @@ for candidate in "${COREAI_CANDIDATES[@]}"; do
 done
 
 if [[ "$SYNCED_COREAI" -eq 0 ]]; then
-    echo "    [info] No local apple-coreai checkout found (set HEYLOOK_COREAI_DIR to sync CoreAI skills)."
+    echo "    [info] No local apple-coreai checkout found (set COREAI_REPO_DIR to sync CoreAI skills)."
 fi
 
 TOTAL_SKILLS="$(find "$SKILLS_DIR" -mindepth 2 -maxdepth 2 -name 'SKILL.md' | wc -l | tr -d ' ')"

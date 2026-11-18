@@ -37,6 +37,21 @@ needs_build() {
   return 1
 }
 
+resolve_codesign_identity() {
+  if [[ -n "${HEYLOOK_CODESIGN_IDENTITY:-}" ]]; then
+    echo "${HEYLOOK_CODESIGN_IDENTITY}"
+    return 0
+  fi
+  local dev_hash
+  dev_hash="$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk '/"Apple Development:/ {print $2; exit}' || true)"
+  if [[ "${dev_hash}" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+    echo "${dev_hash}"
+    return 0
+  fi
+  echo "-"
+}
+
 assemble_app_bundle() {
   local products_dir="$1"
   local app_dir="${products_dir}/HeylookWorkbench.app"
@@ -87,6 +102,16 @@ assemble_app_bundle() {
     <string>Heylook Workbench uses the microphone for 16 kHz ANE voice prompt transcription.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>Heylook Workbench transcribes voice prompts locally on the Apple Neural Engine.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Heylook Workbench reads Desktop folders you select for local model checkpoints, chat attachments, and multimodal indexing.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Heylook Workbench reads Documents folders you select for local model checkpoints, chat attachments, and multimodal indexing.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Heylook Workbench reads downloaded model checkpoints and media files you choose to inspect or index.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Heylook Workbench reads external drives you select for local model checkpoints and multimodal indexing.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>Heylook Workbench reads network volumes you select for local model checkpoints and multimodal indexing.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Heylook Workbench discovers and serves _heylook._tcp inference peers on your local network.</string>
     <key>NSBonjourServices</key>
@@ -96,6 +121,19 @@ assemble_app_bundle() {
 </dict>
 </plist>
 PLIST
+
+  local sign_identity
+  sign_identity="$(resolve_codesign_identity)"
+  if [[ "${sign_identity}" != "-" ]]; then
+    echo "    Signing ${app_dir} with Apple Development identity (${sign_identity:0:8}...)..." >&2
+    if ! codesign --force --deep --sign "${sign_identity}" "${app_dir}" >&2; then
+      echo "    [warn] Apple Development signing failed; falling back to ad-hoc (-)." >&2
+      codesign --force --deep --sign - "${app_dir}" >&2 || true
+    fi
+  else
+    echo "    [info] No valid Apple Development identity found; signing ${app_dir} ad-hoc (-)." >&2
+    codesign --force --deep --sign - "${app_dir}" >&2 || true
+  fi
   echo "${app_dir}"
 }
 

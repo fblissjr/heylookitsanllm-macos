@@ -69,6 +69,14 @@ public struct ThinkingControls: Sendable, Equatable, Codable {
     public let switchVariable: String?
     public let depthVariable: String?
     public let depthValues: [String]
+    public let depthAliases: [String: String]
+    public let depthDefault: String?
+    public let depthUnknown: String?
+    public let depthChangesPrefix: Bool?
+    public let depthOffValues: [String]
+    public let budgetEnforced: Bool?
+    public let budgetReason: String?
+    public let templateSourceName: String?
 
     public init(
         supportsThinking: Bool,
@@ -76,7 +84,15 @@ public struct ThinkingControls: Sendable, Equatable, Codable {
         defaultEnabled: Bool = true,
         switchVariable: String? = nil,
         depthVariable: String? = nil,
-        depthValues: [String] = []
+        depthValues: [String] = [],
+        depthAliases: [String: String] = [:],
+        depthDefault: String? = nil,
+        depthUnknown: String? = nil,
+        depthChangesPrefix: Bool? = nil,
+        depthOffValues: [String] = [],
+        budgetEnforced: Bool? = nil,
+        budgetReason: String? = nil,
+        templateSourceName: String? = nil
     ) {
         self.supportsThinking = supportsThinking
         self.canDisableThinking = canDisableThinking
@@ -84,6 +100,14 @@ public struct ThinkingControls: Sendable, Equatable, Codable {
         self.switchVariable = switchVariable
         self.depthVariable = depthVariable
         self.depthValues = depthValues
+        self.depthAliases = depthAliases
+        self.depthDefault = depthDefault
+        self.depthUnknown = depthUnknown
+        self.depthChangesPrefix = depthChangesPrefix
+        self.depthOffValues = depthOffValues
+        self.budgetEnforced = budgetEnforced
+        self.budgetReason = budgetReason
+        self.templateSourceName = templateSourceName
     }
 
     public static let unsupported = ThinkingControls(
@@ -91,6 +115,60 @@ public struct ThinkingControls: Sendable, Equatable, Codable {
         canDisableThinking: false,
         defaultEnabled: false
     )
+
+    /// Validates a requested `thinking_depth` / `reasoning_effort` value against detected controls
+    /// (`thinking_controls.py:check_depth`). Returns `nil` if accepted, or a human-readable refusal reason.
+    public func checkDepth(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        guard supportsThinking || depthVariable != nil else {
+            return "this model's chat template has no thinking-depth control"
+        }
+        guard let depthVar = depthVariable else {
+            return "this model's chat template has no thinking-depth control"
+        }
+        if depthUnknown == "verbatim" {
+            return nil
+        }
+        if depthValues.contains(value) || depthAliases[value] != nil {
+            return nil
+        }
+        let offered = depthValues.isEmpty ? "none" : depthValues.joined(separator: ", ")
+        return "thinking depth '\(value)' is not offered by this model's chat template (\(depthVar): \(offered))"
+    }
+
+    /// Converts these controls into the canonical wire `EngineThinkingFacts` slot (`contract.py`).
+    public func toEngineThinkingFacts(templateName: String? = nil) -> EngineThinkingFacts? {
+        guard supportsThinking || switchVariable != nil || depthVariable != nil else {
+            return nil
+        }
+        let depthFacts: EngineThinkingDepthFacts? = depthVariable.map { v in
+            EngineThinkingDepthFacts(
+                variable: v,
+                values: depthValues,
+                aliases: depthAliases,
+                defaultValue: depthDefault,
+                unknown: depthUnknown,
+                changesPrefix: depthChangesPrefix,
+                off: depthOffValues
+            )
+        }
+        let budgetFacts: EngineThinkingBudgetFacts? = budgetEnforced.map { enforced in
+            EngineThinkingBudgetFacts(
+                enforced: enforced,
+                reason: budgetReason ?? (
+                    enforced
+                        ? "heylook's engine closes the thinking block with one forced token"
+                        : "the template's thinking markers were not found, so no cap can be forced"
+                )
+            )
+        }
+        return EngineThinkingFacts(
+            switchVariable: switchVariable,
+            depth: depthFacts,
+            budget: budgetFacts,
+            template: templateName ?? templateSourceName
+        )
+    }
 }
 
 /// Pure-Swift checkpoint inspector that derives a model's `ReasoningFormat`, `ThinkingControls`,
@@ -265,13 +343,12 @@ public struct ModelTemplateInfo: Sendable, Equatable {
     ) -> ModelTemplateInfo {
         let format = detectReasoningFormat(
             templateText: templateText,
-            specialTokens: specialTokens,
-            modelID: modelID
+            specialTokens: specialTokens
         )
         let controls = detectThinkingControls(
             templateText: templateText,
             reasoningFormat: format,
-            modelID: modelID
+            templateSource: templateSource
         )
 
         var mergedSpecials = Set(StripSpecials.defaultSpecialTokens).union(specialTokens)
@@ -298,10 +375,21 @@ public struct ModelTemplateInfo: Sendable, Equatable {
 
     // MARK: - Private Structural Detectors
 
+    private static let depthProbeLevels: [String] = [
+        "low", "medium", "high", "xhigh", "max", "minimal",
+        "none", "off", "on", "auto", "enabled", "disabled", "adaptive",
+    ]
+    private static let garbageDepthSentinel = "zq-not-a-level"
+    private static let probeConversation: [[String: JinjaValue]] = [
+        ["role": .string("system"), "content": .string("SYSTEM-PROMPT")],
+        ["role": .string("user"), "content": .string("FIRST-USER-TURN")],
+        ["role": .string("assistant"), "content": .string("FIRST-REPLY")],
+        ["role": .string("user"), "content": .string("SECOND-USER-TURN")],
+    ]
+
     private static func detectReasoningFormat(
         templateText: String,
-        specialTokens: Set<String>,
-        modelID: String?
+        specialTokens: Set<String>
     ) -> ReasoningFormat {
         // 1. OpenAI Harmony channel protocol: `<|channel|>analysis<|message|>...<|end|>`
         let hasHarmonyMarkers = (templateText.contains("<|channel|>") && templateText.contains("<|message|>"))
@@ -344,21 +432,9 @@ public struct ModelTemplateInfo: Sendable, Equatable {
             }
         }
 
-        // 5. Fallback for DeepSeek-R1 / R1-Distill checkpoints whose chat_template may omit literal `<think>`
-        //    (matching `MLXLMCommon.DeepSeekR1ConventionsResolver`)
-        if let idLower = modelID?.lowercased(),
-           idLower.contains("deepseek-r1") || idLower.contains("r1-distill") || idLower.contains("qwq") {
-            return .tagPair(open: "<think>", close: "</think>", prefillsThinking: true)
-        }
-
-        // 6. If the template explicitly toggles `enable_thinking`, default to `<think>`/`</think>`
-        if templateText.contains("enable_thinking") {
-            return .tagPair(open: "<think>", close: "</think>", prefillsThinking: false)
-        }
-
-        // 7. When no template file exists on disk (e.g. synthetic or unpopulated directories),
-        //    default to standard `<think>...</think>` tag-pair parsing so `<think>` blocks are still parsed.
-        if templateText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && specialTokens.isEmpty {
+        // 5. If the template's AST declares/reads `enable_thinking`, default to `<think>`/`</think>`
+        if let compiled = try? HeylookJinjaRenderer.compile(templateText),
+           compiled.undeclaredVariables().contains("enable_thinking") {
             return .tagPair(open: "<think>", close: "</think>", prefillsThinking: false)
         }
 
@@ -375,7 +451,6 @@ public struct ModelTemplateInfo: Sendable, Equatable {
     ) -> Bool {
         guard !templateText.isEmpty else { return false }
 
-        // Look at the generation-prompt region at the end of the template
         let searchRegion: Substring
         if let genPromptRange = templateText.range(of: "add_generation_prompt", options: .backwards) {
             searchRegion = templateText[genPromptRange.lowerBound...]
@@ -389,9 +464,6 @@ public struct ModelTemplateInfo: Sendable, Equatable {
             return false
         }
         if let lastClose = searchRegion.range(of: closeTag, options: .backwards) {
-            // If `</think>` appears AFTER the last `<think>` in the generation prompt (e.g. when
-            // `enable_thinking == false` branch renders `<think>\n\n</think>\n\n`), verify whether
-            // there is also an unclosed `<think>` branch before or after it.
             let beforeClose = searchRegion[..<lastClose.lowerBound]
             let openCount = beforeClose.components(separatedBy: openTag).count - 1
             let afterOpen = searchRegion[lastOpen.upperBound...]
@@ -403,42 +475,98 @@ public struct ModelTemplateInfo: Sendable, Equatable {
         return true
     }
 
+    private struct DetectedDepthSpec {
+        let variable: String
+        let values: [String]
+        let aliases: [String: String]
+        let defaultValue: String?
+        let unknown: String
+        let changesPrefix: Bool?
+        let off: [String]
+    }
+
     private static func detectThinkingControls(
         templateText: String,
         reasoningFormat: ReasoningFormat,
-        modelID: String?
+        templateSource: String
     ) -> ThinkingControls {
-        let hasEnableThinking = templateText.contains("enable_thinking")
-
-        // Detect depth variable (`reasoning_effort`, `reasoning_strength`, or `thinking_mode`)
-        let candidateDepthVars = ["reasoning_effort", "reasoning_strength", "thinking_mode"]
-        var detectedDepthVar: String?
-        var detectedDepthValues: [String] = []
-
-        for varName in candidateDepthVars where templateText.contains(varName) {
-            detectedDepthVar = varName
-            detectedDepthValues = extractDepthValues(for: varName, in: templateText)
-            break
+        let trimmed = templateText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let compiled = try? HeylookJinjaRenderer.compile(templateText) else {
+            if reasoningFormat != .none {
+                return ThinkingControls(
+                    supportsThinking: true,
+                    canDisableThinking: false,
+                    defaultEnabled: true,
+                    budgetEnforced: true,
+                    budgetReason: "heylook's engine closes the thinking block with one forced token",
+                    templateSourceName: templateSource
+                )
+            }
+            return .unsupported
         }
 
-        let supportsThinking = (reasoningFormat != .none) || hasEnableThinking || (detectedDepthVar != nil)
+        let reads = compiled.undeclaredVariables()
+        let switchVar: String? = reads.contains("enable_thinking") ? "enable_thinking" : nil
+        let switchOn: [String: JinjaValue] = switchVar != nil ? ["enable_thinking": .bool(true)] : [:]
+
+        // Candidate depth variables: free variables matching /reason|think|effort/i (excluding `enable_thinking`),
+        // sorted by first occurrence in template source (`thinking_controls.py:detect`).
+        let depthNameRegex = try? NSRegularExpression(pattern: "reason|think|effort", options: [.caseInsensitive])
+        let candidateVars = reads
+            .filter { v in
+                guard v != "enable_thinking" else { return false }
+                let range = NSRange(v.startIndex..<v.endIndex, in: v)
+                return depthNameRegex?.firstMatch(in: v, range: range) != nil
+            }
+            .sorted { lhs, rhs in
+                let li = templateText.range(of: lhs)?.lowerBound ?? templateText.endIndex
+                let ri = templateText.range(of: rhs)?.lowerBound ?? templateText.endIndex
+                return li != ri ? li < ri : lhs < rhs
+            }
+
+        var detectedDepth: DetectedDepthSpec?
+        for variable in candidateVars {
+            if let found = probeDepthVariable(
+                compiled: compiled,
+                body: templateText,
+                variable: variable,
+                switchOn: switchOn
+            ) {
+                detectedDepth = found
+                break
+            }
+        }
+
+        let supportsThinking = (reasoningFormat != .none) || (switchVar != nil) || (detectedDepth != nil)
         guard supportsThinking else {
             return .unsupported
         }
 
-        let switchVar: String? = hasEnableThinking ? "enable_thinking" : nil
-        let canDisable = hasEnableThinking
-            || detectedDepthValues.contains("none")
-            || detectedDepthValues.contains("off")
+        let defaultEnabled = detectDefaultThinkingEnabled(
+            compiled: compiled,
+            switchVar: switchVar,
+            reasoningFormat: reasoningFormat,
+            templateText: templateText
+        )
 
-        // Gemma 4's template defaults `enable_thinking` to false unless requested;
-        // standard `<think>` templates default to true.
-        let defaultEnabled: Bool
-        if case .gemmaChannel = reasoningFormat {
-            defaultEnabled = templateText.contains("enable_thinking is not defined or enable_thinking")
-                || !templateText.contains("enable_thinking is defined and enable_thinking")
+        let offValues = detectedDepth?.off ?? []
+        let depthValues = detectedDepth?.values ?? []
+        let canDisable = (switchVar != nil)
+            || !offValues.isEmpty
+            || depthValues.contains("none")
+            || depthValues.contains("off")
+
+        let budgetEnforced: Bool?
+        let budgetReason: String?
+        if switchVar != nil {
+            let enforced = !reasoningFormat.structuralDelimiters.isEmpty
+            budgetEnforced = enforced
+            budgetReason = enforced
+                ? "heylook's engine closes the thinking block with one forced token"
+                : "the template's thinking markers were not found, so no cap can be forced"
         } else {
-            defaultEnabled = true
+            budgetEnforced = nil
+            budgetReason = nil
         }
 
         return ThinkingControls(
@@ -446,40 +574,242 @@ public struct ModelTemplateInfo: Sendable, Equatable {
             canDisableThinking: canDisable,
             defaultEnabled: defaultEnabled,
             switchVariable: switchVar,
-            depthVariable: detectedDepthVar,
-            depthValues: detectedDepthValues
+            depthVariable: detectedDepth?.variable,
+            depthValues: depthValues,
+            depthAliases: detectedDepth?.aliases ?? [:],
+            depthDefault: detectedDepth?.defaultValue,
+            depthUnknown: detectedDepth?.unknown,
+            depthChangesPrefix: detectedDepth?.changesPrefix,
+            depthOffValues: offValues,
+            budgetEnforced: budgetEnforced,
+            budgetReason: budgetReason,
+            templateSourceName: templateSource
         )
     }
 
-    /// Scans `templateText` for string literals compared or listed alongside `variableName`
-    /// (e.g., `reasoning_effort in ["low", "medium", "high"]` or `reasoning_strength == 'max'`).
-    private static func extractDepthValues(for variableName: String, in templateText: String) -> [String] {
-        let canonicalOrder = ["none", "minimal", "low", "medium", "high", "max"]
-        var found = Set<String>()
+    private static func renderProbe(
+        _ compiled: HeylookJinjaRenderer.CompiledTemplate,
+        extra: [String: JinjaValue]
+    ) -> String? {
+        var ctx: [String: JinjaValue] = [
+            "messages": .array(probeConversation.map { .object($0) }),
+            "add_generation_prompt": .bool(true),
+            "bos_token": .string(""),
+            "eos_token": .string(""),
+        ]
+        for (k, v) in extra {
+            ctx[k] = v
+        }
+        return try? compiled.render(context: ctx)
+    }
 
-        let lowerTemplate = templateText.lowercased()
-        for candidate in canonicalOrder {
-            let singleQuoted = "'\(candidate)'"
-            let doubleQuoted = "\"\(candidate)\""
-            if lowerTemplate.contains(singleQuoted) || lowerTemplate.contains(doubleQuoted) {
-                found.insert(candidate)
+    private static func detectDefaultThinkingEnabled(
+        compiled: HeylookJinjaRenderer.CompiledTemplate,
+        switchVar: String?,
+        reasoningFormat: ReasoningFormat,
+        templateText: String
+    ) -> Bool {
+        if let switchVar {
+            if let absent = renderProbe(compiled, extra: [:]),
+               let onOut = renderProbe(compiled, extra: [switchVar: .bool(true)]),
+               let offOut = renderProbe(compiled, extra: [switchVar: .bool(false)]) {
+                if absent == offOut && absent != onOut {
+                    return false
+                }
+                if absent == onOut && absent != offOut {
+                    return true
+                }
+            }
+        }
+        if case .gemmaChannel = reasoningFormat {
+            return templateText.contains("enable_thinking is not defined or enable_thinking")
+                || !templateText.contains("enable_thinking is defined and enable_thinking")
+        }
+        return true
+    }
+
+    private static func probeDepthVariable(
+        compiled: HeylookJinjaRenderer.CompiledTemplate,
+        body: String,
+        variable: String,
+        switchOn: [String: JinjaValue]
+    ) -> DetectedDepthSpec? {
+        let absent = renderProbe(compiled, extra: switchOn)
+        var garbageCtx = switchOn
+        garbageCtx[variable] = .string(garbageDepthSentinel)
+        let garbage = renderProbe(compiled, extra: garbageCtx)
+
+        let unknown: String
+        if let garbage {
+            if garbage == absent {
+                unknown = "ignored"
+            } else if garbage.contains(garbageDepthSentinel) {
+                unknown = "verbatim"
+            } else {
+                unknown = "fallback"
+            }
+        } else {
+            unknown = "raises"
+        }
+
+        let tied = compiled.associatedDepthLiterals(for: variable)
+        let candidates: [String]
+        if unknown == "verbatim" {
+            candidates = tied
+        } else {
+            let quotedLiterals = extractQuotedIdentifierLiterals(from: body)
+            candidates = dedupPreservingOrder(tied + quotedLiterals + depthProbeLevels)
+        }
+
+        var groups: [String: [String]] = [:]
+        var outputOrder: [String] = []
+        for candidate in candidates {
+            var ctx = switchOn
+            ctx[variable] = .string(candidate)
+            guard let rendered = renderProbe(compiled, extra: ctx) else { continue }
+            if groups[rendered] == nil {
+                outputOrder.append(rendered)
+            }
+            groups[rendered, default: []].append(candidate)
+        }
+
+        var groupByWord: [String: String] = [:]
+        for (out, members) in groups {
+            for m in members { groupByWord[m] = out }
+        }
+        let canonical = compiled.normalizedDepthWords(groupByWord: groupByWord)
+
+        if (unknown == "ignored" || unknown == "fallback"), let garbage, let droppedMembers = groups.removeValue(forKey: garbage) {
+            let tiedSet = Set(tied)
+            let named = droppedMembers.filter { canonical.contains($0) || tiedSet.contains($0) }
+            if !named.isEmpty && !canonical.isDisjoint(with: named) {
+                groups[garbage] = named
             }
         }
 
-        let ordered = canonicalOrder.filter { found.contains($0) }
-        if !ordered.isEmpty {
-            return ordered
+        if groups.isEmpty && unknown != "verbatim" {
+            return nil
         }
 
-        // Sensible defaults when the template accepts the variable without enumerating literals inline
-        switch variableName {
-        case "reasoning_strength":
-            return ["none", "low", "medium", "high", "max"]
-        case "reasoning_effort":
-            return ["low", "medium", "high"]
-        default:
-            return ["low", "medium", "high"]
+        let varStart = body.range(of: variable)?.lowerBound ?? body.startIndex
+        func firstSeenOffset(_ value: String) -> Int {
+            let single = "'\(value)'"
+            let double = "\"\(value)\""
+            var hitsAfter: [Int] = []
+            var hitsAny: [Int] = []
+            for needle in [single, double] {
+                if let rAfter = body.range(of: needle, range: varStart..<body.endIndex) {
+                    hitsAfter.append(body.distance(from: body.startIndex, to: rAfter.lowerBound))
+                }
+                if let rAny = body.range(of: needle) {
+                    hitsAny.append(body.distance(from: body.startIndex, to: rAny.lowerBound))
+                }
+            }
+            if let earliestAfter = hitsAfter.min() {
+                return earliestAfter
+            }
+            if let earliestAny = hitsAny.min() {
+                return body.count + earliestAny
+            }
+            return 2 * body.count + 1
         }
+
+        var values: [String] = []
+        var aliases: [String: String] = [:]
+        var defaultValue: String?
+
+        for out in outputOrder {
+            guard let members = groups[out], !members.isEmpty else { continue }
+            let spelling = members.enumerated().min { lhs, rhs in
+                let lCanon = canonical.contains(lhs.element) ? 0 : 1
+                let rCanon = canonical.contains(rhs.element) ? 0 : 1
+                if lCanon != rCanon { return lCanon < rCanon }
+                let lSeen = firstSeenOffset(lhs.element)
+                let rSeen = firstSeenOffset(rhs.element)
+                if lSeen != rSeen { return lSeen < rSeen }
+                return lhs.offset < rhs.offset
+            }?.element ?? members[0]
+
+            values.append(spelling)
+            for m in members where m != spelling {
+                aliases[m] = spelling
+            }
+            if out == absent {
+                defaultValue = spelling
+            }
+        }
+
+        values.sort { firstSeenOffset($0) < firstSeenOffset($1) }
+
+        let base = absent ?? outputOrder.first ?? ""
+        var changesPrefix: Bool? = nil
+        if let firstUserRange = base.range(of: "FIRST-USER-TURN") {
+            let firstUserOffset = base.distance(from: base.startIndex, to: firstUserRange.lowerBound)
+            var others = outputOrder.filter { $0 != base }
+            if unknown == "verbatim", let garbage, garbage != base {
+                others = [garbage]
+            }
+            if !others.isEmpty {
+                let earliestDivergence = others.map { firstDivergenceOffset(base, $0) }.min() ?? firstUserOffset
+                changesPrefix = earliestDivergence < firstUserOffset
+            }
+        }
+
+        var offValues: [String] = []
+        if !switchOn.isEmpty, let switchedOff = renderProbe(compiled, extra: ["enable_thinking": .bool(false)]) {
+            offValues = values.filter { spelling in
+                var ctx = switchOn
+                ctx[variable] = .string(spelling)
+                return renderProbe(compiled, extra: ctx) == switchedOff
+            }
+        }
+
+        return DetectedDepthSpec(
+            variable: variable,
+            values: values,
+            aliases: aliases,
+            defaultValue: defaultValue,
+            unknown: unknown,
+            changesPrefix: changesPrefix,
+            off: offValues
+        )
+    }
+
+    private static func extractQuotedIdentifierLiterals(from body: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: "['\"]([A-Za-z][A-Za-z0-9_-]{0,23})['\"]") else {
+            return []
+        }
+        let nsRange = NSRange(body.startIndex..<body.endIndex, in: body)
+        var out: [String] = []
+        var seen: Set<String> = []
+        for match in regex.matches(in: body, range: nsRange) {
+            guard match.numberOfRanges >= 2,
+                  let range = Range(match.range(at: 1), in: body) else { continue }
+            let token = String(body[range])
+            if seen.insert(token).inserted {
+                out.append(token)
+            }
+        }
+        return out
+    }
+
+    private static func dedupPreservingOrder(_ items: [String]) -> [String] {
+        var seen: Set<String> = []
+        var out: [String] = []
+        out.reserveCapacity(items.count)
+        for item in items where seen.insert(item).inserted {
+            out.append(item)
+        }
+        return out
+    }
+
+    private static func firstDivergenceOffset(_ a: String, _ b: String) -> Int {
+        var idx = 0
+        for (ca, cb) in zip(a, b) {
+            if ca != cb { return idx }
+            idx += 1
+        }
+        return min(a.count, b.count)
     }
 
     private static func loadJSON(at url: URL) -> [String: Any]? {
