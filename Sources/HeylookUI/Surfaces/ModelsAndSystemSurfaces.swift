@@ -95,20 +95,20 @@ struct ModelsInspectorSurface: View {
                 ContentUnavailableView {
                     Label("No Models Registered", systemImage: "cpu")
                 } description: {
-                    Text("Configure watch folders above (heylook.toml [scan]) to discover MLX, CoreAI, or GGUF checkpoints, or load the sample demo workspace.")
+                    Text("Configure watch folders above (heylook.toml [scan]) to discover MLX, CoreAI, or GGUF checkpoints, or connect to a Bonjour peer in Perf & Server.")
                 } actions: {
                     GlassEffectContainer(spacing: 10) {
                         HStack(spacing: 10) {
                             Button("Re-scan Models") {
                                 Task { await viewModel.rescanConfiguredModels() }
                             }
-                            .buttonStyle(.glass)
+                            .buttonStyle(.glassProminent)
                             .controlSize(.small)
 
-                            Button("Load Sample Demo Workspace") {
-                                Task { await viewModel.loadSampleDemoWorkspace() }
+                            Button("Perf & Server") {
+                                viewModel.activeSurface = .perf
                             }
-                            .buttonStyle(.glassProminent)
+                            .buttonStyle(.glass)
                             .controlSize(.small)
                         }
                     }

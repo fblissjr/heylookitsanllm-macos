@@ -130,7 +130,8 @@ public struct HeylookRootView: View {
                     EmptyModelsDiscoveryBanner(
                         contrastStyle: contrastStyle,
                         onRescan: { Task { await viewModel.rescanConfiguredModels() } },
-                        onLoadDemo: { Task { await viewModel.loadSampleDemoWorkspace() } }
+                        onOpenModels: { viewModel.activeSurface = .models },
+                        onOpenPerf: { viewModel.activeSurface = .perf }
                     )
                     Divider()
                 }
@@ -228,12 +229,6 @@ public struct HeylookRootView: View {
                         Task { await viewModel.rescanConfiguredModels() }
                     } label: {
                         Label("Re-scan Models", systemImage: "arrow.clockwise")
-                    }
-
-                    Button {
-                        Task { await viewModel.loadSampleDemoWorkspace() }
-                    } label: {
-                        Label("Load Demo Workspace", systemImage: "sparkles")
                     }
 
                     Button {
@@ -434,22 +429,27 @@ private struct StatusBannerBar: View {
 private struct EmptyModelsDiscoveryBanner: View {
     let contrastStyle: AdaptiveContrastStyle
     let onRescan: () -> Void
-    let onLoadDemo: () -> Void
+    let onOpenModels: () -> Void
+    let onOpenPerf: () -> Void
 
     var body: some View {
         GlassEffectContainer(spacing: 10) {
             HStack(spacing: 10) {
                 Image(systemName: "externaldrive.badge.plus")
                     .foregroundStyle(.orange)
-                Text("No local models discovered in heylook.toml scan_folders.")
+                Text("No local models discovered in heylook.toml [scan]. Add Watch Folders in Models or connect a Bonjour peer.")
                     .font(.caption.weight(.medium))
                 Spacer()
                 Button("Re-scan Folders", action: onRescan)
                     .buttonStyle(.glass)
                     .controlSize(.small)
 
-                Button("Load Sample Demo Workspace", action: onLoadDemo)
+                Button("Watch Folders", action: onOpenModels)
                     .buttonStyle(.glassProminent)
+                    .controlSize(.small)
+
+                Button("Bonjour Peers", action: onOpenPerf)
+                    .buttonStyle(.glass)
                     .controlSize(.small)
             }
         }

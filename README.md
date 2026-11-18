@@ -1,120 +1,63 @@
 # heylookitsanllm-macos (`heylook`)
 
-Native Swift 6.4 (`v6` language mode) multiplatform (`macOS 27.2+` and `iOS 27.2+` deployment floor supporting `27.2.1` hosts and `27.3+` SDK `#available` guards) personal inference workbench, multimodal embedding/retrieval studio, and embedded Anthropic Messages-conformant `/v1/*` HTTP/SSE server for Apple Silicon—orchestrating heterogeneous compute across **`MLX Swift` (Metal GPU)**, **`CoreAI` / `CoreML` (Apple Neural Engine)**, **`GGUF` (`llama-server` subprocesses)**, and **`RemoteHeylookProvider` (Bonjour `_heylook._tcp`)**.
+A native **Swift 6.4 (`v6` language mode)** multiplatform (`macOS 27.2+` and `iOS 27.2+` deployment floor supporting `27.2.1` hosts and `#available(macOS 27.3, iOS 27.3, *)` APIs) personal AI inference workbench, multimodal media/embedding studio, and embedded HTTP/SSE server for Apple Silicon.
 
-- **[User Guide (`docs/USER_GUIDE.md`)](./docs/USER_GUIDE.md)** — How to configure `heylook.toml`, drive all 6 workbench surfaces (`⌘1`–`⌘6`), manage presets, index & compare multimodal artifacts, quantize models, and use `heylook-cli` and `/v1/*`.
-- **[Current Status & Roadmap (`docs/project/CURRENT.md`)](./docs/project/CURRENT.md)** — Honest subsystem audit against `heylookitsanllm` `v2.0.251` and the active **Parity Completion Roadmap (Phases 16A–16E)**.
-- **[LLM Knowledge Wiki (`docs/wiki/README.md`)](./docs/wiki/README.md)** — Deep-dive subsystem architecture, engine contracts, and sharp edges.
+Built to achieve complete behavioral and frontend parity with `heylookitsanllm` (`v2.0.251`) on top of an Apple Silicon–native, truthful-runtime foundation.
 
 ---
 
-## Architecture & Capabilities
+## Key Capabilities
 
-- **Core Domain, Jinja2 AST, Provenance & SQLite WAL Store (`HeylookCore`)**:
-  - **Provenance & 5-Layer Sampler Cascade** (`EngineDescription.swift`, `SamplerCascade.swift`): Deterministic resolution across `builtin` -> `vendor` (`generation_config.json` / GGUF `general.sampling.*`) -> `model.heylook.toml` -> `preset` -> `request` (`SamplerLayerSource`: `builtin`, `vendor`, `model_config`, `preset`, `request`) with dual `snake_case`/`camelCase` `SamplerSettings` `Codable` and per-field engine provenance (`ProvenanceSource`: `derived`, `configured`, `observed`, `observed_cached`, `unknown`, `not_applicable`).
-  - **Jinja2 AST Engine, Template Inspection & Multi-Protocol Reasoning** (`HeylookJinjaRenderer.swift`, `ModelTemplateInfo.swift`, `ReasoningParser.swift`): Recursive-descent Jinja2 lexer/AST parser/evaluator (`HeylookJinjaRenderer`, bridged with `huggingface/swift-jinja` when linked) supporting `validateSyntax`, `detectCapabilities`, `checkPrefixStability`, and special-token `PromptMarkerSpan` extraction; 4-rung `ChatTemplateInspection` (`chat_template_path` > `chat_template.heylook.jinja` > `chat_template.jinja` > `gguf_embedded` / `tokenizer_config.json`) reporting `origin`, `writable`, `inertReason`, `stale`, `prefixStable`, `caps`, and Hugging Face `.metadata` SHA-1/SHA-256 `modifiedSinceDownload`; file-derived `ModelTemplateInfo` & `ThinkingControls`; and 4-protocol streaming `ReasoningParser` (`.tagPair`, `.gemmaChannel`, `.harmonyChannel`, `.recipientChannel`) with dynamic `StripSpecials` and mid-stream `forceEndReasoning()`.
-  - **Streaming GGUF Inspection, Non-Destructive TOML & Observability** (`HeylookConfig.swift`): `64 MB` streaming `GGUFHeaderReader` parsing past `256k+` vocab arrays without truncation (including non-causal `clip.projector_type`, hybrid-recurrent SSM, and built-in MTP metadata), non-destructive `heylook.toml` (`addScanFolder` / `removeScanFolder`) & override-only `model.heylook.toml` sidecars, and `HeylookObservabilityLog` (`level` threshold filtering, `retentionLimit` ring pruning, JSONL event persistence).
-  - **Unified SQLite3 WAL Store** (`SQLiteStore.swift`): Zero-dependency `SQLiteStore` (`WAL` mode) with SHA-256 deduplicated `media_blobs` + orphan GC, multimodal `content_blocks_json` hydration, `message_stats` + `queryPerformanceProfile` (`PerformanceProfileSummary`), turn-level `cloneConversation(id:upToPosition:)`, single-turn `deleteMessage` position compaction, `COLLATE NOCASE` unique `presets`, `clearAllData()`, and live `mutationStream()` sync.
+### 1. Six-Surface Native SwiftUI Workbench (`⌘1` – `⌘6`)
+- **`⌘1` Chat (`ChatWorkbenchSurface`)**: Multi-turn streaming with reasoning traces, inline **Model Load / Reload Panel** (`ctx_size`, `flash_attn`, 1-token JIT warm, `Reload (Apply Changes)`), **4-state system prompt chip**, live Prompt Preview drawer, staged `image-plan` budget inspector + 2048px resize toggle, voice-to-turn ANE ASR recording, inline message edit/regenerate/continue/delete, and smart `ScrollViewReader` tail-follow (`Jump to latest`).
+- **`⌘2` Notebook (`NotebookSurface`)**: Distraction-free drafting pad (`CursorAwareTextEditor`), per-document model picker, preset cascade, collapsible system prompt drawer, and `@Environment(\.scenePhase)` flush.
+- **`⌘3` Presets (`PresetsSurface`)**: Clean unseeded preset library (`COLLATE NOCASE`), 13-key sparse `"Null-Means-Cascade"` overrides, optimistic concurrency locking (`Reload Latest Copy`), and live model compatibility preview.
+- **`⌘4` Embeddings & ANE (`EmbeddingsStudioSurface`)**:
+  - **Compare**: Multi-block text/image/audio/video items, `windows.seconds` (uniform FPS or scene-change), Matryoshka cosine heatmap (`768d`/`512d`/`256d`/`128d`), vector inspector, and clickable video window hits opening `CompareVideoWindowPreviewSheet` (`AVPlayer` bounded playback + sampled `frame_times`).
+  - **Embedding Lab**: Import custom `set.json` benchmarks or run the built-in 8-case CoreGraphics multimodal sample suite across model/dimension/prompt/ANE-lane sweep configs.
+  - **Media Corpus (`mbed`)**: Optional local corpus ingestion across text, code, PDFs (`PDFKit`), images, `30s` audio windows, and `32s`/`16s`-stride video windows (`VectorStore` SQLite + `Accelerate`/`vDSP`).
+- **`⌘5` Models (`ModelsInspectorSurface`)**: Watch folders (`heylook.toml [scan]`), live `RAMFitCalculator` headroom badges (`24.0 GiB` thin-headroom warning; MLX hard fail vs GGUF warning), `stale_reload_fields` + `Reload now`, schema-driven `ModelConfigEditorSheet` (with integrated `RAMFitMeterView` & 4+ rung `ChatTemplateInspectorView`), and pure-Swift `MLXModelConverterSheet`.
+- **`⌘6` Perf & Server (`PerfServerSurface`)**: Hardware RAM/Metal/scheduler strip, `EmbeddingGemma 2` `MLComputePlan` ANE operator plan, 3 SQLite profile tables (`TimingBreakdownTableView`, `PerModelCacheTableView`, `RecentTrendsTableView`) across `1h`/`6h`/`24h`/`7d`, truthful localhost vs LAN + Bonjour (`_heylook._tcp`) status, persistent `[settings]` & `events.jsonl`/`metrics.jsonl` disk log reader, and `HeylookObservabilityLog` ring viewer (zero background 3s polling).
 
-- **Dual-Lane Compute Scheduler & Modular Providers (`HeylookEngines`)**:
-  - **`ComputeScheduler` & `StreamingPipeline`** (`ComputeScheduler.swift`, `Providers/StreamingPipeline.swift`): FIFO Metal GPU `GenerationGate` (`max_queue_depth`) paired with a concurrent `ANELane` so ANE-resident towers run alongside pinned GPU models without LRU eviction; eager `provider.preload()` warmup and deterministic `provider.unload()` reclamation; unified `StreamingPipeline` with multi-chunk `StopSequenceFilter` holdback, `thinkingBudget` auto-`forceEndReasoning()`, and immediate `RequestRegistry.addCancelHandler` abort; and truthful runtime defaults (`allowSyntheticFallback = false`).
-  - **`MLXSwiftProvider` & `MLXModelConverter`** (`Providers/MLXSwiftProvider.swift`): In-process Metal GPU LLM, VLM (with Lanczos `image_max_tokens` downscaling and VLM-to-LLM factory fallback), and `HeylookTransformersTokenizerLoader`; multi-branch `[KVCache]` snapshot cloning/trimming with `isTrimmable` hybrid guards (`MambaCache` / `ArraysCache`); speculative decoding via `MTPDrafterModelFactory` (`mtpDrafter`) and `LLMModelFactory` (`draftModel`) with `speculativeDecodingTelemetry`; and pure-Swift `.safetensors` quantization (`MLXModelConverter`).
-  - **`GGUFSubprocessProvider`** (`Providers/GGUFSubprocessProvider.swift`, macOS): Crash-isolated `llama-server` subprocess per loaded model managed by `SubprocessLifecycleRegistry` (`SIGTERM` -> `SIGKILL` + `atexit` teardown) on OS-socket-probed loopback ports (`GGUFPortPool`, `18080+`), dynamic unified-memory `assessRAMFit` (`RAMFitAssessment`) with automatic external drafter drop under tight Metal headroom and drafter-less retry on launch failure, media-blind sidecar fallback when `--mmproj` is present, `--reasoning-preserve` / `--ctx-checkpoints` / `--cache-reuse` / `json_schema` / `stop`, and live `GET /props` provenance upgrades.
-  - **`CoreAIProvider`** (`Providers/CoreAIProvider.swift`): In-process execution of Schema `0.1` and `0.2` `.aimodel` bundles (`CoreAIBundleManifest` + `CoreAILanguageModels` `LanguageModelBundle` / `CoreAIRunner`) with `dflash` / `mtp` `SpeculativeReport` telemetry, paired with dual-tier on-device ANE speech recognition (`transcribeAudio`): Tier A zero-download `Speech.framework` (`SpeechAnalyzer` + `SpeechTranscriber`, `apple-speech-transcriber`) and Tier B exported `CoreAISpeech` (`SpeechRecognitionModel` for `Parakeet TDT` and `Whisper`), backed by `FLLR`-safe RIFF/WAV chunk decoding and `AVAudioConverter` `16 kHz` mono PCM resampling.
-  - **`RemoteHeylookProvider`** (`Providers/RemoteHeylookProvider.swift`): Connects `iOS 27.2+` or secondary macOS peers to a remote `HeylookServer` over HTTP/SSE with Bonjour `_heylook._tcp` auto-discovery (`BonjourServiceBrowser`).
+### 2. Multi-Backend Heterogeneous Compute (`HeylookEngines` & `HeylookEmbeddings`)
+- **`MLXSwiftProvider` (`HEYLOOK_ENABLE_NATIVE_MLX=1`)**: `PreRenderedVLMTokenizerProxy`, `VisionFeatureCache` (16 / 512 MB LRU), `APCSnapshotCache` keyed on `(tokenIDs, mediaSalt)`, `ThinkingControlLogitProcessor`, lossless `LeviathanMTPTokenIterator` rejection/residual sampling, `Gemma4Specialization` (`48px` vision alignment, `gemma4_assistant` `backbone_hidden_size` pairing), `HybridRecurrentSWASpecialization`, and pure-Swift `MLXModelConverter` (`affine`, `mxfp4`, `mxfp8`, `nvfp4`, `q4_zero`).
+- **`GGUFSubprocessProvider`**: Isolated `llama-server` subprocesses (`GGUFPortPool`), automatic `mmproj` discovery, `GGUFSpawnConfig.autoSized` (SWA `--cache-reuse` suppression, `--ctx-checkpoints 32 --checkpoint-min-step 256`, `--reasoning-preserve`), reply-only `StopSequenceFilter`, and `CompletionIDBox` mid-stream `reasoning_end`.
+- **`CoreAIProvider` & `SpeechTranscriptionService`**: `.aimodel` Neural Engine execution (`HEYLOOK_ENABLE_COREAI=1`) and decoupled on-device ASR (`CoreAISpeech` + `SpeechAnalyzer`/`SpeechTranscriber`) with subchunk-walking `decodeRIFFChunksMonoPCM`.
+- **Multimodal & GGUF Embeddings**: `MLXSwiftLMEmbeddingGemma2Engine` (1,024-token padded text batching, true `hybrid_ane` ANE->GPU `softTokens` bridge without `TextANE.mlmodelc`, consecutive single-window `windows.seconds` video decoding, dynamic `config_sentence_transformers.json` prompts) plus `GGUFEmbeddingEngine` (`llama-server --embeddings`).
 
-- **Multimodal Embeddings, Audio Resampling & ANE Towers (`HeylookEmbeddings`)**:
-  - Indexes `.video` (`16s`-stride overlapping `32s` windows with `1 fps` or content-aware novelty selection + optional soundtrack via SDK 27 async `AVAssetReader.outputProvider(for:)`), `.audio` (`30s` windows with `AVAudioFile` + `AVAudioConverter` resampling to `16 kHz` mono `Float32`), `.image`, `.document` (`PDFKit` pages), `.code`, and `.text`.
-  - Pairs `CheckpointPieceTokenizer` (BPE merge-rank + Viterbi Unigram `tokenizer.json` segmentation) and `NativeMLXEmbeddingGemma2` (`MLXSwiftLMEmbeddingGemma2Engine` + `HybridLocalEmbeddingEngine`) with `ANECoreMLRuntime` (`.mlmodelc` Vision/Audio/Text towers), `ANETowerInspector` (`MLComputePlan`), and `VectorStore` (`SQLite3` + `Accelerate` `vDSP` Matryoshka `768d`/`512d`/`256d`/`128d` slicing with truthful `model_id` invalidation).
-
-- **Embedded `/v1/*` HTTP/SSE Server & Security Guards (`HeylookServer`)**:
-  - Unified incremental SSE framing (`consumeStreamAndFormatSSE` + `SSEConnectionStreamer`) with `X-Request-ID` validation & echo across:
-    - `POST /v1/messages` (streaming & non-streaming Anthropic wire, HTTP `400` `thinking_depth` validation, HTTP `422` multimodal capability gating, `stop_sequences`, `response_format`) and `POST /v1/audio/transcriptions` (standalone on-device ANE speech-to-text across `apple-speech-transcriber` and `CoreAISpeech` bundles)
-    - `/v1/conversations` CRUD, `POST /v1/conversations/{id}/clone`, `/v1/conversations/{id}/messages` CRUD, `GET /v1/conversations/{id}/media/{media_id}`, `POST` / `DELETE /v1/conversations/{id}/generate` (`append` / `regenerate` / `continue` with shared `RequestRegistry.shared` `409 generation_in_progress` lock, `heylook_saved`, and `dropped_media`), `POST /v1/conversations/{id}/generate/reasoning-end`, `POST /v1/conversations/{id}/voice-generate` (with optional `asr_model` override and HTTP `422 empty_transcription`), and `GET` / `POST /v1/conversations/{id}/prompt`
-    - `/v1/notebooks` CRUD + `POST /v1/notebooks/{id}/generate`, and `/v1/presets` CRUD
-    - `GET /v1/models`, `GET /v1/models/{id}`, `POST /v1/models/{id}/load`, `POST /v1/models/{id}/unload`, and `POST /v1/models/{id}/image-plan`
-    - `/v1/admin/models` (`GET`, `POST`, `POST /v1/admin/models/reload`, `POST /v1/admin/models/unload-all`, `POST /v1/admin/models/validate`, `POST /v1/admin/models/fit`, `GET` / `PATCH /v1/admin/models/scan-config`, `GET /v1/admin/models/model-options`) and `/v1/admin/models/{id}` (`GET`, `PATCH` / `PUT`, `DELETE`, `POST /load`, `POST /unload`, `GET` / `PUT` / `DELETE /chat-template`)
-    - `GET` / `PATCH /v1/admin/config`, `DELETE /v1/admin/config/{key}`, and `GET` / `PATCH` / `DELETE /v1/admin/config/logs`
-    - `GET /v1/performance/profile/{time_range}`, `GET /v1/system/metrics`, `GET /v1/capabilities`, `GET /v1/status` (`/health`, `/v1/health`), `POST /v1/embeddings`, `POST /v1/cache/clear`, `POST /v1/data/clear`, `POST /v1/telemetry/events`, `DELETE /v1/requests/{id}`, and `POST /v1/requests/{id}/reasoning-end`
-  - Enforces strict `Host` DNS-rebinding rejection on both loopback (`127.0.0.1`) and wildcard (`0.0.0.0`), `X-Heylook-Admin-Token` (`401`/`403`) admin authentication, and `HEYLOOK_READONLY_MODEL_CONFIG` (`409`) write protection.
-
----
-
-## 6-Surface Multiplatform SwiftUI Workbench (`HeylookUI` & `HeylookApp`)
-
-Built on a unified 3-region `NavigationSplitView` + trailing `.inspector(isPresented:)` (`HeylookWorkbenchView.swift`) with cached `@Observable` projections (`activeModelDescription`, `sortedActiveGGUFPorts`), item-driven `DestructiveActionPrompt` confirmations, `#available(macOS 27.3, iOS 27.3, *)` `ToolbarContainerBehavior27_3Modifier`, and live `SQLiteStore.mutationStream()` + `RequestRegistry.shared` synchronization:
-
-1. **`⌘1` Chat** (`Surfaces/ChatWorkbenchSurface.swift`, `Surfaces/MarkdownMessageView.swift`): Streaming GFM Markdown with fenced code-block copy, `followingTail` auto-scroll, `ThinkingTraceCardView` (`End thinking`), persistent turn media (`media_blobs`), `⇧⌘V` clipboard image paste + live `image-plan` token/resize pill, on-device ANE voice dictation (`Dictate-to-Composer` default + `⌥`-click / context-menu `Hands-Free Auto-Send` across `Apple SpeechTranscriber` and `CoreAISpeech` `Parakeet`/`Whisper`), per-turn `Save` / `Save & Regenerate` / `Save & Continue` / `Regenerate` / `Fork`, highlighted `PromptMarkerSpan` prompt preview, and structured `ResponseFormat` (`Text` / `JSON Object` / `JSON Schema`).
-2. **`⌘2` Notebook** (`Surfaces/NotebookAndEmbeddingsSurfaces.swift`, `Surfaces/CursorAwareTextEditor.swift`): Cursor-aware inline streaming (`prefix + delta + suffix`), selection-gated `"Analyze Selection"`, `"Insert Summary"`, `"Continue at Cursor"`, per-notebook `systemPrompt` / `params` / `appliedPresetID` persistence, `Stop` abort, and `500 ms` debounced auto-save.
-3. **`⌘3` Presets** (`Surfaces/PresetsSurface.swift`): Master-detail CRUD across `sampler` and `full` scopes (`nil`-means-cascade optional field overrides, `Create Preset` / `Save Changes`, duplicate, apply, confirmed `Delete…`) paired with two-verb `Update` / `Save as…` controls in the inspector.
-4. **`⌘4` Embeddings & Media Studio** (`Surfaces/NotebookAndEmbeddingsSurfaces.swift`): Local ANE/SQLite Media Finder (`HitRowView`, `EmbeddingsInspectorView` with inline `AVPlayerView` / `VideoPlayer` `KeyframeStamp` seek pills & `ScoredFeatureBreakdownCard`) + `≤16`-item N×N Multimodal Cosine Matrix (`EmbeddingsCompareMatrixView` with live `768`/`512`/`256`/`128d` subspace re-slicing, CSV/JSON export, and `Send Pair to Retrieval Lab`) + Multi-Config `GPU / Hybrid / ANE` Retrieval Lab sweeps (`EmbeddingsMultiConfigLabView` + `set.json` import) + `EmbeddingsEvalLabDrawer`.
-5. **`⌘5` Models & Inspector** (`Surfaces/ModelsAndSystemSurfaces.swift`): `heylook.toml` `[scan] folders` editor, live `RAMFitAssessment` headroom badges + quick `ctx_size` reload picker, override-only `ModelSidecarEditorSheet` (`model.heylook.toml`), 4-rung `ChatTemplateInspection` + live Jinja2 syntax validation (`chat_template.heylook.jinja`), and pure-Swift `MLXModelConverterSheet`.
-6. **`⌘6` Perf, Observability & Server** (`Surfaces/ModelsAndSystemSurfaces.swift`, `Sources/HeylookApp/HeylookApp.swift`): Live Mach RAM used/available & CPU %, real `MLComputePlan` ANE op %, `1h` / `6h` / `24h` / `7d` `PerformanceProfileSummary` tables, `HeylookObservabilityLog` JSONL viewer, active `llama-server` ports (`sortedActiveGGUFPorts`), Bonjour `_heylook._tcp` LAN scanner, and macOS `MenuBarExtra` (`Open Workbench`).
+### 3. Truthful Engine Contract, SQLite `WAL` & Embedded HTTP/SSE Server (`HeylookCore` & `HeylookServer`)
+- **`EngineContract`**: `Fact<Value>` (`"value": null` on `.unknown` / `.notApplicable`), `SettingFact`, zero-path `PublicModelWireRow`, explicit-only `AdminModelWireRow`, `ProviderConfigSchema` (13 derived `SamplerCascade` keys, `422` `file_only` guard), comment-preserving `TOMLCodec`, and `garbageDepthSentinel` template probing.
+- **`WorkbenchService` & `ConversationOrchestrator`**: Unified actor saga shared by `HeylookServer` and `HeylookUI`, providing `409 generation_in_progress` locking, detachable `SubscriberHub` streaming, atomic SQLite tail commits (`replaceTailWithMessage` / `replaceTailWithUpdate`), scoped 64-hex `media_blobs` (`nosniff`), non-compacting `deleteMessage` + `DELETE ?after=`, `PatternRouter` greedy `*model_id`, HTTP/1.1 Keep-Alive + chunked transport, and `5.0s` `event: ping` SSE framing.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Fast offline SwiftPM build & unit verification suite
-# (Prefix with `xcrun` if Homebrew `swift` precedes `/usr/bin/swift` in $PATH)
-xcrun swift build
-xcrun swift test
-xcrun swift run heylook-cli eval-lab
+# 1. Run fast Swift Testing unit + contract suite
+swift test
 
-# (Optional) One-command environment, Xcode, Metal, iOS Simulator, skills & swift-lsp updater
-# (Pass COREAI_REPO_DIR, MLX_SWIFT_LM_DIR, or HEYLOOK_SKILLS_PLUGIN_URL when overriding remote defaults)
-./scripts/update_dev_env.sh
-
-# Full native Xcode build & test (compiles Cmlx default.metallib, links mlx-swift / mlx-swift-lm / swift-transformers,
-# writes TCC usage keys in Info.plist, and signs HeylookWorkbench.app with Apple Development identity when available)
+# 2. Full native Xcode build (Metal shaders -> default.metallib + MLX/CoreAI + TCC signing)
 ./scripts/build_native.sh build
-./scripts/build_native.sh test
+
+# 3. Launch the native macOS workbench app
 ./scripts/build_native.sh app
 
-# Run with read-only model/template configuration guard enabled (returns HTTP 409 on config/sidecar writes)
-HEYLOOK_READONLY_MODEL_CONFIG=1 ./scripts/build_native.sh cli serve 8000
-
-# Inspect host unified memory, discovered models, Voice ASR engine readiness, and ANE tower compute plans
+# 4. Run CLI diagnostics, indexing, quantization, evals, or headless server
 ./scripts/build_native.sh cli doctor
-./scripts/build_native.sh cli status
 ./scripts/build_native.sh cli models
-./scripts/build_native.sh cli inspect-ane ./models/embeddinggemma-2-MLX-BF16
-./scripts/build_native.sh cli inspect-checkpoint ./models/embeddinggemma-2-MLX-BF16
-
-# Quantize a safetensors checkpoint in pure Swift (affine, mxfp4, mxfp8, nvfp4; standard or q4_zero calibration)
-./scripts/build_native.sh cli convert-mlx ./models/raw-bf16 ./models/quant-4bit --bits 4 --group-size 64 --mode affine
-
-# Export Core AI (.aimodel) & CoreAISpeech (Parakeet TDT / Whisper) bundles
-./scripts/export_coreai.sh list --type llm
-./scripts/export_coreai.sh llm Qwen/Qwen3.5-9B
-./scripts/export_coreai.sh gemma4 google/gemma-4-E4B-it --include-vision
-./scripts/export_coreai.sh parakeet --model nvidia/parakeet-tdt-0.6b-v3 --dtype float16 --audio-seconds 15.0 --output-dir ./models/coreai
-
-# Transcribe audio on-device (Apple SpeechTranscriber out-of-the-box, or exported CoreAISpeech bundle)
-./scripts/build_native.sh cli transcribe ./clip.wav
-HEYLOOK_ENABLE_COREAI=1 ./scripts/build_native.sh cli transcribe ./clip.wav --model ./models/coreai/parakeet-tdt-0.6b-v3_float16_static
-
-# Stream live Metal GPU inference from a configured or repo-relative MLX checkpoint
-./scripts/build_native.sh cli chat --model ./models/Qwen3.5-0.8B-MLX-8bit --max-tokens 96 "Explain unified memory + ANE co-residency."
-
-# Index media/docs with hybrid ANE + MLX EmbeddingGemma 2, list watched folders, and search with Matryoshka attribution
-./scripts/build_native.sh cli index ./docs --sampling content --audio-from-video --compute hybrid_ane --db /tmp/heylook-vectors.sqlite
-./scripts/build_native.sh cli search "dual-lane GPU and ANE co-residency scheduler" --dim 768 --task query --db /tmp/heylook-vectors.sqlite
-./scripts/build_native.sh cli watched
-
-# Start the embedded /v1/* HTTP & SSE server (default port 8000)
 ./scripts/build_native.sh cli serve 8000
 ```
 
+> [!NOTE]
+> All SwiftPM dependencies in `Package.swift` use canonical remote GitHub URLs gated behind `HEYLOOK_ENABLE_NATIVE_MLX=1` (`mlx-swift`, `mlx-swift-lm`, `swift-transformers`) and `HEYLOOK_ENABLE_COREAI=1` (`apple/coreai-models`). Set `HEYLOOK_READONLY_MODEL_CONFIG=1` to run with local model/config writes disabled (`409`).
+
 ---
 
-## Documentation & LLM Knowledge Wiki
+## Documentation Index
 
-| Document | Purpose |
-| :--- | :--- |
-| **[docs/USER_GUIDE.md](./docs/USER_GUIDE.md)** | Operator guide to all 6 Workbench surfaces (`⌘1`–`⌘6`), `heylook.toml` setup, `heylook-cli`, and `/v1/*` API usage. |
-| **[VISION.md](./VISION.md)** | Enduring purpose, 7 core beliefs, tradeoff compass, non-goals, and horizons (`LiteRT`, `27.3+` Siri/Spotlight/TCC). |
-| **[AGENTS.md](./AGENTS.md)** | Operating guide, module table, `HEYLOOK_READONLY_MODEL_CONFIG`, and **LLM Knowledge Wiki Index Router**. |
-| **[docs/wiki/README.md](./docs/wiki/README.md)** | Master hub for the 8-page **LLM Knowledge Wiki**:<br>• [architecture_overview.md](./docs/wiki/architecture_overview.md)<br>• [engine_contract_and_provenance.md](./docs/wiki/engine_contract_and_provenance.md)<br>• [providers_and_heterogeneous_compute.md](./docs/wiki/providers_and_heterogeneous_compute.md)<br>• [multimodal_embeddings_and_ane.md](./docs/wiki/multimodal_embeddings_and_ane.md)<br>• [wire_api_and_sqlite_store.md](./docs/wiki/wire_api_and_sqlite_store.md)<br>• [model_family_onboarding.md](./docs/wiki/model_family_onboarding.md)<br>• [ui_architecture_and_macos27.md](./docs/wiki/ui_architecture_and_macos27.md)<br>• [sharp_edges.md](./docs/wiki/sharp_edges.md) |
-| **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** & **[TODO.md](./docs/project/TODO.md)** | Honest subsystem audit matrix against `heylookitsanllm` `v2.0.251`, active **Parity Completion Roadmap (Phases 16A–16E)**, and **Post-Parity Horizons**. |
+- **[VISION.md](./VISION.md)** — Core design beliefs, tradeoff compass, and non-goals.
+- **[AGENTS.md](./AGENTS.md)** — Operating rules, build/test commands, and LLM Knowledge Wiki index router.
+- **[docs/USER_GUIDE.md](./docs/USER_GUIDE.md)** — Operator handbook for the 6-surface workbench, `heylook.toml`, `heylook-cli`, and `/v1/*` APIs.
+- **[docs/wiki/README.md](./docs/wiki/README.md)** — Deep-dive architecture wiki across all 8 subsystems.
+- **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** & **[docs/project/TODO.md](./docs/project/TODO.md)** — Subsystem readiness matrix and parity roadmap.

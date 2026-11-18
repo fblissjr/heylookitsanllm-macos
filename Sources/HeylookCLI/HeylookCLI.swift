@@ -347,7 +347,7 @@ struct HeylookCLI {
                     supportsVision: ProvenanceField(value: false, provenance: .derived),
                     supportsThinking: ProvenanceField(value: true, provenance: .derived)
                 )
-                let prov = ProviderFactory.makeProvider(for: adHoc, allowSyntheticFallback: false)
+                let prov = ProviderFactory.makeProvider(for: adHoc)
                 await scheduler.register(provider: prov, description: adHoc)
                 selectedDesc = adHoc
             } else {
@@ -437,8 +437,7 @@ struct HeylookCLI {
                 embeddingEngine: embeddingEngine,
                 bindHost: cfg.serverHost,
                 allowedHosts: cfg.allowedHosts,
-                adminToken: cfg.adminToken ?? ProcessInfo.processInfo.environment["HEYLOOK_ADMIN_TOKEN"],
-                allowSyntheticFallback: false
+                adminToken: cfg.adminToken ?? ProcessInfo.processInfo.environment["HEYLOOK_ADMIN_TOKEN"]
             )
             let server = HeylookHTTPServer(router: router, host: cfg.serverHost, port: port)
             try await server.start()
@@ -670,8 +669,7 @@ struct HeylookCLI {
             let result = try await scheduler.transcribeVoice(
                 wavData: wavData,
                 languageHint: languageHint,
-                preferredASRModelID: preferredModelID,
-                allowSyntheticFallback: false
+                preferredASRModelID: preferredModelID
             )
             print("=== Heylook ANE Speech Transcription ===")
             print(String(format: "  Model     : %@ (backend=%@, placement=%@)", result.modelID, result.backend, result.computePlacement.rawValue))

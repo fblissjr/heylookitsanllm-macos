@@ -362,16 +362,6 @@ public enum NativeMLXEmbeddingGemma2 {
             computeOptions: computeOptions
         )
     }
-
-    @available(*, deprecated, message: "allowSyntheticFallback has been removed; real checkpoints/towers are always required.")
-    public static func makeBestAvailableEngine(
-        checkpointURL: URL = defaultCheckpointURL,
-        computeOptions: ModelComputeOptions = .allMLXGPU,
-        allowSyntheticFallback: Bool
-    ) -> any EmbeddingEngine {
-        _ = allowSyntheticFallback
-        return makeBestAvailableEngine(checkpointURL: checkpointURL, computeOptions: computeOptions)
-    }
 }
 
 /// Lightweight SentencePiece/BPE `tokenizer.json` piece encoder used by `HybridLocalEmbeddingEngine`
@@ -565,8 +555,6 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
     public nonisolated let hasCompiledANETowers: Bool
     public nonisolated let hasCompiledANEVision: Bool
     public nonisolated let hasCompiledANEAudio: Bool
-    @available(*, deprecated, message: "Synthetic fallback has been removed; HybridLocalEmbeddingEngine always throws runtimeUnavailable when towers are missing.")
-    public nonisolated var allowSyntheticFallback: Bool { false }
     public nonisolated let nativeDimensions: Int = Matryoshka.gemma2NativeDimensions
     public nonisolated let supportedDimensions: [Int] = Matryoshka.gemma2Dimensions
 
@@ -594,16 +582,6 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
             ?? Self.defaultDescriptor
     }
 
-    @available(*, deprecated, message: "allowSyntheticFallback has been removed; HybridLocalEmbeddingEngine always requires real .mlmodelc towers.")
-    public init(
-        checkpointURL: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
-        computeOptions: ModelComputeOptions = .allMLXGPU,
-        allowSyntheticFallback: Bool
-    ) {
-        _ = allowSyntheticFallback
-        self.init(checkpointURL: checkpointURL, computeOptions: computeOptions)
-    }
-
     private static let defaultDescriptor = NativeMLXEmbeddingGemma2.CheckpointDescriptor(
         modelType: "embedding_gemma2",
         hiddenSize: 512,
@@ -623,19 +601,6 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
         checkpointDirectory: URL,
         computeOptions: ModelComputeOptions = .allMLXGPU
     ) {
-        self.init(
-            checkpointURL: checkpointDirectory,
-            computeOptions: computeOptions
-        )
-    }
-
-    @available(*, deprecated, message: "allowSyntheticFallback has been removed; HybridLocalEmbeddingEngine always requires real .mlmodelc towers.")
-    public init(
-        checkpointDirectory: URL,
-        computeOptions: ModelComputeOptions = .allMLXGPU,
-        allowSyntheticFallback: Bool
-    ) {
-        _ = allowSyntheticFallback
         self.init(
             checkpointURL: checkpointDirectory,
             computeOptions: computeOptions

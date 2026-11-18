@@ -362,12 +362,6 @@ public actor CoreAIProvider: InferenceProvider {
         self.descriptionState = updatedDesc
     }
 
-    @available(*, deprecated, message: "allowSyntheticFallback has been removed; CoreAIProvider always enforces real .aimodel weights.")
-    public init(description: EngineDescription, allowSyntheticFallback: Bool) {
-        _ = allowSyntheticFallback
-        self.init(description: description)
-    }
-
     public func describe() async -> EngineDescription {
         descriptionState
     }

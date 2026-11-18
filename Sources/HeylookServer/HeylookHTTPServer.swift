@@ -17,7 +17,6 @@ public actor HeylookRouter {
     public nonisolated let allowedHosts: Set<String>
     public nonisolated let adminToken: String?
     public nonisolated let isReadOnlyConfig: Bool
-    public nonisolated let allowSyntheticFallback: Bool
 
     private let patternRouter: PatternRouter
 
@@ -40,7 +39,6 @@ public actor HeylookRouter {
         let trimmedToken = adminToken?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.adminToken = (trimmedToken?.isEmpty == false) ? trimmedToken : nil
         self.isReadOnlyConfig = service.isReadOnlyConfig
-        self.allowSyntheticFallback = service.allowSyntheticFallback
         self.patternRouter = Self.buildPatternRouter(service: service, registry: service.registry)
     }
 
@@ -52,16 +50,14 @@ public actor HeylookRouter {
         bindHost: String = "127.0.0.1",
         allowedHosts: [String] = [],
         adminToken: String? = ProcessInfo.processInfo.environment["HEYLOOK_ADMIN_TOKEN"],
-        isReadOnlyConfig: Bool = HeylookConfig.isReadOnlyModelConfig,
-        allowSyntheticFallback: Bool = false
+        isReadOnlyConfig: Bool = HeylookConfig.isReadOnlyModelConfig
     ) {
         let svc = WorkbenchService(
             store: store,
             scheduler: scheduler,
             registry: registry,
             embeddingEngine: embeddingEngine,
-            isReadOnlyConfig: isReadOnlyConfig,
-            allowSyntheticFallback: allowSyntheticFallback
+            isReadOnlyConfig: isReadOnlyConfig
         )
         self.init(
             service: svc,

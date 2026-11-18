@@ -174,7 +174,7 @@ public enum HTTPConnectionHandler {
         return nil
     }
 
-    private actor ConnectionBufferActor {
+    internal actor ConnectionBufferActor {
         private var buffer = Data()
         private var eof = false
         private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -205,7 +205,8 @@ public enum HTTPConnectionHandler {
         func nextRequest() async -> (request: ParsedHTTPRequest?, remainingAfterEOF: Data?) {
             while true {
                 if let parsed = parseNextRequest(from: buffer) {
-                    buffer.removeFirst(parsed.consumedBytes)
+                    // Re-normalize slice `startIndex` to 0 for subsequent Keep-Alive frame parsing.
+                    buffer = Data(buffer.dropFirst(parsed.consumedBytes))
                     return (parsed, nil)
                 }
                 if eof {

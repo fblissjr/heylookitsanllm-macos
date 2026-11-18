@@ -62,8 +62,7 @@ public enum CLIEvalLabSuite {
             store: store,
             scheduler: scheduler,
             embeddingEngine: embEngine,
-            isReadOnlyConfig: true,
-            allowSyntheticFallback: false
+            isReadOnlyConfig: true
         )
 
         var probes: [ProbeSummary] = []

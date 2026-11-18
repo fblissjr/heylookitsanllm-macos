@@ -1,76 +1,84 @@
-# Engine Contract, Provenance, Sampler Cascade & Template Analysis
+# 2. Engine Contract, Provenance, Samplers & Templates
 
-Covers `Sources/HeylookCore/Engine/`, `Sources/HeylookCore/Sampling/`, `Sources/HeylookCore/Parsing/`, and `Sources/HeylookCore/Config/`.
-
----
-
-## 1. `EngineDescription` & `ProvenanceField<T>` (`EngineDescription.swift`)
-
-Every registered or resident model publishes an `EngineDescription` struct. Rather than returning bare scalars that hide whether a setting came from a model checkpoint, an operator sidecar, or a live runtime query, each configurable or observable property is wrapped in `ProvenanceField<T>`:
-
-- **`value`**: The effective value in force (`String`, `Int`, `Bool`, `ComputePlacement`, etc.).
-- **`provenance` (`ProvenanceSource`)**:
-  - `.derived`: Inferred from checkpoint files on disk (`config.json`, `generation_config.json`, `tokenizer.json`, `chat_template.jinja`, `.gguf` header metadata).
-  - `.configured`: Explicitly set by the operator in `heylook.toml`, `model.heylook.toml`, a preset, or a request override.
-  - `.observed`: Confirmed at runtime by the active execution engine (e.g., `CoreAIBundleManifest` `metadata.json` or `llama-server` `GET /props`).
-  - `.observedCached`: Restored from a previous runtime observation.
-- **`effect` (`EffectClass`)**:
-  - `.perRequest`: Takes effect immediately on the next generation call (`temperature`, `top_p`, `thinking`, `thinking_depth`, `thinking_budget`).
-  - `.reload`: Requires unloading and reloading the model (`ctx_size`, `flash_attn`, `compute_unit`, `chat_template.heylook.jinja`).
-  - `.restart`: Requires restarting the server listener (`server_port`, `server_host`).
-
-> **Rule**: `ComputeScheduler.applySidecarUpdate(_:for:)` must preserve `reasoningFormat` and `thinkingControls` (and update `thinkingControls.supportsThinking` and `templateSource` when edited) rather than resetting them to `EngineDescription` defaults.
+Every configuration field, capability flag, template property, and sampler parameter in `heylookitsanllm-macos` separates **truthful wire introspection** (`EngineContract`), **internal runtime metadata** (`EngineDescription`), **declarative field schemas** (`ProviderConfigSchema`), **5-layer sampler precedence** (`SamplerCascade`), and **zero-heuristic template probing** (`ModelTemplateInfo` + `HeylookJinjaRenderer`).
 
 ---
 
-## 2. 5-Layer Deterministic `SamplerCascade` (`SamplerCascade.swift`)
+## 2.1 Truthful Wire Contract (`EngineContract`, `Fact<Value>`, `SettingFact`)
 
-Sampling and thinking parameters resolve through a strict 5-layer cascade (`HeylookConfig.resolveEffectiveSampling`):
+Defined in `Sources/HeylookCore/Engine/EngineContract.swift` and `Sources/HeylookCore/Engine/EngineDescription.swift`:
 
-$$\text{builtin} \longrightarrow \text{vendor} \longrightarrow \text{model.heylook.toml} \longrightarrow \text{preset} \longrightarrow \text{request}$$
-
-| Layer | Source | Provenance Recorded |
-| :--- | :--- | :--- |
-| **1. `builtin`** | `SamplerSettings.builtinDefaults` (`temp=0.7`, `top_p=0.95`, `top_k=40`, `min_p=0.05`, `max_tokens=2048`) | `.derived` |
-| **2. `vendor`** | `generation_config.json` in MLX/CoreAI model directory or `general.sampling.*` KV metadata in `.gguf` binary header | `.derived` |
-| **3. `modelSidecar`** | `model.heylook.toml` in the model directory or `[[models]]` entry in `heylook.toml` | `.configured` |
-| **4. `preset`** | Selected `PresetRecord` in `SQLiteStore` | `.configured` |
-| **5. `request`** | Per-request fields on `MessagesRequest` (`POST /v1/messages`) or `userOverriddenSamplerKeys` in `HeylookWorkbenchViewModel` | `.configured` (`request` pill in UI) |
-
----
-
-## 3. Zero-Hardcoding `ModelTemplateInfo` & `ThinkingControls` (`ModelTemplateInfo.swift`)
-
-Following `VISION.md` (*"Derive, don't copy"*), `ModelTemplateInfo.inspect(modelDirectory:)` inspects `chat_template.jinja`, `chat_template.heylook.jinja`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`, and `.gguf` `tokenizer.chat_template` without any hardcoded model-name branches:
-
-1. **`ReasoningFormat`**:
-   - `.tagPair(open:close:prefillsThinking:)`: `<think>...</think>`, `<|thought|>...<|/thought|>`, `<thought>...</thought>`. Automatically sets `prefillsThinking = true` when the `add_generation_prompt` tail of the template opens `<think>` without closing it.
-   - `.gemmaChannel(openPrefix:closeTag:)`: `<|channel>thought\n...<channel|>` (Gemma 4).
-   - `.harmonyChannel`: `<|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>` (GPT-OSS).
-   - `.recipientChannel`: `to=self<|message|>...<|eom|><|start|>assistant to=user<|message|>...<|eot|>` (Muse-Glimmer / Muse-Spark).
-   - `.none`: Templates with no reasoning markers (`Llama 3.2`, `Mistral`, etc.).
-2. **`ThinkingControls`**:
-   - `supportsThinking`: `true` iff the template has a reasoning format or thinking toggle variable.
-   - `switchVariable`: e.g., `"enable_thinking"`.
-   - `depthVariable` & `depthValues`: Extracted directly from Jinja `in [...]` checks for `"reasoning_effort"`, `"reasoning_strength"`, or `"thinking_mode"` (e.g., `["low", "medium", "high"]` or `["none", "low", "medium", "high", "max"]`).
-3. **Dynamic `StripSpecials` & EOS Token Union**:
-   - Extracts `"special": true` tokens from `tokenizer.json` (`added_tokens`) and `tokenizer_config.json` (`added_tokens_decoder`), minus `reasoningFormat.structuralDelimiters`, so turn-end tokens (`<turn|>`, `<|eot|>`, `<|im_end|>`) are scrubbed from visible output without eating reasoning channel delimiters before `ReasoningParser` processes them.
-   - Collects `eos_token_id` arrays from `config.json` and `generation_config.json` so `MLXSwiftProvider` configures `extraEOSTokens` on `ModelConfiguration`.
+- **Internal Provenance (`EngineDescription` & `ProvenanceField<T>`)**: Tracks runtime identity, capabilities, context sizes, and reasoning metadata across six provenance states (`derived`, `configured`, `observed`, `observed_cached`, `unknown`, `not_applicable`), three effect classes (`reload`, `per_request`, `read_only`), and explicit `ComputePlacement` (`mlx_gpu`, `ane`, `hybrid_ane_gpu`, `cpu_and_gpu`, `cpu_only`, `gguf_subprocess`, `remote`).
+- **Truthful Fact Serialization (`Fact<Value>`)**: Every field under `EngineContract` wraps its payload in `Fact<Value>(value:provenance:source:)`. When serializing to JSON, `.unknown` and `.notApplicable` **force `"value": null`** rather than leaking stale estimates or zeros. Both `value` (when `String`) and `source` pass through `EngineSanitization.publicValue` / `EngineSanitization.publicPathString` so local filesystem paths are never leaked to public API clients.
+- **`SettingFact`**: Each setting in `EngineContract.settings` encodes `{value, configured, auto, reason, provenance, effect}` across six wire `ConfigFieldEffect` values (`per_request`, `applies_live`, `descriptive`, `requires_reload`, `load_time_only`, `identity`).
+- **`EngineContract` Sub-Blocks**:
+  - `context`: `length` (`Fact<Int>`) vs `running` (`Fact<Int>` — `not_applicable` on dynamic MLX/CoreAI KV growth; `observed` from `llama-server /props` on loaded GGUF).
+  - `template`: `EngineTemplateFacts` (`origin`, sanitized `path`, `sha256`, `running_sha256`, `prefix_stable`, `caps`).
+  - `thinking`: `EngineThinkingFacts` (`supported`, `source`, `control`, `depth: EngineThinkingDepthFacts?`, `budget: EngineThinkingBudgetFacts?`, `default_enabled`, `format`).
+  - `speculative`: `EngineSpeculativeFacts` (`supported`, `in_force`, `draft_model`, `spec_type`).
+  - `decoding`: `EngineDecodingFacts` (`method`, `reason`, `draft_model`, `mtp_tokens`).
+  - `embeddings`: `EngineEmbeddingFacts?` (`modalities`, `dimensions`, `native_dimensions`, `max_input_tokens`, `prompts`, `normalization`, `video_audio`, `video_windows`, `limits`, `provenance`, `load_profile`, `compute_placement`).
+- **Public vs Admin Model Rows**:
+  - `PublicModelWireRow` (`GET /v1/models`, `GET /v1/models/*id`) strictly **omits `modelPath`** (`EngineSanitization`) and surfaces `id`, `object`, `owned_by`, `provider`, `modalities`, `capabilities`, `thinking_default`, `sampler_defaults`, `sampler_sources`, and `engine: EngineContract`.
+  - `AdminModelWireRow` (`GET /v1/admin/models`) additionally surfaces `model_path`, `config` (explicit keys only via `ModelSidecarConfig.toExplicitJSONDictionary()`), `source` (`.config` vs `.discovered`), `stale_reload_fields`, and the live `EngineContract`.
 
 ---
 
-## 4. 4-Rung Chat Template Ladder, `HeylookJinjaRenderer` & `ChatTemplateInspection` (`HeylookConfig.swift`, `HeylookJinjaRenderer.swift`)
+## 2.2 Declarative Schema & Comment-Preserving TOML (`ProviderConfigSchema`, `TOMLCodec`)
 
-When resolving a model's chat template (for `llama-server --chat-template-file`, `MLXSwiftProvider`, or `GET`/`POST /v1/conversations/{id}/prompt`), `HeylookConfig` evaluates the template ladder in order:
+- **`ProviderConfigSchema`** (`Sources/HeylookCore/Config/ProviderConfigSchema.swift`) is the single canonical source of truth for per-provider configuration across `mlx`, `gguf`, and `coreai`. It directly derives all **13** sampler descriptors from `SamplerCascade.SamplerFieldKey.allCases` without duplicating key lists.
+  - Each `ConfigFieldDescriptor` specifies `type`, bounds (`minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`), `enum`, `effect`, CLI `arg` (for `gguf`), `ui` (`normal | advanced | hidden`), `shape`, `reason`, `file_only`, and `load_setting`.
+  - Drives four consumers uniformly:
+    1. `modelOptionsJSON(...)` for `GET /v1/admin/model-options`.
+    2. `validatePatch(...)` for `PATCH /v1/admin/models/*id`, rejecting unknown keys, invalid bounds/types, and `isFileOnly` fields (e.g. `server_binary`, `model_path`) with HTTP **`422`**.
+    3. `parseReloadSettings(...)` for `POST /v1/admin/models/*id/reload`, rejecting non-`load_setting` keys with HTTP **`400`**.
+    4. `staleReloadFields(...)` and `buildEngineSettings(...)` comparing the snapshot captured at load time against the current on-disk/saved config (plus template staleness).
+- **`TOMLCodec`** (`Sources/HeylookCore/Config/TOMLCodec.swift`) provides a recursive-descent parser and comment-preserving mutator for `heylook.toml` (`updateScanConfig`, `updateSettings`) and per-model `model.heylook.toml` (`updateModelSidecar`, `applyModelSidecarPatch`). When all explicit overrides are unset (`null` / removed), `updateModelSidecar` returns `nil` so an empty sidecar file is cleanly deleted from disk rather than leaving stale overrides behind.
 
-1. **Rung 1 (`chat_template_path` / `chat_template` in `model.heylook.toml`)**: Explicit path or inline Jinja string in sidecar (`.configured`, `origin = "sidecar"`). When `chat_template_path` is set, `ChatTemplateInspection.inertReason` warns that `chat_template.heylook.jinja` is shadowed.
-2. **Rung 2 (`chat_template.heylook.jinja`)**: Operator override file written by `PUT /v1/admin/models/{id}/chat-template` or the Template Override sheet (`.configured`, `origin = "operator_override"`). Deleting the override via `DELETE /v1/admin/models/{id}/chat-template` cleanly reverts to Rung 3 or 4 without mutating vendor files.
-3. **Rung 3 (`chat_template.jinja`)**: Vendor-shipped Jinja file in the model directory (`.derived`, `origin = "vendor_file"`), skipped if `use_sidecar_chat_template = false` or if `--mmproj` vision/audio is active and the sidecar template lacks media placeholders while the `.gguf` header carries a multimodal template.
-4. **Rung 4 (`tokenizer_config.json` / `gguf_embedded`)**: `chat_template` string embedded in `tokenizer_config.json` or `tokenizer.chat_template` in the `.gguf` binary header (`.derived`, `origin = "gguf_header"`).
+---
 
-### Real Jinja2 AST Evaluation & Integrity Checks
-- **`HeylookJinjaRenderer`**: Provides a full recursive-descent Jinja2 lexer, AST parser, syntax validator (`validateSyntax`), and evaluator supporting `for`/`else` (`loop.index0`, `loop.first`, `loop.last`), `if`/`elif`/`else`, `set` & `namespace(...)` mutation across loop iterations, `macro` definitions, array slicing (`messages[::-1]`), filters (`tojson`, `trim`, `length`, `join`, `replace`, `selectattr`), `raise_exception(...)`, and `huggingface/swift-jinja` execution when linked under `HEYLOOK_ENABLE_NATIVE_MLX=1`.
-- **Prefix-Stability Lint (`checkPrefixStability`)**: Renders a 2-turn conversation and a 3-turn extension and verifies that the 2-turn output (minus generation prompt tail) is an exact byte prefix of the 3-turn render, flagging `strftime_now()` or history-mutating templates (`prefixStable = false`).
-- **Post-Download Vendor Modification Detection (`checkModifiedSinceDownload`)**: Computes git-blob `SHA-1` (`blob <len>\0...`) or Git-LFS `SHA-256` against `.cache/huggingface/download/<filename>.metadata` ETags so operators can see when a vendor `chat_template.jinja` or `tokenizer_config.json` was edited on disk (`modifiedSinceDownload == true`).
-- **Offline Subword Tokenization (`CheckpointPieceTokenizer`)**: Parses both BPE (`vocab` + merge ranks) and SentencePiece Unigram (`vocab` `[piece, score]` log-probabilities via Viterbi dynamic programming) from `tokenizer.json` for accurate offline prompt/budget token counting.
-- **Non-Destructive Config Helpers**: `HeylookConfig.addScanFolder(_:configURL:)`, `removeScanFolder(_:configURL:)`, and `save(to:)` update `heylook.toml` atomically while preserving `[[models]]`, `admin_token`, and `allowed_hosts`.
+## 2.3 Five-Layer `SamplerCascade`
+
+Defined in `Sources/HeylookCore/Sampling/SamplerCascade.swift`:
+
+1. **Layer 1 — `builtin`**:
+   - `fallbackTemperature = 1.0`, `fallbackTopP = 0.95`, `defaultMaxTokens = 16384`, `defaultRepetitionContextSize = 64`.
+   - Inactive optional knobs default to engine off-sentinels (`top_k = 0`, `min_p = 0.0`, `repetition_penalty = 1.0`, `presence_penalty = 0.0`).
+2. **Layer 2 — `vendor`**: Reads `generation_config.json` from the checkpoint directory, importing vendor baseline keys (`VENDOR_SAMPLING_KEYS = ["temperature", "top_p", "top_k"]`).
+3. **Layer 3 — `model.heylook.toml`**: Model sidecar or `[[models]]` explicit overrides (skipping any keys listed in `unset`).
+4. **Layer 4 — `preset`**: Active preset snapshot stamped onto a conversation or notebook.
+5. **Layer 5 — `request`**: Explicit per-turn overrides in `/v1/messages` or `/v1/conversations/*/generate`.
+
+`SamplerFieldKey` (`allCases`, 13 canonical keys) ensures identical resolution across `HeylookCore`, `ProviderConfigSchema`, `PresetsSurface`, `DocumentSettingsController`, and `MessagesWire` (`StrictSamplerParams` validates API sampler payloads with `422` on unknown keys or out-of-range values). Note `.thinking` maps to wire `"enable_thinking"` in `ProviderConfigSchema` and sidecar explicit JSON exports while accepting `/v1/messages` `thinking: Bool | {type, budget_tokens}`.
+
+---
+
+## 2.4 Render-Probe `ThinkingControls`, Template Ladder & 4-Protocol `ReasoningParser`
+
+### Zero-Heuristic Thinking Probe (`ModelTemplateInfo.swift` & `HeylookJinjaRenderer.swift`)
+
+Instead of switching on model ID substrings, `ModelTemplateInfo.detectThinkingControls` runs real AST + template renders against `HeylookJinjaRenderer`:
+- Probes variable references (`enable_thinking`, `thinking`, `reasoning_effort`, `reasoning_strength`, etc.) and evaluates outputs with candidate toggles and a sentinel string `garbageDepthSentinel = "zq-not-a-level"`.
+- Classifies depth-word semantics from observed rendered text:
+  - `unknown`: `"ignored"` | `"verbatim"` | `"fallback"` | `"raises"` (e.g., whether an unsupported `thinking_depth` word is ignored, echoed verbatim, triggers fallback, or raises a Jinja error), plus `changes_prefix`, `off`, `aliases`, and `budgetEnforced`.
+- `HeylookJinjaRenderer.checkPrefixStability(template:)` detects non-prefix-stable templates caused by `strftime_now`/`now()` or turn-index logic (such as templates that strip `reasoning_content` from older assistant turns prior to `last_query_index`).
+
+### Chat Template Resolution Ladder (`HeylookConfig.inspectChatTemplate`)
+
+Templates are discovered and inspected in strict precedence order:
+1. Inline or referenced `chat_template` / `chat_template_path` in `model.heylook.toml`.
+2. Operator override file `chat_template.heylook.jinja` in the model directory (validated via `HeylookJinjaRenderer.validateSyntax` before writing).
+3. Vendor sidecar `chat_template.jinja` (unless `use_sidecar_chat_template = false`).
+4. `tokenizer_config.json` -> `chat_template.json` -> embedded GGUF `tokenizer.chat_template` (`GGUFHeaderReader`).
+
+`inspectChatTemplate` surfaces every copy found (`sources` ladder), Hugging Face download provenance (`modified_since_download`), `inert_reason` when an override is shadowed, truthful `observedStale: Bool?` (`nil` when unloaded), and `refused_shapes`.
+
+### 4-Protocol Streaming `ReasoningParser` (`Sources/HeylookCore/Parsing/ReasoningParser.swift`)
+
+Wait-free character state machines split reasoning vs visible content across four structural reasoning protocols derived by `ModelTemplateInfo`:
+1. `.tagPair` (`<think>...</think>`, `<|thought|>...<|/thought|>`, `<thought>...</thought>`, including open-thinking resume when history ends inside an open think block).
+2. `.gemmaChannel` (`<|channel>thought\n...<channel|>`).
+3. `.harmonyChannel` (`<|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>`).
+4. `.recipientChannel` (`to=self<|message|>...<|eom|><|start|>assistant to=user<|message|>...<|eot|>`).
+
+`forceEndReasoning()` closes active reasoning cleanly when mid-generation stop/think-end is triggered (`POST /v1/requests/{id}/reasoning-end`), while `StripSpecials` filters trailing special tokens without hardcoding model IDs.

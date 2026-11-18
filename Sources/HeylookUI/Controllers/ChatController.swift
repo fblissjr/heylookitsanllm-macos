@@ -127,7 +127,7 @@ public final class ChatController {
     public let scheduler: ComputeScheduler
     public let registry: RequestRegistry
     public let chatSettings: DocumentSettingsController
-    @ObservationIgnored private let localService: WorkbenchService
+    @ObservationIgnored public let localService: WorkbenchService
 
     // MARK: - Conversation & Message State
 
@@ -319,17 +319,17 @@ public final class ChatController {
         store: SQLiteStore,
         scheduler: ComputeScheduler,
         registry: RequestRegistry,
-        chatSettings: DocumentSettingsController
+        chatSettings: DocumentSettingsController,
+        localService: WorkbenchService? = nil
     ) {
         self.store = store
         self.scheduler = scheduler
         self.registry = registry
         self.chatSettings = chatSettings
-        self.localService = WorkbenchService(
+        self.localService = localService ?? WorkbenchService(
             store: store,
             scheduler: scheduler,
-            registry: registry,
-            allowSyntheticFallback: false
+            registry: registry
         )
     }
 

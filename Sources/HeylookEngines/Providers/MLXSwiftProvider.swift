@@ -127,16 +127,6 @@ public actor MLXSwiftProvider: InferenceProvider {
         }
     }
 
-    @available(*, deprecated, message: "allowSyntheticFallback has been removed; MLXSwiftProvider enforces real checkpoints and runtime.")
-    public init(
-        description: EngineDescription,
-        allowSyntheticFallback: Bool,
-        tokenCounter: (@Sendable (String) -> Int)? = nil
-    ) {
-        _ = allowSyntheticFallback
-        self.init(description: description, tokenCounter: tokenCounter)
-    }
-
     public func describe() async -> EngineDescription {
         descriptionState
     }

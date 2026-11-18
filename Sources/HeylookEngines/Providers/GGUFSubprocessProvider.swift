@@ -465,16 +465,6 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         )
     }
 
-    @available(*, deprecated, message: "allowSyntheticFallback has been removed; GGUFSubprocessProvider always requires a real llama-server executable and GGUF checkpoint.")
-    public init(
-        description: EngineDescription,
-        spawnConfig: GGUFSpawnConfig? = nil,
-        allowSyntheticFallback: Bool
-    ) {
-        _ = allowSyntheticFallback
-        self.init(description: description, spawnConfig: spawnConfig)
-    }
-
     /// Builds the `llama-server` CLI flag array matching `llama_server_provider.py`.
     public static func buildLlamaServerArgs(config: GGUFSpawnConfig) -> [String] {
         var args: [String] = [

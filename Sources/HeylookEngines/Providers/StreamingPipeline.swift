@@ -5,10 +5,8 @@ import HeylookCore
 public enum ProviderFactory {
     public static func makeProvider(
         for description: EngineDescription,
-        allowSyntheticFallback: Bool = false,
         remoteBaseURL: URL = URL(string: "http://127.0.0.1:8000")!
     ) -> any InferenceProvider {
-        _ = allowSyntheticFallback
         switch description.provider {
         case .mlx:
             return MLXSwiftProvider(description: description)

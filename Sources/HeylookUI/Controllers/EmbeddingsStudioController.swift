@@ -389,7 +389,6 @@ public final class EmbeddingsStudioController {
     public private(set) var labSweepResults: [EmbeddingsLabRunResult] = []
     public var labSweepANELanePresets: Bool = false
     public var labProgressText: String?
-    public var evalLabSuiteReport: EvalLabSuite.SuiteReport?
     public var isRunningEvalLab: Bool = false
     public private(set) var activeEmbeddingRequestID: String?
 
@@ -406,10 +405,14 @@ public final class EmbeddingsStudioController {
 
     @ObservationIgnored public var onStatusMessage: (String?) -> Void = { _ in }
 
-    public init(vectorStore: VectorStore, router: HeylookRouter) {
+    public init(
+        vectorStore: VectorStore,
+        router: HeylookRouter,
+        embeddingEngine: (any EmbeddingEngine)? = nil
+    ) {
         self.vectorStore = vectorStore
         self.router = router
-        let initialEngine = NativeMLXEmbeddingGemma2.makeBestAvailableEngine(computeOptions: .hybridANETowers)
+        let initialEngine = embeddingEngine ?? NativeMLXEmbeddingGemma2.makeBestAvailableEngine(computeOptions: .hybridANETowers)
         self.activeEmbeddingEngine = initialEngine
         self.indexCoordinator = IndexCoordinator(engine: initialEngine, store: vectorStore)
         self.labSet = Self.makeBuiltInMultimodalSampleSet()
@@ -476,7 +479,7 @@ public final class EmbeddingsStudioController {
     }
 
     public var isActiveEmbeddingEngineSynthetic: Bool {
-        activeEmbeddingEngine is DeterministicHashEmbeddingEngine
+        false
     }
 
     // MARK: - Engine Setup & Shutdown
@@ -2162,12 +2165,6 @@ public final class EmbeddingsStudioController {
             )
         )
         embeddingsSubMode = .evalLab
-    }
-
-    // Legacy `EvalLabSuite` bridge retained ONLY for `HeylookWorkbenchViewModel` compile compatibility.
-    @discardableResult
-    public func runFullEvalLabSuite() async -> EvalLabSuite.SuiteReport? {
-        nil
     }
 
     // MARK: - Unified Embedding Execution (Local Engine + Remote HTTP `/v1/embeddings`)

@@ -434,13 +434,21 @@ public final class HeylookWorkbenchViewModel {
 
     @ObservationIgnored private var storeMutationTask: Task<Void, Never>?
 
-    public init(autoBootstrap: Bool = true) {
+    public init(
+        autoBootstrap: Bool = true,
+        store: SQLiteStore? = nil,
+        vectorStore: VectorStore? = nil,
+        config: HeylookConfig? = nil,
+        embeddingEngine: (any EmbeddingEngine)? = nil
+    ) {
         let dbURL = HeylookConfig.defaultStoreURL
         let vecDbURL = HeylookConfig.defaultVectorStoreURL
-        let cfg = HeylookConfig.loadDefault()
-        let sqliteStore = (try? SQLiteStore(databaseURL: dbURL))
+        let cfg = config ?? HeylookConfig.loadDefault()
+        let sqliteStore = store
+            ?? (try? SQLiteStore(databaseURL: dbURL))
             ?? (try! SQLiteStore(databaseURL: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("heylook_fallback.sqlite")))
-        let vecStore = (try? VectorStore(databaseURL: vecDbURL))
+        let vecStore = vectorStore
+            ?? (try? VectorStore(databaseURL: vecDbURL))
             ?? (try! VectorStore(databaseURL: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("heylook_vec_fallback.sqlite")))
         let computeScheduler = ComputeScheduler(maxLoadedGPUModels: cfg.maxLoadedModels, maxQueueDepth: cfg.maxQueueDepth)
         let reqRegistry = RequestRegistry.shared
@@ -450,7 +458,7 @@ public final class HeylookWorkbenchViewModel {
         self.scheduler = computeScheduler
         self.registry = reqRegistry
 
-        let embControllerInitEngine = NativeMLXEmbeddingGemma2.makeBestAvailableEngine(computeOptions: .hybridANETowers)
+        let embControllerInitEngine = embeddingEngine ?? NativeMLXEmbeddingGemma2.makeBestAvailableEngine(computeOptions: .hybridANETowers)
         let httpRouter = HeylookRouter(
             store: sqliteStore,
             scheduler: computeScheduler,
@@ -474,7 +482,8 @@ public final class HeylookWorkbenchViewModel {
             store: sqliteStore,
             scheduler: computeScheduler,
             registry: reqRegistry,
-            chatSettings: self.chatSettings
+            chatSettings: self.chatSettings,
+            localService: httpRouter.service
         )
         self.notebookPresets = NotebookAndPresetsController(
             store: sqliteStore,
@@ -482,7 +491,11 @@ public final class HeylookWorkbenchViewModel {
             registry: reqRegistry,
             notebookSettings: self.notebookSettings
         )
-        self.embeddings = EmbeddingsStudioController(vectorStore: vecStore, router: httpRouter)
+        self.embeddings = EmbeddingsStudioController(
+            vectorStore: vecStore,
+            router: httpRouter,
+            embeddingEngine: embControllerInitEngine
+        )
         self.modelsPerf = ModelsAndPerfController(
             config: cfg,
             store: sqliteStore,
@@ -893,8 +906,6 @@ public final class HeylookWorkbenchViewModel {
     }
     public var connectedRemoteServerURL: String? { modelsPerf.connectedRemoteServerURL }
 
-    public static func defaultDemoModels() -> [EngineDescription] { ModelsAndPerfController.defaultDemoModels() }
-    public func loadSampleDemoWorkspace() async { await modelsPerf.loadSampleDemoWorkspace() }
     public func refreshMetrics() async { await modelsPerf.refreshMetrics() }
     public func refreshPerfAndObservability() { modelsPerf.refreshPerfAndObservability() }
     public func refreshObservabilityEntries() { modelsPerf.refreshObservabilityEntries() }
@@ -1441,7 +1452,6 @@ public final class HeylookWorkbenchViewModel {
     }
     public var labMetrics: [EmbeddingLabRunner.DimensionMetrics] { embeddings.labMetrics }
     public var labConfigRuns: [EmbeddingLabConfigRun] { embeddings.labConfigRuns }
-    public var evalLabSuiteReport: EvalLabSuite.SuiteReport? { embeddings.evalLabSuiteReport }
     public var isRunningEvalLab: Bool { embeddings.isRunningEvalLab }
 
     public var hasActiveQuery: Bool { embeddings.hasActiveQuery }
@@ -1495,6 +1505,4 @@ public final class HeylookWorkbenchViewModel {
     public func sendHitToPairwiseCompare(_ hit: SearchHit) { embeddings.sendHitToPairwiseCompare(hit) }
     public func pinHitToRetrievalLab(_ hit: SearchHit) async { await embeddings.pinHitToRetrievalLab(hit) }
     public func promoteComparePairToRetrievalLab() async { await embeddings.promoteComparePairToRetrievalLab() }
-    @discardableResult
-    public func runFullEvalLabSuite() async -> EvalLabSuite.SuiteReport? { await embeddings.runFullEvalLabSuite() }
 }

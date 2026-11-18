@@ -58,6 +58,11 @@ public protocol InferenceProvider: Sendable {
         registry: RequestRegistry
     ) async -> AsyncThrowingStream<GenerationChunk, Error>
 
+    func planImages(sizes: [[Int]]) async throws -> ImagePlanResult
+    func renderPromptPreview(request: MessagesRequest) async throws -> PromptPreviewResult
+    func observedContractState() async -> ObservedContractState
+    func warmUp1Token() async throws
+
     func unload() async
 }
 
@@ -288,15 +293,6 @@ public actor ComputeScheduler {
         }
     }
 
-    @available(*, deprecated, message: "allowSyntheticFallback has been removed; use registerDiscoveredModels(_:)")
-    public func registerDiscoveredModels(
-        _ discovered: [EngineDescription],
-        allowSyntheticFallback: Bool
-    ) async {
-        _ = allowSyntheticFallback
-        await registerDiscoveredModels(discovered)
-    }
-
     public func reloadRegistry(_ discovered: [EngineDescription]) async {
         let newIDs = Set(discovered.map(\.modelID))
         let removedIDs = Set(descriptions.keys).subtracting(newIDs)
@@ -314,15 +310,6 @@ public actor ComputeScheduler {
                 await register(provider: provider, description: desc)
             }
         }
-    }
-
-    @available(*, deprecated, message: "allowSyntheticFallback has been removed; use reloadRegistry(_:)")
-    public func reloadRegistry(
-        _ discovered: [EngineDescription],
-        allowSyntheticFallback: Bool
-    ) async {
-        _ = allowSyntheticFallback
-        await reloadRegistry(discovered)
     }
 
     public func removeModel(_ modelID: String) async -> Bool {
@@ -649,8 +636,7 @@ public actor ComputeScheduler {
         return provider
     }
 
-    public func voiceASRSummary(allowSyntheticFallback: Bool = false) -> VoiceASRSummary {
-        _ = allowSyntheticFallback
+    public func voiceASRSummary() -> VoiceASRSummary {
         let explicitASRs = descriptions.values
             .filter { $0.supportsAudio.value || $0.tags.contains("asr") || $0.tags.contains("speech") }
             .sorted { $0.modelID.localizedStandardCompare($1.modelID) == .orderedAscending }
@@ -694,10 +680,8 @@ public actor ComputeScheduler {
     }
 
     public func resolveASRProvider(
-        preferredModelID: String? = nil,
-        allowSyntheticFallback: Bool = false
+        preferredModelID: String? = nil
     ) throws -> (provider: CoreAIProvider, isRegisteredInCatalog: Bool) {
-        _ = allowSyntheticFallback
         if let preferred = preferredModelID, !preferred.isEmpty {
             if preferred == SpeechTranscriptionService.systemSpeechModelID {
                 guard SpeechTranscriptionService.isSystemSpeechAvailable else {
@@ -763,10 +747,8 @@ public actor ComputeScheduler {
     public func transcribeVoice(
         wavData: Data,
         languageHint: String = "en",
-        preferredASRModelID: String? = nil,
-        allowSyntheticFallback: Bool = false
+        preferredASRModelID: String? = nil
     ) async throws -> ANESpeechTranscriptionResult {
-        _ = allowSyntheticFallback
         let resolved = try resolveASRProvider(preferredModelID: preferredASRModelID)
         if resolved.isRegisteredInCatalog {
             return try await withComputeLease(for: resolved.provider.modelID) {

@@ -1,53 +1,44 @@
-# Multimodal Embeddings, ANE Towers & Matryoshka Vector Store
+# 4. Multimodal Embeddings, ANE Towers & Matryoshka Store
 
-Covers `Sources/HeylookEmbeddings/` (`Domain/`, `Engine/`, `Pipeline/`, `Store/`, and `IndexCoordinator.swift`).
-
----
-
-## 1. Extensible `Artifact` & `ArtifactSpan` Model (`Artifact.swift`)
-
-Every indexed file is represented as a parent `Artifact` (`ArtifactKind`: `.video`, `.image`, `.audio`, `.text`, `.code`, `.document`) paired with one or more `EmbeddedChunk` rows carrying a modality-specific `ArtifactSpan`:
-- `.whole`: Full image, short text file, or single-span item.
-- `.temporal(start: Double, end: Double, frameTimes: [Double])`: Overlapping `32s` video windows (`16s` stride) with exact extracted keyframe timestamps, or `30s` audio windows (`15s` stride).
-- `.lines(startLine: Int, endLine: Int)`: Source code and markdown line ranges.
-- `.pages(startPage: Int, endPage: Int)`: `PDFKit` page ranges.
-
-> **Parent-Artifact Deduplication Rule**: `VectorStore.search` groups matching chunk rows by `artifact.id`, never returning duplicate cards for multiple windows of the same video or pages of the same PDF. Each `SearchHit` carries `bestScore`, `bestSpan`, and ordered `spanMatches` (with `scoresByDimension` across `768d`, `512d`, `256d`, and `128d`).
+`HeylookEmbeddings` (`Sources/HeylookEmbeddings/`) delivers native multimodal embeddings across text, code, images, PDFs, audio, and video windows using **EmbeddingGemma 2**, optional compiled CoreML ANE towers (`.mlmodelc`), GGUF embedding subprocesses (`llama-server --embeddings`), and an Accelerate/`vDSP`-backed SQLite WAL `VectorStore`.
 
 ---
 
-## 2. Matryoshka Representation Learning (MRL) Without Re-Indexing (`VectorStore.swift`)
+## 4.1 Truthful Multimodal & GGUF Embedding Engines
 
-- `VectorStore` stores full **768-dimensional** `Float32` embeddings once in SQLite (`WAL` mode).
-- At query time, `Matryoshka.sliceAndNormalize` slices the first $d \in \{768, 512, 256, 128\}$ dimensions and L2-normalizes in hardware using Apple `Accelerate` (`vDSP_svesq` + `vDSP_vsdiv` + `vDSP_dotpr`).
-- **Truthful Model-ID Invalidation (`VectorStore.isUpToDate`)**:
-  `isUpToDate` tracks `(byte_count, modified_ms, window_sampling, model_id)`.
-  - Real `EmbeddingGemma 2` engines (`MLXSwiftLMEmbeddingGemma2Engine` and `HybridLocalEmbeddingEngine` when compiled `.mlmodelc` towers are present) report `modelID = "embeddinggemma-2-MLX-BF16"`.
-  - When neither `MLXVLM` nor compiled `.mlmodelc` ANE bundles are present on disk, `DeterministicHashEmbeddingEngine` and `HybridLocalEmbeddingEngine` report `modelID = "deterministic-hash-768d"`, ensuring that installing real weights automatically invalidates placeholder hash rows on the next index pass.
-
----
-
-## 3. Per-Tower Compute Placement & `ANECoreMLRuntime` (`ModelComputeOptions.swift` & `NativeMLXEmbeddingGemma2.swift`)
-
-`ModelComputeOptions` allows routing the 3 towers of `EmbeddingGemma 2` independently across **CPU + Neural Engine (`.cpuAndNeuralEngine`)**, **MLX GPU (`.mlxGPU`)**, **CoreML GPU (`.cpuAndGPU`)**, or **CPU Only (`.cpuOnly`)**:
-
-| Component (`EmbeddingComponent`) | Compiled Bundle | ANE Op Placement | Role |
-| :--- | :--- | :--- | :--- |
-| **Vision Encoder (`visionEncoder`)** | `EmbeddingGemma2VisionANE.mlmodelc` | Neural Engine primary | Patchifies & encodes still images and video keyframes |
-| **Audio Conformer (`audioEncoder`)** | `EmbeddingGemma2AudioANE.mlmodelc` | Neural Engine primary | Encodes 16 kHz 128-bin HTK log-mel audio windows |
-| **Text Backbone + Projection (`textBackbone`)** | `EmbeddingGemma2TextANE.mlmodelc` + `embed_tokens_fp16.bin` | Neural Engine + mmap FP16 embeddings | Encodes text tokens and fuses multimodal projections into 768d |
-
-### ANE Execution Path (`HybridLocalEmbeddingEngine` & `ANECoreMLRuntime`)
-- When compiled `.mlmodelc` bundles exist in the checkpoint directory (`hasCompiledANETowers == true`), `HybridLocalEmbeddingEngine` decodes images via `CGImageSource`, resamples arbitrary sample-rate / multi-channel audio (`24 kHz`, `44.1 kHz`, `48 kHz` stereo/mono WAV/CAF/M4A) to `16 kHz` mono `Float32` via `AVAudioFile` + `AVAudioConverter`, computes 128-bin HTK log-mel spectrograms via `ANECoreMLRuntime.computeAudioLogMel`, and runs `aneRuntime.encodeVision`, `aneRuntime.encodeAudio`, and `aneRuntime.encodeTextAndFuse` directly on the Neural Engine.
-- **FP16 Overflow Mitigation (`ANESafeRMSNorm`)**: Because the Apple Neural Engine executes strictly in IEEE 754 `FP16` (`max = 65,504`), `scripts/export_ane_coreml.py` pre-scales hidden states by $1/16$ before squaring inside `RMSNorm` layers so large Gemma residual activations never overflow to `NaN` on ANE hardware.
+1. **`MLXSwiftLMEmbeddingGemma2Engine`** (`Sources/HeylookEmbeddings/Engine/NativeMLXEmbeddingGemma2.swift`):
+   - **1,024-Token Padded Batch Text Embedding**: Batches text-only inputs into padded forward passes capped at `textBatchTokenLimit = 1_024` via `makeLengthBatches(lengths:limit:)`, reducing Swift/Metal kernel dispatch overhead across bulk corpus and lab sweeps.
+   - **True `hybrid_ane` ANE->GPU Bridge (No `TextANE.mlmodelc` Needed)**: Under `.hybridANETowers` (`compute=hybrid_ane`), `resolvedHybridModel` loads MLX weights *excluding* ANE-offloaded vision/audio towers, runs `VisionEncoder.mlmodelc` / `AudioEncoder.mlmodelc` on Apple Neural Engine via **`ANECoreMLRuntime`** to extract `softTokens`, and injects those `[Float]` soft tokens directly into GPU **`MLXVLM.EmbeddingGemma2.embed(inputIds:attentionMask:softTokens:)`**. Only `.allANE` requires a compiled `TextANE.mlmodelc` bundle (using sequence length buckets `[64, 320, 512, 768, 1024]`).
+   - **Consecutive Single-Window Video Decoding**: When a request supplies `windows.seconds` (including clips `<= 16s`), **`WindowPlanner.consecutiveRanges`** partitions `[0, duration]` into non-overlapping consecutive windows and **`ArtifactProcessor.decodeVideoWindowFrames`** decodes **one window at a time** (bounded peak memory) using uniform FPS (`pickFPS`) or scene-change (`pickContent`) sampling, optionally extracting matched window audio.
+2. **`GGUFEmbeddingEngine`** (`Sources/HeylookEmbeddings/Engine/GGUFEmbeddingEngine.swift`):
+   - Launches an isolated `llama-server --embeddings --pooling <mode>` subprocess scoped by `EmbeddingModelFacts.ggufEmbeddingProfile` (`ctx_size <= n_ubatch <= n_batch` enforced safely).
+   - Truthfully rejects video `windows` payloads with HTTP **`400`** because GGUF `llama-server --embeddings` supports text-only embedding inputs.
+3. **`HybridLocalEmbeddingEngine`**:
+   - Coordinates ANE-tower vs MLX fallback routing strictly across real checkpoints; synthetic fallback flags and `DeterministicHashEmbeddingEngine` have been completely removed from production `Sources/`.
 
 ---
 
-## 4. Video & Audio Windowing Pipeline (`ArtifactProcessor.swift`)
+## 4.2 Dynamic Task Prompts & Contract Facts (`EmbeddingModelFacts`)
 
-- **Duration-Scaled Frame Budgets (`WindowPlanner.pickContent`)**:
-  Scales frame selection to the window duration (`min(maxFrames, max(2, ceil((hi - lo) * fps)))`) and falls back to all candidate frames when `< 3` anchors exist, preventing short clips or trailing windows from feeding dense frames into a 1 fps vision processor.
-- **Upright Portrait Frame Decoding**:
-  Every `AVAssetImageGenerator` instance sets `appliesPreferredTrackTransform = true` so portrait iPhone clips are rotated upright before vision encoding.
-- **SDK 27 Async Soundtrack Extraction (`loadAudioFromVideo`)**:
-  Uses SDK 27 `AVAssetReader.outputProvider(for:)` + `readySampleBuffer.withUnsafeSampleBuffer` to stream `16 kHz` mono PCM audio windows (`30s` window, `15s` stride) alongside `.temporal` visual keyframe windows for the same video artifact.
+Defined in `Sources/HeylookEmbeddings/Engine/EmbeddingModelFacts.swift`:
+
+- **`PromptCatalog`**: Reads `config_sentence_transformers.json` directly from the model directory to discover `prompts` mappings and `default_prompt_name` (for example `Retrieval-query`, `Retrieval-document`, `STS`, `Clustering`, `Classification`), validating API `prompt_name` values against real checkpoint definitions instead of hardcoded task tables.
+- **`EngineEmbeddingFacts`**: `EmbeddingModelFacts.deriveFacts(...)` populates truthful modalities (`text`, `image`, `audio`, `video` when supported), `native_dimensions`, Matryoshka projections (`dimensions`), `max_input_tokens`, `prompts`, `normalization`, `video_audio`, `video_windows`, `limits`, `provenance`, `load_profile`, and `compute_placement` on `/v1/models` and `/v1/models/*id`.
+
+---
+
+## 4.3 `ANECoreMLRuntime`, Limits & Media Preprocessing
+
+- **Vision Buckets (`ANECoreMLRuntime` in `ModelComputeOptions.swift`)**: Aspect-preserving upright EXIF-oriented `CGImage` rendering into compiled CoreML Vision buckets (`[480, 672]`, `[672, 480]`, `[528, 528]` for video budgets; `[672, 960]`, `[960, 672]`, `[768, 768]` for standalone images) with sRGB `[1, 3, H, W]` `[0, 1]` normalization.
+- **Audio Tower**: 16 kHz mono PCM resampled into `30s` windows (`750`-token output ceiling after `conv0`/`conv1` subsampling).
+- **Strict Request Limits (`EmbeddingRequestLimits` in `EmbeddingEngine.swift`)**:
+  - Max **`16`** items per request, **`32`** content blocks per item, **`131,072`** text characters per text block, **`32 MiB`** per decoded image/audio blob, and **`256 MiB`** aggregate video payload budget per request, enforced via `EmbeddingValidationError` (`400` / `413`).
+- **Indexing Pipelines (`ArtifactProcessor` + `WindowPlanner` + `FolderWatcher` + `IndexCoordinator`)**:
+  - Indexes folders recursively across text/code (`ArtifactSpan`), PDFs (`PDFKit` per-page chunking), images, audio (`30s` chunks), and video (`32s` windows with `16s` stride for corpus indexing; consecutive `windows.seconds` windows for `/v1/embeddings` video window queries).
+
+---
+
+## 4.4 Matryoshka `VectorStore` (`Store/VectorStore.swift`)
+
+- **Nested Representations**: Stores full native float vectors (`768d` for EmbeddingGemma 2) in SQLite `WAL` (`embeddings`, `artifacts`, `spans`) and projects dynamically to L2-normalized **`768d` / `512d` / `256d` / `128d`** Matryoshka prefixes via `Accelerate`/`vDSP` (`Matryoshka.project`).
+- **Truthful Model Invalidation**: Records the indexing `model_id` per indexed artifact/span so switching embedding models never silently compares vectors across incompatible latent spaces.

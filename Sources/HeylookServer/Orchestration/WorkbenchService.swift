@@ -12,7 +12,6 @@ public actor WorkbenchService: WorkbenchBackend {
     public let registry: RequestRegistry
     public let orchestrator: ConversationOrchestrator
     public let isReadOnlyConfig: Bool
-    public let allowSyntheticFallback: Bool
 
     private var defaultEmbeddingEngine: any EmbeddingEngine
     private var hasCustomEmbeddingEngine: Bool
@@ -32,8 +31,7 @@ public actor WorkbenchService: WorkbenchBackend {
         scheduler: ComputeScheduler,
         registry: RequestRegistry = .shared,
         embeddingEngine: (any EmbeddingEngine)? = nil,
-        isReadOnlyConfig: Bool = HeylookConfig.isReadOnlyModelConfig,
-        allowSyntheticFallback: Bool = false
+        isReadOnlyConfig: Bool = HeylookConfig.isReadOnlyModelConfig
     ) {
         self.store = store
         self.scheduler = scheduler
@@ -44,7 +42,6 @@ public actor WorkbenchService: WorkbenchBackend {
             registry: registry
         )
         self.isReadOnlyConfig = isReadOnlyConfig
-        self.allowSyntheticFallback = allowSyntheticFallback
         self.hasCustomEmbeddingEngine = embeddingEngine != nil
         self.defaultEmbeddingEngine = embeddingEngine ?? NativeMLXEmbeddingGemma2.makeBestAvailableEngine(
             computeOptions: .hybridANETowers
@@ -1057,6 +1054,28 @@ public actor WorkbenchService: WorkbenchBackend {
         )
     }
 
+    private static func mapASRError(_ error: Error) -> Error {
+        if let schedErr = error as? ComputeSchedulerError {
+            switch schedErr {
+            case .modelNotFound(let id):
+                return WorkbenchError.notFound("ASR model '\(id)' not found")
+            case .queueOverloaded(_, let maxDepth):
+                return WorkbenchError.modelOverloaded(message: RequestMiddleware.queueFullMessage, queueCapacity: maxDepth)
+            case .modelBusy(let id):
+                return WorkbenchError.conflict(code: "generation_in_progress", message: "ASR model '\(id)' is busy")
+            }
+        }
+        if let execErr = error as? ProviderExecutionError {
+            switch execErr {
+            case .invalidRequest:
+                return WorkbenchError.badRequest(execErr.localizedDescription)
+            case .checkpointNotFound, .binaryNotFound, .runtimeUnavailable:
+                return WorkbenchError.serviceUnavailable(execErr.localizedDescription)
+            }
+        }
+        return error
+    }
+
     public func transcribeAudio(_ request: AudioTranscriptionRequest, requestID _: String) async throws -> [String: JSONValue] {
         guard let wavData = Data(base64Encoded: request.audioBase64), !wavData.isEmpty else {
             throw WorkbenchError.badRequest("audio_base64 must be non-empty valid base64 WAV audio")
@@ -1065,8 +1084,7 @@ public actor WorkbenchService: WorkbenchBackend {
             let asr = try await scheduler.transcribeVoice(
                 wavData: wavData,
                 languageHint: request.languageHint ?? "en",
-                preferredASRModelID: request.model,
-                allowSyntheticFallback: allowSyntheticFallback
+                preferredASRModelID: request.model
             )
             return [
                 "text": .string(asr.text),
@@ -1075,13 +1093,8 @@ public actor WorkbenchService: WorkbenchBackend {
                 "compute_placement": .string(asr.computePlacement.rawValue),
                 "duration_seconds": .double(asr.durationSeconds),
             ]
-        } catch let execErr as ProviderExecutionError {
-            switch execErr {
-            case .invalidRequest:
-                throw WorkbenchError.badRequest(execErr.localizedDescription)
-            case .checkpointNotFound, .binaryNotFound, .runtimeUnavailable:
-                throw WorkbenchError.serviceUnavailable(execErr.localizedDescription)
-            }
+        } catch {
+            throw Self.mapASRError(error)
         }
     }
 
@@ -1104,16 +1117,10 @@ public actor WorkbenchService: WorkbenchBackend {
             asr = try await scheduler.transcribeVoice(
                 wavData: wavData,
                 languageHint: request.languageHint ?? "en",
-                preferredASRModelID: request.asrModel,
-                allowSyntheticFallback: allowSyntheticFallback
+                preferredASRModelID: request.asrModel
             )
-        } catch let execErr as ProviderExecutionError {
-            switch execErr {
-            case .invalidRequest:
-                throw WorkbenchError.badRequest(execErr.localizedDescription)
-            default:
-                throw WorkbenchError.serviceUnavailable(execErr.localizedDescription)
-            }
+        } catch {
+            throw Self.mapASRError(error)
         }
 
         let transcript = asr.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1911,7 +1918,7 @@ public actor WorkbenchService: WorkbenchBackend {
 
     public func capabilities() async -> [String: JSONValue] {
         let mem = HardwareMemoryMonitor.snapshot()
-        let asrSummary = await scheduler.voiceASRSummary(allowSyntheticFallback: allowSyntheticFallback)
+        let asrSummary = await scheduler.voiceASRSummary()
         let models = await scheduler.listModels()
         let embLimits = EmbeddingRequestLimits.default
         let embeddingModelLoaded = models.contains { $0.supportsEmbeddings.value } || isDefaultEmbeddingEngineReady()
