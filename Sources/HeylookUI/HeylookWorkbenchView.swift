@@ -7,6 +7,39 @@ import HeylookEmbeddings
 import HeylookEngines
 import HeylookServer
 
+#if os(macOS)
+import AppKit
+#endif
+
+/// Accessible contrast-aware styling palette derived from `@Environment(\.colorSchemeContrast)`.
+/// Ensures borders, subtle chips, and muted ink remain legible under High Contrast / Increase Contrast.
+public struct AdaptiveContrastStyle: Sendable, Equatable {
+    public let isIncreased: Bool
+
+    public init(isIncreased: Bool) {
+        self.isIncreased = isIncreased
+    }
+
+    public init(_ contrast: ColorSchemeContrast) {
+        self.isIncreased = (contrast == .increased)
+    }
+
+    public var borderOpacity: Double { isIncreased ? 0.34 : 0.10 }
+    public var subtleBorderOpacity: Double { isIncreased ? 0.28 : 0.06 }
+    public var chipFillOpacity: Double { isIncreased ? 0.22 : 0.12 }
+    public var bannerFillOpacity: Double { isIncreased ? 0.18 : 0.10 }
+    public var mutedInkOpacity: Double { isIncreased ? 0.86 : 0.62 }
+    public var borderWidth: CGFloat { isIncreased ? 1.25 : 0.75 }
+
+    public func borderColor(_ base: Color = .primary) -> Color {
+        base.opacity(borderOpacity)
+    }
+
+    public func subtleBorderColor(_ base: Color = .primary) -> Color {
+        base.opacity(subtleBorderOpacity)
+    }
+}
+
 public enum HeylookSurface: String, CaseIterable, Identifiable, Sendable {
     case chat = "Chat"
     case notebook = "Notebook"
@@ -55,6 +88,8 @@ public enum HeylookSurface: String, CaseIterable, Identifiable, Sendable {
 
 public struct HeylookRootView: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var showShortcutsSheet: Bool = false
 
@@ -71,16 +106,21 @@ public struct HeylookRootView: View {
         )
     }
 
+    private var isCompactWidth: Bool {
+        horizontalSizeClass == .compact
+    }
+
     public var body: some View {
         let genModels = viewModel.generationModels
+        let contrastStyle = AdaptiveContrastStyle(colorSchemeContrast)
         NavigationSplitView(columnVisibility: $columnVisibility) {
             HeylookSidebarView(viewModel: viewModel)
                 .navigationTitle("Heylook")
-                .navigationSplitViewColumnWidth(min: 250, ideal: 280, max: 340)
+                .modifier(DesktopSplitColumnWidthModifier(isCompact: isCompactWidth))
         } detail: {
             VStack(spacing: 0) {
                 if let banner = viewModel.statusBanner, !banner.isEmpty {
-                    StatusBannerBar(banner: banner) {
+                    StatusBannerBar(banner: banner, contrastStyle: contrastStyle) {
                         viewModel.statusBanner = nil
                     }
                     Divider()
@@ -88,6 +128,7 @@ public struct HeylookRootView: View {
 
                 if viewModel.registeredModels.isEmpty {
                     EmptyModelsDiscoveryBanner(
+                        contrastStyle: contrastStyle,
                         onRescan: { Task { await viewModel.rescanConfiguredModels() } },
                         onLoadDemo: { Task { await viewModel.loadSampleDemoWorkspace() } }
                     )
@@ -136,7 +177,7 @@ public struct HeylookRootView: View {
                         LoadAndSamplerInspectorView(viewModel: viewModel)
                     }
                 }
-                .inspectorColumnWidth(min: 310, ideal: 350, max: 440)
+                .modifier(DesktopInspectorColumnWidthModifier(isCompact: isCompactWidth))
             }
             .toolbar {
                 ToolbarItem(placement: .automatic) {
@@ -155,7 +196,7 @@ public struct HeylookRootView: View {
                             Text("\(dot) \(model.modelID)").tag(model.modelID)
                         }
                     }
-                    .frame(minWidth: 190, maxWidth: 320)
+                    .frame(minWidth: isCompactWidth ? nil : 190, maxWidth: isCompactWidth ? 200 : 320)
                     .help("Select active generation model (● loaded in Unified Memory, ○ unloaded)")
                 }
                 .visibilityPriority(.high)
@@ -169,7 +210,7 @@ public struct HeylookRootView: View {
                         Label("Shortcuts", systemImage: "questionmark.circle")
                     }
                     .keyboardShortcut("/", modifiers: [.command])
-                    .help("Keyboard Shortcuts (⌘/)")
+                    .help("Keyboard Shortcuts (? or ⌘/)")
 
                     Button {
                         viewModel.showInspector.toggle()
@@ -220,19 +261,83 @@ public struct HeylookRootView: View {
             } message: { action in
                 Text(action.message)
             }
+            .confirmationDialog(
+                "Replace System Prompt?",
+                isPresented: Binding(
+                    get: { viewModel.pendingPromptReplacement != nil },
+                    set: { isPresented in
+                        if !isPresented { viewModel.cancelPendingPromptReplacement() }
+                    }
+                )
+            ) {
+                Button("Replace Prompt & Apply", role: .destructive) {
+                    viewModel.confirmPendingPromptReplacement(replacePrompt: true)
+                }
+                Button("Apply Settings Only") {
+                    viewModel.confirmPendingPromptReplacement(replacePrompt: false)
+                }
+                Button("Cancel", role: .cancel) {
+                    viewModel.cancelPendingPromptReplacement()
+                }
+            } message: {
+                if let pending = viewModel.pendingPromptReplacement {
+                    Text("Preset \"\(pending.preset.name)\" includes a system prompt. Replace the current prompt, or copy only its sampler settings?")
+                }
+            }
         }
         .onKeyPress(.escape) {
             handleLayeredEscape()
         }
+        .onKeyPress(characters: CharacterSet(charactersIn: "?"), phases: .down) { press in
+            handleHelpShortcutKeyPress(press)
+        }
     }
 
+    private func handleHelpShortcutKeyPress(_ press: KeyPress) -> KeyPress.Result {
+        guard !Self.isEditingTextInput() else { return .ignored }
+        guard press.modifiers.isDisjoint(with: [.command, .control, .option]) else { return .ignored }
+        guard press.characters == "?" else { return .ignored }
+        showShortcutsSheet.toggle()
+        return .handled
+    }
+
+    private static func isEditingTextInput() -> Bool {
+        #if os(macOS)
+        guard let responder = NSApp?.keyWindow?.firstResponder else { return false }
+        return responder is NSTextView || responder is NSText
+        #else
+        return false
+        #endif
+    }
+
+    /// Dismisses open overlays, sheets, inline message editor, and drawers BEFORE stopping active generation (`hotkeys.js` parity).
     private func handleLayeredEscape() -> KeyPress.Result {
-        if viewModel.isGenerating {
-            viewModel.cancelGeneration()
+        if showShortcutsSheet {
+            showShortcutsSheet = false
             return .handled
         }
-        if viewModel.isNotebookGenerating {
-            viewModel.cancelNotebookGeneration()
+        if viewModel.pendingConfirmation != nil {
+            viewModel.pendingConfirmation = nil
+            return .handled
+        }
+        if viewModel.pendingPromptReplacement != nil {
+            viewModel.cancelPendingPromptReplacement()
+            return .handled
+        }
+        if viewModel.editingSidecarModel != nil {
+            viewModel.editingSidecarModel = nil
+            return .handled
+        }
+        if viewModel.showMLXConverterSheet {
+            viewModel.showMLXConverterSheet = false
+            return .handled
+        }
+        if viewModel.showEvalLabDrawer {
+            viewModel.showEvalLabDrawer = false
+            return .handled
+        }
+        if viewModel.showLoadPanel {
+            viewModel.showLoadPanel = false
             return .handled
         }
         if viewModel.pendingModelSwitchTargetID != nil {
@@ -251,7 +356,39 @@ public struct HeylookRootView: View {
             viewModel.showInspector = false
             return .handled
         }
+        if viewModel.isGenerating {
+            viewModel.cancelGeneration()
+            return .handled
+        }
+        if viewModel.isNotebookGenerating {
+            viewModel.cancelNotebookGeneration()
+            return .handled
+        }
         return .ignored
+    }
+}
+
+private struct DesktopSplitColumnWidthModifier: ViewModifier {
+    let isCompact: Bool
+
+    func body(content: Content) -> some View {
+        if isCompact {
+            content
+        } else {
+            content.navigationSplitViewColumnWidth(min: 250, ideal: 280, max: 340)
+        }
+    }
+}
+
+private struct DesktopInspectorColumnWidthModifier: ViewModifier {
+    let isCompact: Bool
+
+    func body(content: Content) -> some View {
+        if isCompact {
+            content
+        } else {
+            content.inspectorColumnWidth(min: 310, ideal: 350, max: 440)
+        }
     }
 }
 
@@ -267,6 +404,7 @@ private struct ToolbarContainerBehavior27_3Modifier: ViewModifier {
 
 private struct StatusBannerBar: View {
     let banner: String
+    let contrastStyle: AdaptiveContrastStyle
     let onDismiss: () -> Void
 
     var body: some View {
@@ -289,11 +427,12 @@ private struct StatusBannerBar: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
-        .background(Color.blue.opacity(0.1))
+        .background(Color.blue.opacity(contrastStyle.bannerFillOpacity))
     }
 }
 
 private struct EmptyModelsDiscoveryBanner: View {
+    let contrastStyle: AdaptiveContrastStyle
     let onRescan: () -> Void
     let onLoadDemo: () -> Void
 
@@ -316,7 +455,7 @@ private struct EmptyModelsDiscoveryBanner: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background(Color.orange.opacity(0.1))
+        .background(Color.orange.opacity(contrastStyle.bannerFillOpacity))
     }
 }
 
@@ -325,9 +464,11 @@ private struct EmptyModelsDiscoveryBanner: View {
 private struct HeylookSidebarView: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
     @Environment(\.appearsActive) private var appearsActive
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @State private var isDropTargeted = false
 
     var body: some View {
+        let contrastStyle = AdaptiveContrastStyle(colorSchemeContrast)
         List {
             Section("Workbench") {
                 ForEach(HeylookSurface.allCases) { surface in
@@ -354,8 +495,14 @@ private struct HeylookSidebarView: View {
                                     .background(
                                         Capsule().fill(
                                             viewModel.activeSurface == surface
-                                                ? Color.accentColor.opacity(0.18)
-                                                : Color.secondary.opacity(0.12)
+                                                ? Color.accentColor.opacity(contrastStyle.chipFillOpacity)
+                                                : Color.secondary.opacity(contrastStyle.chipFillOpacity)
+                                        )
+                                    )
+                                    .overlay(
+                                        Capsule().strokeBorder(
+                                            contrastStyle.borderColor(viewModel.activeSurface == surface ? Color.accentColor : .secondary),
+                                            lineWidth: contrastStyle.isIncreased ? 1 : 0
                                         )
                                     )
                                     .foregroundStyle(viewModel.activeSurface == surface ? Color.accentColor : .secondary)
@@ -460,10 +607,12 @@ private struct HeylookSidebarView: View {
 
 private struct ChatConversationsSidebarSection: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @State private var renamingConversation: ConversationRecord?
     @State private var renameDraftTitle: String = ""
 
     var body: some View {
+        let contrastStyle = AdaptiveContrastStyle(colorSchemeContrast)
         Section {
             Button {
                 viewModel.createNewConversation()
@@ -496,6 +645,10 @@ private struct ChatConversationsSidebarSection: View {
                 .padding(.horizontal, 6)
                 .padding(.vertical, 4)
                 .background(Color.secondary.opacity(0.09), in: RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(contrastStyle.borderColor(.secondary), lineWidth: contrastStyle.isIncreased ? 1 : 0)
+                )
             }
 
             ForEach(viewModel.filteredConversations) { conv in
@@ -863,6 +1016,8 @@ private struct PerfQuickActionsSidebarSection: View {
 
 private struct KeyboardShortcutsSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     private let shortcuts: [(category: String, items: [(keys: String, action: String)])] = [
         (
@@ -870,7 +1025,7 @@ private struct KeyboardShortcutsSheet: View {
             [
                 ("⌘1 – ⌘6", "Switch between Chat, Notebook, Presets, Embeddings, Models, and Perf"),
                 ("⌥⌘I", "Toggle Right Inspector (Presets, Samplers & System Prompt)"),
-                ("⌘/", "Show Keyboard Shortcuts")
+                ("? / ⌘/", "Show / Hide Keyboard Shortcuts")
             ]
         ),
         (
@@ -880,7 +1035,7 @@ private struct KeyboardShortcutsSheet: View {
                 ("⇧⌘N", "New Notebook"),
                 ("⌘↩", "Send Chat Prompt / Continue Notebook at Cursor"),
                 ("⇧⌘V", "Paste Image from Clipboard into Chat Composer"),
-                ("Esc", "Stop Active Generation → Close Inline Edit → Close Drawers")
+                ("Esc", "Close Sheets, Editor & Drawers → Stop Active Generation")
             ]
         ),
         (
@@ -893,40 +1048,47 @@ private struct KeyboardShortcutsSheet: View {
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Label("Keyboard Shortcuts", systemImage: "keyboard")
-                    .font(.headline)
-                Spacer()
-                Button("Done") { dismiss() }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .keyboardShortcut(.defaultAction)
-            }
+        let contrastStyle = AdaptiveContrastStyle(colorSchemeContrast)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Label("Keyboard Shortcuts", systemImage: "keyboard")
+                        .font(.headline)
+                    Spacer()
+                    Button("Done") { dismiss() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .keyboardShortcut(.defaultAction)
+                }
 
-            Divider()
+                Divider()
 
-            ForEach(shortcuts, id: \.category) { group in
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(group.category)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    ForEach(group.items, id: \.keys) { item in
-                        HStack {
-                            Text(item.action)
-                                .font(.caption)
-                            Spacer()
-                            Text(item.keys)
-                                .font(.caption.monospaced().weight(.semibold))
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 5))
+                ForEach(shortcuts, id: \.category) { group in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(group.category)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(group.items, id: \.keys) { item in
+                            HStack(spacing: 12) {
+                                Text(item.action)
+                                    .font(.caption)
+                                Spacer()
+                                Text(item.keys)
+                                    .font(.caption.monospaced().weight(.semibold))
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 2)
+                                    .background(Color.secondary.opacity(contrastStyle.chipFillOpacity), in: RoundedRectangle(cornerRadius: 5))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 5)
+                                            .strokeBorder(contrastStyle.borderColor(.secondary), lineWidth: contrastStyle.isIncreased ? 1 : 0)
+                                    )
+                            }
                         }
                     }
                 }
             }
+            .padding(20)
         }
-        .padding(20)
-        .frame(minWidth: 440)
+        .frame(minWidth: horizontalSizeClass == .compact ? nil : 440)
     }
 }

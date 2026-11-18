@@ -33,6 +33,7 @@ struct HeylookApp: App {
     #if os(macOS)
     @NSApplicationDelegateAdaptor(HeylookAppDelegate.self) private var appDelegate
     #endif
+    @Environment(\.scenePhase) private var scenePhase
     @State private var viewModel = HeylookWorkbenchViewModel()
 
     init() {
@@ -45,8 +46,8 @@ struct HeylookApp: App {
     var body: some Scene {
         WindowGroup("Heylook Workbench", id: "workbench") {
             HeylookRootView(viewModel: viewModel)
-                .frame(minWidth: 980, minHeight: 640)
                 #if os(macOS)
+                .frame(minWidth: 980, minHeight: 640)
                 .onAppear {
                     NSApplication.shared.setActivationPolicy(.regular)
                     NSApplication.shared.activate()
@@ -56,6 +57,11 @@ struct HeylookApp: App {
                     }
                 }
                 #endif
+                .onChange(of: scenePhase) { _, newPhase in
+                    if newPhase == .inactive || newPhase == .background {
+                        viewModel.flushPendingEdits()
+                    }
+                }
         }
         #if os(macOS)
         .defaultSize(width: 1360, height: 860)
@@ -266,8 +272,8 @@ struct HeylookSettingsView: View {
             Tab("Models & Scan Folders", systemImage: "folder.badge.gearshape") {
                 Form {
                     Section {
-                        if HeylookConfig.isModelConfigReadOnly {
-                            Label("Read-only mode active (HEYLOOK_READONLY_MODELS=1)", systemImage: "lock.fill")
+                        if HeylookConfig.isReadOnlyModelConfig {
+                            Label("Read-only mode active (HEYLOOK_READONLY_MODEL_CONFIG=1)", systemImage: "lock.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                         }
@@ -295,7 +301,7 @@ struct HeylookSettingsView: View {
                                             .contentShape(Rectangle())
                                     }
                                     .buttonStyle(.plain)
-                                    .disabled(HeylookConfig.isModelConfigReadOnly)
+                                    .disabled(HeylookConfig.isReadOnlyModelConfig)
                                     .help("Remove folder from heylook.toml")
                                 }
                             }
@@ -307,7 +313,7 @@ struct HeylookSettingsView: View {
                             } label: {
                                 Label("Add Scan Folder…", systemImage: "folder.badge.plus")
                             }
-                            .disabled(HeylookConfig.isModelConfigReadOnly)
+                            .disabled(HeylookConfig.isReadOnlyModelConfig)
 
                             Button {
                                 Task { await viewModel.rescanConfiguredModels() }
