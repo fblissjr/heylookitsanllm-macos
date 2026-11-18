@@ -2,6 +2,7 @@ import Accelerate
 import AVFoundation
 import CoreImage
 import Foundation
+import HeylookCore
 
 #if canImport(MLXVLM)
 import MLX
@@ -87,11 +88,119 @@ public enum NativeMLXEmbeddingGemma2 {
         public let videoMaxSoftTokens: Int
         public let imageMaxSoftTokens: Int
         public let prompts: [String: String]
+        public let defaultPromptName: String?
         public let poolingModeMeanTokens: Bool
+        public let hasVision: Bool
+        public let hasAudio: Bool
+        public let hasVideo: Bool
+        public let imageTokenID: Int
+        public let videoTokenID: Int
+        public let boiTokenID: Int
+        public let eoiTokenID: Int
+        public let audioTokenID: Int
+        public let boaTokenID: Int
+        public let eoaTokenID: Int
+
+        public init(
+            modelType: String,
+            hiddenSize: Int,
+            embeddingDim: Int,
+            numHiddenLayers: Int,
+            maxInputTokens: Int,
+            videoFPS: Double,
+            videoMaxFrames: Int,
+            videoMaxSoftTokens: Int,
+            imageMaxSoftTokens: Int,
+            prompts: [String: String],
+            defaultPromptName: String? = nil,
+            poolingModeMeanTokens: Bool,
+            hasVision: Bool = true,
+            hasAudio: Bool = true,
+            hasVideo: Bool = true,
+            imageTokenID: Int = 258880,
+            videoTokenID: Int = 258884,
+            boiTokenID: Int = 255999,
+            eoiTokenID: Int = 258882,
+            audioTokenID: Int = 258881,
+            boaTokenID: Int = 256000,
+            eoaTokenID: Int = 258883
+        ) {
+            self.modelType = modelType
+            self.hiddenSize = hiddenSize
+            self.embeddingDim = embeddingDim
+            self.numHiddenLayers = numHiddenLayers
+            self.maxInputTokens = maxInputTokens
+            self.videoFPS = videoFPS
+            self.videoMaxFrames = videoMaxFrames
+            self.videoMaxSoftTokens = videoMaxSoftTokens
+            self.imageMaxSoftTokens = imageMaxSoftTokens
+            self.prompts = prompts
+            self.defaultPromptName = defaultPromptName
+            self.poolingModeMeanTokens = poolingModeMeanTokens
+            self.hasVision = hasVision
+            self.hasAudio = hasAudio
+            self.hasVideo = hasVideo
+            self.imageTokenID = imageTokenID
+            self.videoTokenID = videoTokenID
+            self.boiTokenID = boiTokenID
+            self.eoiTokenID = eoiTokenID
+            self.audioTokenID = audioTokenID
+            self.boaTokenID = boaTokenID
+            self.eoaTokenID = eoaTokenID
+        }
 
         public var maxWindowSeconds: Double {
             guard videoFPS > 0 else { return 32.0 }
             return Double(videoMaxFrames) / videoFPS
+        }
+
+        public var availablePromptNames: [String] {
+            prompts.keys.sorted()
+        }
+
+        public var supportedModalities: [String] {
+            var mods = ["text"]
+            if hasVision { mods.append("image") }
+            if hasVideo { mods.append("video") }
+            if hasAudio { mods.append("audio") }
+            return mods
+        }
+
+        /// Validates an explicit `prompt_name` against the checkpoint's `config_sentence_transformers.json` map.
+        public func validatePromptName(_ name: String, itemIndex: Int = 0) throws -> String {
+            guard let resolved = prompts[name] else {
+                throw EmbeddingValidationError.unknownPromptName(
+                    itemIndex: itemIndex,
+                    promptName: name,
+                    available: availablePromptNames
+                )
+            }
+            return resolved
+        }
+
+        public func embeddingFacts(computePlacement: String? = nil) -> EngineEmbeddingFacts {
+            EmbeddingModelFacts.fromCheckpoint(self, computePlacement: computePlacement)
+        }
+
+        /// Resolves the prompt prefix and effective `prompt_name` for an `EmbeddingInput`.
+        /// - Explicit mode (`usesExplicitPromptName == true`): `promptName == nil` returns empty prefix `""`;
+        ///   unknown `promptName` throws typed `400` error (`EmbeddingValidationError.unknownPromptName`);
+        ///   known `promptName` returns exact `prompts[promptName]`.
+        /// - Legacy `EmbeddingTask` mode: prefers matching entry in `prompts` (`config_sentence_transformers.json`)
+        ///   before falling back to `EmbeddingTask` hardcoded defaults.
+        public func resolvePrompt(
+            for input: EmbeddingInput,
+            itemIndex: Int = 0
+        ) throws -> (prefix: String, promptName: String?) {
+            try EmbeddingModelFacts.resolvePrompt(
+                for: input,
+                catalog: EmbeddingModelFacts.PromptCatalog(
+                    prompts: prompts,
+                    defaultPromptName: defaultPromptName,
+                    maxSeqLength: maxInputTokens
+                ),
+                itemIndex: itemIndex
+            )
         }
 
         public static func load(from directory: URL = defaultCheckpointURL) throws -> CheckpointDescriptor {
@@ -107,16 +216,25 @@ public enum NativeMLXEmbeddingGemma2 {
             let configData = try Data(contentsOf: configURL)
             let configJSON = (try JSONSerialization.jsonObject(with: configData) as? [String: Any]) ?? [:]
             let textConfig = (configJSON["text_config"] as? [String: Any]) ?? [:]
-            let visionConfig = (configJSON["vision_config"] as? [String: Any]) ?? [:]
+            let visionConfig = configJSON["vision_config"] as? [String: Any]
+            let audioConfig = configJSON["audio_config"] as? [String: Any]
 
             var prompts = [String: String]()
+            var defaultPromptName: String?
             var maxSeqLength = 8192
             if let stData = try? Data(contentsOf: stURL),
                let stJSON = try? JSONSerialization.jsonObject(with: stData) as? [String: Any] {
-                if let p = stJSON["prompts"] as? [String: String] {
-                    prompts = p
+                if let rawPrompts = stJSON["prompts"] as? [String: Any] {
+                    for (k, v) in rawPrompts {
+                        if let str = v as? String {
+                            prompts[k] = str
+                        }
+                    }
                 }
-                if let maxLen = stJSON["max_seq_length"] as? Int {
+                if let defName = stJSON["default_prompt_name"] as? String {
+                    defaultPromptName = defName
+                }
+                if let maxLen = (stJSON["max_seq_length"] as? NSNumber)?.intValue {
                     maxSeqLength = maxLen
                 }
             }
@@ -126,38 +244,69 @@ public enum NativeMLXEmbeddingGemma2 {
             if let poolData = try? Data(contentsOf: poolURL),
                let poolJSON = try? JSONSerialization.jsonObject(with: poolData) as? [String: Any] {
                 meanTokens = (poolJSON["pooling_mode_mean_tokens"] as? Bool) ?? true
-                wordEmbeddingDimension = (poolJSON["word_embedding_dimension"] as? Int) ?? 768
+                wordEmbeddingDimension = (poolJSON["word_embedding_dimension"] as? NSNumber)?.intValue ?? 768
             }
 
             var fps = 1.0
             var numFrames = 32
             var videoSoftTokens = 140
-            var imageSoftTokens = (visionConfig["default_output_length"] as? Int) ?? 280
+            var imageSoftTokens = (visionConfig?["default_output_length"] as? NSNumber)?.intValue ?? 280
+            var hasVideoProcessor = false
             if let procData = try? Data(contentsOf: procURL),
                let procJSON = try? JSONSerialization.jsonObject(with: procData) as? [String: Any] {
                 if let vp = procJSON["video_processor"] as? [String: Any] {
-                    fps = (vp["fps"] as? Double) ?? Double((vp["fps"] as? Int) ?? 1)
-                    numFrames = (vp["num_frames"] as? Int) ?? 32
-                    videoSoftTokens = (vp["max_soft_tokens"] as? Int) ?? 140
+                    hasVideoProcessor = true
+                    if let parsedFPS = (vp["fps"] as? NSNumber)?.doubleValue, parsedFPS > 0 {
+                        fps = parsedFPS
+                    }
+                    numFrames = (vp["max_frames"] as? NSNumber)?.intValue
+                        ?? (vp["num_frames"] as? NSNumber)?.intValue
+                        ?? 32
+                    videoSoftTokens = (vp["max_soft_tokens"] as? NSNumber)?.intValue ?? 140
                 }
                 if let ip = procJSON["image_processor"] as? [String: Any],
-                   let maxSoft = ip["max_soft_tokens"] as? Int {
+                   let maxSoft = (ip["max_soft_tokens"] as? NSNumber)?.intValue {
                     imageSoftTokens = maxSoft
                 }
             }
 
+            let imageTokenID = (configJSON["image_token_id"] as? NSNumber)?.intValue ?? 258880
+            let videoTokenID = (configJSON["video_token_id"] as? NSNumber)?.intValue ?? 258884
+            let boiTokenID = (configJSON["boi_token_id"] as? NSNumber)?.intValue ?? 255999
+            let eoiTokenID = (configJSON["eoi_token_id"] as? NSNumber)?.intValue ?? 258882
+            let audioTokenID = (configJSON["audio_token_id"] as? NSNumber)?.intValue ?? 258881
+            let boaTokenID = (configJSON["boa_token_id"] as? NSNumber)?.intValue ?? 256000
+            let eoaTokenID = (configJSON["eoa_token_index"] as? NSNumber)?.intValue
+                ?? (configJSON["eoa_token_id"] as? NSNumber)?.intValue
+                ?? 258883
+
+            let hasVision = visionConfig != nil
+            let hasAudio = audioConfig != nil
+            let hasVideo = hasVision && ((configJSON["video_token_id"] != nil) || hasVideoProcessor)
+
             return CheckpointDescriptor(
                 modelType: (configJSON["model_type"] as? String) ?? "embedding_gemma2",
-                hiddenSize: (textConfig["hidden_size"] as? Int) ?? 512,
-                embeddingDim: (configJSON["embedding_dim"] as? Int) ?? wordEmbeddingDimension,
-                numHiddenLayers: (textConfig["num_hidden_layers"] as? Int) ?? 24,
+                hiddenSize: (textConfig["hidden_size"] as? NSNumber)?.intValue ?? 512,
+                embeddingDim: (configJSON["embedding_dim"] as? NSNumber)?.intValue ?? wordEmbeddingDimension,
+                numHiddenLayers: (textConfig["num_hidden_layers"] as? NSNumber)?.intValue ?? 24,
                 maxInputTokens: maxSeqLength,
                 videoFPS: fps,
                 videoMaxFrames: numFrames,
                 videoMaxSoftTokens: videoSoftTokens,
                 imageMaxSoftTokens: imageSoftTokens,
                 prompts: prompts,
-                poolingModeMeanTokens: meanTokens
+                defaultPromptName: defaultPromptName,
+                poolingModeMeanTokens: meanTokens,
+                hasVision: hasVision,
+                hasAudio: hasAudio,
+                hasVideo: hasVideo,
+                imageTokenID: imageTokenID,
+                videoTokenID: videoTokenID,
+                boiTokenID: boiTokenID,
+                eoiTokenID: eoiTokenID,
+                audioTokenID: audioTokenID,
+                boaTokenID: boaTokenID,
+                eoaTokenID: eoaTokenID
             )
         }
     }
@@ -196,11 +345,9 @@ public enum NativeMLXEmbeddingGemma2 {
     }
 
     /// Creates the best available in-process `EmbeddingEngine` for the current build and checkpoint.
-    /// `allowSyntheticFallback` defaults to `false` (Repo Rule #3: Truthful Runtime).
     public static func makeBestAvailableEngine(
         checkpointURL: URL = defaultCheckpointURL,
-        computeOptions: ModelComputeOptions = .allMLXGPU,
-        allowSyntheticFallback: Bool = false
+        computeOptions: ModelComputeOptions = .allMLXGPU
     ) -> any EmbeddingEngine {
         #if canImport(MLXVLM)
         if FileManager.default.fileExists(atPath: checkpointURL.appendingPathComponent("config.json").path) {
@@ -212,9 +359,18 @@ public enum NativeMLXEmbeddingGemma2 {
         #endif
         return HybridLocalEmbeddingEngine(
             checkpointURL: checkpointURL,
-            computeOptions: computeOptions,
-            allowSyntheticFallback: allowSyntheticFallback
+            computeOptions: computeOptions
         )
+    }
+
+    @available(*, deprecated, message: "allowSyntheticFallback has been removed; real checkpoints/towers are always required.")
+    public static func makeBestAvailableEngine(
+        checkpointURL: URL = defaultCheckpointURL,
+        computeOptions: ModelComputeOptions = .allMLXGPU,
+        allowSyntheticFallback: Bool
+    ) -> any EmbeddingEngine {
+        _ = allowSyntheticFallback
+        return makeBestAvailableEngine(checkpointURL: checkpointURL, computeOptions: computeOptions)
     }
 }
 
@@ -400,48 +556,89 @@ public struct CheckpointPieceTokenizer: Sendable {
 
 /// Hybrid local `EmbeddingEngine` executing compiled CoreML `.mlmodelc` ANE towers (`ANECoreMLRuntime`)
 /// and `ArtifactProcessor` + `WindowPlanner` temporal windowing.
-/// Enforces Repo Rule #3 (*Truthful Runtime*): `allowSyntheticFallback` defaults to `false` and never
-/// silently masquerades `DeterministicHashEmbeddingEngine` vectors as model embeddings in production.
+/// Enforces Repo Rule #3 (*Truthful Runtime*): always requires compiled `.mlmodelc` towers and
+/// `tokenizer.json`, throwing `EmbeddingEngineError.runtimeUnavailable` when absent.
 public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
     public nonisolated let modelID: String
     public nonisolated let checkpointURL: URL
     public nonisolated let computeOptions: ModelComputeOptions
     public nonisolated let hasCompiledANETowers: Bool
-    public nonisolated let allowSyntheticFallback: Bool
+    public nonisolated let hasCompiledANEVision: Bool
+    public nonisolated let hasCompiledANEAudio: Bool
+    @available(*, deprecated, message: "Synthetic fallback has been removed; HybridLocalEmbeddingEngine always throws runtimeUnavailable when towers are missing.")
+    public nonisolated var allowSyntheticFallback: Bool { false }
     public nonisolated let nativeDimensions: Int = Matryoshka.gemma2NativeDimensions
     public nonisolated let supportedDimensions: [Int] = Matryoshka.gemma2Dimensions
 
+    public nonisolated let descriptor: NativeMLXEmbeddingGemma2.CheckpointDescriptor
     private let aneRuntime: ANECoreMLRuntime
     private let pieceTokenizer: CheckpointPieceTokenizer?
-    private let fallbackHash: DeterministicHashEmbeddingEngine
+
+    public nonisolated var availablePromptNames: [String] { descriptor.availablePromptNames }
+    public nonisolated var defaultPromptName: String? { descriptor.defaultPromptName }
 
     public init(
         checkpointURL: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
-        computeOptions: ModelComputeOptions = .allMLXGPU,
-        allowSyntheticFallback: Bool = false
+        computeOptions: ModelComputeOptions = .allMLXGPU
     ) {
         self.checkpointURL = checkpointURL
         self.computeOptions = computeOptions
-        self.allowSyntheticFallback = allowSyntheticFallback
         let anePresent = ANETowerInspector.locateBundle(for: .textBackbone, in: checkpointURL) != nil
         self.hasCompiledANETowers = anePresent
-        self.modelID = (anePresent || !allowSyntheticFallback)
-            ? checkpointURL.lastPathComponent
-            : "deterministic-hash-768d"
+        self.hasCompiledANEVision = ANETowerInspector.locateBundle(for: .visionEncoder, in: checkpointURL) != nil
+        self.hasCompiledANEAudio = ANETowerInspector.locateBundle(for: .audioEncoder, in: checkpointURL) != nil
+        self.modelID = checkpointURL.lastPathComponent
         self.aneRuntime = ANECoreMLRuntime(checkpointDirectory: checkpointURL)
         self.pieceTokenizer = CheckpointPieceTokenizer.load(from: checkpointURL)
-        self.fallbackHash = DeterministicHashEmbeddingEngine(modelID: "deterministic-hash-768d")
+        self.descriptor = (try? NativeMLXEmbeddingGemma2.CheckpointDescriptor.load(from: checkpointURL))
+            ?? Self.defaultDescriptor
     }
+
+    @available(*, deprecated, message: "allowSyntheticFallback has been removed; HybridLocalEmbeddingEngine always requires real .mlmodelc towers.")
+    public init(
+        checkpointURL: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
+        computeOptions: ModelComputeOptions = .allMLXGPU,
+        allowSyntheticFallback: Bool
+    ) {
+        _ = allowSyntheticFallback
+        self.init(checkpointURL: checkpointURL, computeOptions: computeOptions)
+    }
+
+    private static let defaultDescriptor = NativeMLXEmbeddingGemma2.CheckpointDescriptor(
+        modelType: "embedding_gemma2",
+        hiddenSize: 512,
+        embeddingDim: 768,
+        numHiddenLayers: 24,
+        maxInputTokens: 8192,
+        videoFPS: 1.0,
+        videoMaxFrames: 32,
+        videoMaxSoftTokens: 140,
+        imageMaxSoftTokens: 280,
+        prompts: [:],
+        defaultPromptName: nil,
+        poolingModeMeanTokens: true
+    )
 
     public init(
         checkpointDirectory: URL,
-        computeOptions: ModelComputeOptions = .allMLXGPU,
-        allowSyntheticFallback: Bool = false
+        computeOptions: ModelComputeOptions = .allMLXGPU
     ) {
         self.init(
             checkpointURL: checkpointDirectory,
-            computeOptions: computeOptions,
-            allowSyntheticFallback: allowSyntheticFallback
+            computeOptions: computeOptions
+        )
+    }
+
+    @available(*, deprecated, message: "allowSyntheticFallback has been removed; HybridLocalEmbeddingEngine always requires real .mlmodelc towers.")
+    public init(
+        checkpointDirectory: URL,
+        computeOptions: ModelComputeOptions = .allMLXGPU,
+        allowSyntheticFallback: Bool
+    ) {
+        _ = allowSyntheticFallback
+        self.init(
+            checkpointURL: checkpointDirectory,
+            computeOptions: computeOptions
         )
     }
 
@@ -453,8 +650,54 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
         _ inputs: [EmbeddingInput],
         dimensions: Int? = nil
     ) async throws -> [EmbeddedOutput] {
+        guard !inputs.isEmpty else { return [] }
         let targetDim = dimensions ?? nativeDimensions
-        if !hasCompiledANETowers && !allowSyntheticFallback {
+        guard supportedDimensions.contains(targetDim) else {
+            throw EmbeddingValidationError.unsupportedDimensions(
+                requested: targetDim,
+                supported: supportedDimensions
+            )
+        }
+
+        var validatedPlans: [(
+            promptPrefix: String,
+            promptName: String?,
+            windowOptions: VideoWindowOptions?
+        )] = []
+        validatedPlans.reserveCapacity(inputs.count)
+        for (idx, item) in inputs.enumerated() {
+            let winOpts = try item.resolvedVideoWindows(itemIndex: idx)
+            if let winOpts {
+                guard descriptor.hasVideo else {
+                    throw EmbeddingValidationError.unsupportedModality(
+                        itemIndex: idx,
+                        modality: "video",
+                        supported: descriptor.supportedModalities
+                    )
+                }
+                if let secs = winOpts.seconds, secs > descriptor.maxWindowSeconds {
+                    throw EmbeddingValidationError.videoWindowsExceedMaxSeconds(
+                        itemIndex: idx,
+                        requested: secs,
+                        maxSeconds: descriptor.maxWindowSeconds
+                    )
+                }
+            }
+            for part in item.parts {
+                if case let .media(kind, _, _, _, _) = part,
+                   !descriptor.supportedModalities.contains(kind.rawValue) {
+                    throw EmbeddingValidationError.unsupportedModality(
+                        itemIndex: idx,
+                        modality: kind.rawValue,
+                        supported: descriptor.supportedModalities
+                    )
+                }
+            }
+            let promptRes = try descriptor.resolvePrompt(for: item, itemIndex: idx)
+            validatedPlans.append((promptRes.prefix, promptRes.promptName, winOpts))
+        }
+
+        guard hasCompiledANETowers else {
             throw EmbeddingEngineError.runtimeUnavailable(
                 "Compiled CoreML ANE towers (.mlmodelc) not found at '\(checkpointURL.path)' and native MLXVLM is not linked."
             )
@@ -463,10 +706,11 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
         var outputs = [EmbeddedOutput]()
         outputs.reserveCapacity(inputs.count)
 
-        for item in inputs {
+        for (idx, item) in inputs.enumerated() {
             try Task.checkCancellation()
-            var seedText = item.title ?? ""
-            var windowedVideoRequest: (url: URL, sampling: VideoWindowSampling)?
+            let plan = validatedPlans[idx]
+            var windowedVideoURL: URL?
+            var hasCompanionAudio = false
             var tempVideoURL: URL?
             defer {
                 if let tempVideoURL {
@@ -475,99 +719,123 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
             }
 
             for part in item.parts {
-                switch part {
-                case .text(let s):
-                    seedText += " " + s
-                case let .media(kind, mimeType, data, url, windowSampling):
-                    seedText += " \(kind.rawValue) \(mimeType) \(url?.lastPathComponent ?? "") \(data?.count ?? 0)"
-                    if kind == .video, windowSampling != .off, windowedVideoRequest == nil {
+                if case let .media(kind, _, data, url, windowSampling) = part {
+                    if kind == .audio {
+                        hasCompanionAudio = true
+                    }
+                    if kind == .video, (plan.windowOptions != nil || windowSampling != .off), windowedVideoURL == nil {
                         if let url {
-                            windowedVideoRequest = (url, windowSampling)
+                            windowedVideoURL = url
                         } else if let data {
                             let tmp = FileManager.default.temporaryDirectory
                                 .appendingPathComponent("heylook-emb-vid-\(UUID().uuidString).mp4")
-                            if (try? data.write(to: tmp)) != nil {
-                                tempVideoURL = tmp
-                                windowedVideoRequest = (tmp, windowSampling)
-                            }
+                            try data.write(to: tmp)
+                            tempVideoURL = tmp
+                            windowedVideoURL = tmp
                         }
                     }
                 }
             }
 
-            let primary: [Float]
-            if let aneVec = try await tryEmbedItemOnANE(item: item, targetDim: targetDim) {
-                primary = aneVec
-            } else if allowSyntheticFallback {
-                primary = fallbackHash.embed(text: seedText, dimensions: targetDim)
-            } else {
+            guard let aneRes = try await tryEmbedItemOnANE(
+                item: item,
+                itemIndex: idx,
+                promptPrefix: plan.promptPrefix,
+                targetDim: targetDim
+            ) else {
                 throw EmbeddingEngineError.runtimeUnavailable(
                     "ANE tower execution unavailable for checkpoint '\(checkpointURL.path)' (verify tokenizer.json and .mlmodelc bundles exist)."
                 )
             }
+            let primary = aneRes.vector
+            var totalTokens = aneRes.tokenCount
 
-            var windows = [EmbeddedOutput.WindowVector]()
-            if let (videoURL, sampling) = windowedVideoRequest,
-               let candidates = try? await ArtifactProcessor.extractVideoCandidates(for: videoURL, sampling: sampling) {
-                let planned = WindowPlanner.planWindows(
-                    times: candidates.times,
-                    duration: candidates.duration,
-                    windowSeconds: 32.0,
-                    strideSeconds: 16.0,
-                    sampling: sampling,
-                    fps: 1.0,
-                    maxFrames: 32,
-                    thumbnails: candidates.thumbnails
-                )
-                if planned.count > 1 {
-                    for win in planned {
-                        let winVec: [Float]
-                        if hasCompiledANETowers,
-                           let decodedFrames = try? await ArtifactProcessor.decodeVideoFrames(for: videoURL, at: win.frameTimes),
-                           !decodedFrames.isEmpty,
-                           let aneWinVec = try await tryEmbedVideoFramesOnANE(frames: decodedFrames, targetDim: targetDim) {
-                            winVec = aneWinVec
-                        } else if allowSyntheticFallback {
-                            winVec = fallbackHash.embed(
-                                text: "\(seedText) window:\(win.start)-\(win.end)",
-                                dimensions: targetDim
-                            )
-                        } else {
+            var windows = [VideoWindowEmbeddingResult]()
+            if let videoURL = windowedVideoURL, let winOpts = plan.windowOptions {
+                let winSeconds = winOpts.seconds ?? descriptor.maxWindowSeconds
+                if let metadata = try? await ArtifactProcessor.inspectVideoMetadata(for: videoURL) {
+                    let ranges = WindowPlanner.consecutiveRanges(
+                        duration: metadata.duration,
+                        windowSeconds: winSeconds
+                    )
+                    let pcmSamples: [Float] = hasCompanionAudio
+                        ? ((try? await ArtifactProcessor.decodeMonoPCM(for: videoURL)) ?? [])
+                        : []
+                    for (lo, hi) in ranges {
+                        try Task.checkCancellation()
+                        let decodedFrames = (try? await ArtifactProcessor.decodeVideoWindowFrames(
+                            for: videoURL,
+                            metadata: metadata,
+                            lo: lo,
+                            hi: hi,
+                            sampling: winOpts.sampling,
+                            fps: descriptor.videoFPS,
+                            maxFrames: descriptor.videoMaxFrames
+                        )) ?? []
+                        guard !decodedFrames.isEmpty else { continue }
+                        let roundedStart = (lo * 1000).rounded() / 1000
+                        let roundedEnd = (hi * 1000).rounded() / 1000
+                        let frameTimes = decodedFrames.map { ($0.time * 1000).rounded() / 1000 }
+                        guard let aneWin = try await tryEmbedVideoFramesOnANE(
+                            frames: decodedFrames,
+                            pcmSamples: pcmSamples,
+                            windowStart: lo,
+                            windowEnd: hi,
+                            promptPrefix: plan.promptPrefix,
+                            targetDim: targetDim
+                        ) else {
                             throw EmbeddingEngineError.runtimeUnavailable(
-                                "Failed to encode video window (\(win.start)s-\(win.end)s) on ANE."
+                                "Failed to encode video window (\(roundedStart)s-\(roundedEnd)s) on ANE."
                             )
                         }
+                        totalTokens += aneWin.tokenCount
                         windows.append(
-                            EmbeddedOutput.WindowVector(
-                                start: win.start,
-                                end: win.end,
-                                frameTimes: win.frameTimes,
-                                vector: winVec
+                            VideoWindowEmbeddingResult(
+                                start: roundedStart,
+                                end: roundedEnd,
+                                frameTimes: frameTimes,
+                                vector: aneWin.vector
                             )
                         )
                     }
                 }
             }
 
-            outputs.append(EmbeddedOutput(vector: primary, windows: windows))
+            outputs.append(
+                EmbeddedOutput(
+                    vector: primary,
+                    windows: windows,
+                    inputTokens: totalTokens > 0 ? totalTokens : nil,
+                    promptName: plan.promptName
+                )
+            )
         }
         return outputs
     }
 
     private func tryEmbedVideoFramesOnANE(
         frames: [(time: Double, image: CGImage)],
+        pcmSamples: [Float] = [],
+        windowStart: Double = 0,
+        windowEnd: Double = 0,
+        promptPrefix: String = "",
         targetDim: Int
-    ) async throws -> [Float]? {
+    ) async throws -> (vector: [Float], tokenCount: Int)? {
+        guard let pieceTokenizer else { return nil }
         let visionUnit: TowerComputeUnit = computeOptions.visionEncoder == .mlxGPU
             ? .cpuAndNeuralEngine
             : computeOptions.visionEncoder
+        let audioUnit: TowerComputeUnit = computeOptions.audioEncoder == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.audioEncoder
         let textUnit: TowerComputeUnit = computeOptions.textBackbone == .mlxGPU
             ? .cpuAndNeuralEngine
             : computeOptions.textBackbone
 
-        let bos = pieceTokenizer?.bosTokenID ?? 2
-        let eos = pieceTokenizer?.eosTokenID ?? 1
-        var tokenIDs: [Int] = [bos]
+        var tokenIDs: [Int] = [pieceTokenizer.bosTokenID]
+        if !promptPrefix.isEmpty {
+            tokenIDs.append(contentsOf: pieceTokenizer.encode(promptPrefix))
+        }
         var softTokens: [Float] = []
 
         for frame in frames {
@@ -579,29 +847,58 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                       unit: visionUnit
                   )
             else { return nil }
-            tokenIDs.append(255999)
-            tokenIDs.append(contentsOf: repeatElement(258884, count: enc.tokenCount))
-            tokenIDs.append(258882)
+            tokenIDs.append(descriptor.boiTokenID)
+            tokenIDs.append(contentsOf: repeatElement(descriptor.videoTokenID, count: enc.tokenCount))
+            tokenIDs.append(descriptor.eoiTokenID)
             softTokens.append(contentsOf: enc.softTokens)
         }
-        tokenIDs.append(eos)
-        return try await aneRuntime.encodeTextAndFuse(
+
+        if !pcmSamples.isEmpty && windowEnd > windowStart {
+            let sr = Double(ArtifactProcessor.audioSampleRate)
+            let startIdx = max(0, Int((windowStart * sr).rounded()))
+            let endSec = min(windowEnd, windowStart + ArtifactProcessor.audioWindowSeconds)
+            let endIdx = min(pcmSamples.count, Int((endSec * sr).rounded()))
+            if endIdx > startIdx {
+                let slice = Array(pcmSamples[startIdx..<endIdx])
+                if let mel = ANECoreMLRuntime.computeAudioLogMel(pcmSamples: slice),
+                   let encAudio = try await aneRuntime.encodeAudio(
+                       melFeatures: mel.features,
+                       frameCount: mel.frameCount,
+                       unit: audioUnit
+                   ) {
+                    tokenIDs.append(contentsOf: pieceTokenizer.encode(" "))
+                    tokenIDs.append(descriptor.boaTokenID)
+                    tokenIDs.append(contentsOf: repeatElement(descriptor.audioTokenID, count: encAudio.tokenCount))
+                    tokenIDs.append(descriptor.eoaTokenID)
+                    softTokens.append(contentsOf: encAudio.softTokens)
+                }
+            }
+        }
+
+        tokenIDs.append(pieceTokenizer.eosTokenID)
+        guard let vec = try await aneRuntime.encodeTextAndFuse(
             tokenIDs: tokenIDs,
             softTokens: softTokens.isEmpty ? nil : softTokens,
+            softTokenIDs: [descriptor.imageTokenID, descriptor.videoTokenID, descriptor.audioTokenID],
             unit: textUnit,
             dimensions: targetDim
-        )
+        ) else {
+            return nil
+        }
+        return (vec, tokenIDs.count)
     }
 
-    private func tryEmbedItemOnANE(item: EmbeddingInput, targetDim: Int) async throws -> [Float]? {
+    private func tryEmbedItemOnANE(
+        item: EmbeddingInput,
+        itemIndex: Int,
+        promptPrefix: String,
+        targetDim: Int
+    ) async throws -> (vector: [Float], tokenCount: Int)? {
         guard hasCompiledANETowers else { return nil }
         guard let pieceTokenizer else {
-            if !allowSyntheticFallback {
-                throw EmbeddingEngineError.runtimeUnavailable(
-                    "Missing tokenizer.json in checkpoint directory '\(checkpointURL.path)' required for ANE text backbone."
-                )
-            }
-            return nil
+            throw EmbeddingEngineError.runtimeUnavailable(
+                "Missing tokenizer.json in checkpoint directory '\(checkpointURL.path)' required for ANE text backbone."
+            )
         }
 
         let visionUnit: TowerComputeUnit = computeOptions.visionEncoder == .mlxGPU
@@ -616,6 +913,7 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
 
         var tokenIDs: [Int] = [pieceTokenizer.bosTokenID]
         var softTokens: [Float] = []
+        var didPrependPrompt = false
         var tempURLs: [URL] = []
         defer {
             for tmp in tempURLs {
@@ -623,14 +921,27 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
             }
         }
 
+        if !promptPrefix.isEmpty && !item.hasNonWhitespaceText {
+            didPrependPrompt = true
+            tokenIDs.append(contentsOf: pieceTokenizer.encode(promptPrefix))
+        }
+
         for part in item.parts {
             switch part {
             case .text(let s):
-                let formatted = (item.task == .document || item.task == .retrievalDocument)
-                    ? EmbeddingTask.documentPrompt(title: item.title, text: s)
-                    : (item.task.promptPrefix + s)
-                let encodedPieces = pieceTokenizer.encode(formatted)
-                tokenIDs.append(contentsOf: encodedPieces.prefix(2048))
+                let formatted: String
+                if !didPrependPrompt && !promptPrefix.isEmpty {
+                    didPrependPrompt = true
+                    formatted = (s.hasPrefix("task:") || s.hasPrefix("title:"))
+                        ? s
+                        : (promptPrefix + s)
+                } else {
+                    formatted = s
+                }
+                if !formatted.isEmpty {
+                    let encodedPieces = pieceTokenizer.encode(formatted)
+                    tokenIDs.append(contentsOf: encodedPieces)
+                }
 
             case let .media(kind, _, data, url, _):
                 let mediaURL: URL
@@ -662,9 +973,9 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                               unit: visionUnit
                           )
                     else { return nil }
-                    tokenIDs.append(255999)
-                    tokenIDs.append(contentsOf: repeatElement(258880, count: enc.tokenCount))
-                    tokenIDs.append(258882)
+                    tokenIDs.append(descriptor.boiTokenID)
+                    tokenIDs.append(contentsOf: repeatElement(descriptor.imageTokenID, count: enc.tokenCount))
+                    tokenIDs.append(descriptor.eoiTokenID)
                     softTokens.append(contentsOf: enc.softTokens)
                 } else if kind == .audio {
                     guard let pcm = try? await ArtifactProcessor.decodeMonoPCM(for: mediaURL),
@@ -676,22 +987,24 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                               unit: audioUnit
                           )
                     else { return nil }
-                    tokenIDs.append(256000)
-                    tokenIDs.append(contentsOf: repeatElement(258881, count: enc.tokenCount))
-                    tokenIDs.append(258883)
+                    tokenIDs.append(descriptor.boaTokenID)
+                    tokenIDs.append(contentsOf: repeatElement(descriptor.audioTokenID, count: enc.tokenCount))
+                    tokenIDs.append(descriptor.eoaTokenID)
                     softTokens.append(contentsOf: enc.softTokens)
                 } else if kind == .video {
-                    let candidates = try await ArtifactProcessor.extractVideoCandidates(for: mediaURL, sampling: .fps)
-                    let indices = WindowPlanner.pickFPS(
-                        times: candidates.times,
-                        lo: 0,
-                        hi: min(candidates.duration, 32.0),
-                        fps: 1.0,
-                        maxFrames: 32
+                    guard let metadata = try await ArtifactProcessor.inspectVideoMetadata(for: mediaURL) else {
+                        return nil
+                    }
+                    let sampleTimes = WindowPlanner.uniformSampleTimes(
+                        duration: metadata.duration,
+                        nativeFPS: metadata.nativeFPS,
+                        fps: descriptor.videoFPS,
+                        maxFrames: descriptor.videoMaxFrames
                     )
                     let decoded = try await ArtifactProcessor.decodeVideoFrames(
                         for: mediaURL,
-                        at: indices.map { candidates.times[$0] }
+                        at: sampleTimes,
+                        startOffsetSeconds: metadata.startSeconds
                     )
                     guard !decoded.isEmpty else { return nil }
                     for frame in decoded {
@@ -703,27 +1016,38 @@ public actor HybridLocalEmbeddingEngine: EmbeddingEngine {
                                   unit: visionUnit
                               )
                         else { return nil }
-                        tokenIDs.append(255999)
-                        tokenIDs.append(contentsOf: repeatElement(258884, count: enc.tokenCount))
-                        tokenIDs.append(258882)
+                        tokenIDs.append(descriptor.boiTokenID)
+                        tokenIDs.append(contentsOf: repeatElement(descriptor.videoTokenID, count: enc.tokenCount))
+                        tokenIDs.append(descriptor.eoiTokenID)
                         softTokens.append(contentsOf: enc.softTokens)
                     }
                 }
             }
         }
         tokenIDs.append(pieceTokenizer.eosTokenID)
-        return try await aneRuntime.encodeTextAndFuse(
+        if item.usesExplicitPromptName && tokenIDs.count > descriptor.maxInputTokens {
+            throw EmbeddingValidationError.invalidInput(
+                statusCode: 400,
+                detail: "input[\(itemIndex)]: expanded input has \(tokenIDs.count) tokens; limit is \(descriptor.maxInputTokens)"
+            )
+        }
+        guard let vec = try await aneRuntime.encodeTextAndFuse(
             tokenIDs: tokenIDs,
             softTokens: softTokens.isEmpty ? nil : softTokens,
+            softTokenIDs: [descriptor.imageTokenID, descriptor.videoTokenID, descriptor.audioTokenID],
             unit: textUnit,
             dimensions: targetDim
-        )
+        ) else {
+            return nil
+        }
+        return (vec, tokenIDs.count)
     }
 }
 
 #if canImport(MLXVLM)
 /// In-process `EmbeddingEngine` backed directly by `mlx-swift-lm`'s `MLXVLM.EmbeddingGemma2Embedding`
-/// and `ANECoreMLRuntime`.
+/// (pure GPU & 1,024-token padded batching), `MLXVLM.EmbeddingGemma2` (`hybrid_ane` GPU text/fusion +
+/// ANE vision/audio towers via soft tokens), and `ANECoreMLRuntime`.
 public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
     public nonisolated let modelID: String
     public nonisolated let checkpointURL: URL
@@ -731,11 +1055,22 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
     public nonisolated let nativeDimensions: Int = Matryoshka.gemma2NativeDimensions
     public nonisolated let supportedDimensions: [Int] = Matryoshka.gemma2Dimensions
 
-    private let descriptor: NativeMLXEmbeddingGemma2.CheckpointDescriptor
+    public nonisolated let descriptor: NativeMLXEmbeddingGemma2.CheckpointDescriptor
+    public nonisolated var availablePromptNames: [String] { descriptor.availablePromptNames }
+    public nonisolated var defaultPromptName: String? { descriptor.defaultPromptName }
+    public nonisolated var supportedModalities: [String] { descriptor.supportedModalities }
+
+    private nonisolated let hasANEVisionBundle: Bool
+    private nonisolated let hasANEAudioBundle: Bool
+    private nonisolated let hasANETextBundle: Bool
+
     private let customTokenizerLoader: (any TokenizerLoader)?
     private let aneRuntime: ANECoreMLRuntime
     private var cachedTokenizer: (any MLXLMCommon.Tokenizer)?
     private var cachedEmbedder: MLXVLM.EmbeddingGemma2Embedding?
+    private var cachedHybridModel: MLXVLM.EmbeddingGemma2?
+
+    private static let textBatchTokenLimit: Int = 1_024
 
     public init(
         checkpointURL: URL = NativeMLXEmbeddingGemma2.defaultCheckpointURL,
@@ -747,6 +1082,9 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         self.modelID = checkpointURL.lastPathComponent
         self.customTokenizerLoader = tokenizerLoader
         self.aneRuntime = ANECoreMLRuntime(checkpointDirectory: checkpointURL)
+        self.hasANEVisionBundle = ANETowerInspector.locateBundle(for: .visionEncoder, in: checkpointURL) != nil
+        self.hasANEAudioBundle = ANETowerInspector.locateBundle(for: .audioEncoder, in: checkpointURL) != nil
+        self.hasANETextBundle = ANETowerInspector.locateBundle(for: .textBackbone, in: checkpointURL) != nil
         self.descriptor = (try? NativeMLXEmbeddingGemma2.CheckpointDescriptor.load(from: checkpointURL))
             ?? Self.fallbackDescriptor
     }
@@ -761,6 +1099,9 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         self.modelID = modelDirectory.lastPathComponent
         self.customTokenizerLoader = tokenizerLoader
         self.aneRuntime = ANECoreMLRuntime(checkpointDirectory: modelDirectory)
+        self.hasANEVisionBundle = ANETowerInspector.locateBundle(for: .visionEncoder, in: modelDirectory) != nil
+        self.hasANEAudioBundle = ANETowerInspector.locateBundle(for: .audioEncoder, in: modelDirectory) != nil
+        self.hasANETextBundle = ANETowerInspector.locateBundle(for: .textBackbone, in: modelDirectory) != nil
         self.descriptor = (try? NativeMLXEmbeddingGemma2.CheckpointDescriptor.load(from: modelDirectory))
             ?? Self.fallbackDescriptor
         self.cachedEmbedder = try await MLXVLM.EmbeddingGemma2Embedding(
@@ -794,12 +1135,44 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         return loaded
     }
 
+    /// Loads `EmbeddingGemma2` directly for `hybrid_ane` mode (`textBackbone == .mlxGPU`),
+    /// excluding media components executed on CoreML/ANE while leaving non-ANE components `.onFirstUse`.
+    private func resolvedHybridModel(
+        excludingVision: Bool,
+        excludingAudio: Bool
+    ) async throws -> MLXVLM.EmbeddingGemma2 {
+        if let cachedHybridModel {
+            return cachedHybridModel
+        }
+        let configData = try Data(contentsOf: checkpointURL.appendingPathComponent("config.json"))
+        let config = try JSONDecoder.json5().decode(
+            MLXVLM.EmbeddingGemma2Configuration.self,
+            from: configData
+        )
+        let model = MLXVLM.EmbeddingGemma2(config)
+        let base = try JSONDecoder.json5().decode(MLXLMCommon.BaseConfiguration.self, from: configData)
+        var excluded: Set<ModelComponent> = []
+        if excludingVision { excluded.insert(.vision) }
+        if excludingAudio { excluded.insert(.audio) }
+        try await MLXLMCommon.loadWeights(
+            modelDirectory: checkpointURL,
+            model: model,
+            perLayerQuantization: base.perLayerQuantization,
+            excludedComponents: excluded,
+            componentLoading: .onFirstUse
+        )
+        try Task.checkCancellation()
+        self.cachedHybridModel = model
+        return model
+    }
+
     public func unload() async {
-        let hadEmbedder = cachedEmbedder != nil
+        let hadMLX = (cachedEmbedder != nil) || (cachedHybridModel != nil)
         cachedEmbedder = nil
+        cachedHybridModel = nil
         cachedTokenizer = nil
         await aneRuntime.unload()
-        if hadEmbedder {
+        if hadMLX {
             MLX.Memory.clearCache()
         }
     }
@@ -815,6 +1188,7 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         videoMaxSoftTokens: 140,
         imageMaxSoftTokens: 280,
         prompts: [:],
+        defaultPromptName: nil,
         poolingModeMeanTokens: true
     )
 
@@ -825,24 +1199,63 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         case audio(URL)
     }
 
+    private struct PreparedItem {
+        let index: Int
+        let item: EmbeddingInput
+        let promptPrefix: String
+        let promptName: String?
+        let resolvedParts: [ResolvedPart]
+        let isTextOnly: Bool
+        let combinedText: String
+        let windowedVideoURL: URL?
+        let windowOptions: VideoWindowOptions?
+        let hasCompanionAudio: Bool
+    }
+
     nonisolated private static func buildVLMInput(
         parts: [ResolvedPart],
-        title: String?
+        promptPrefix: String
     ) -> sending MLXVLM.EmbeddingInput {
-        let vlmParts: [MLXVLM.EmbeddingInput.Part] = parts.map { part in
+        var vlmParts: [MLXVLM.EmbeddingInput.Part] = []
+        vlmParts.reserveCapacity(parts.count + 1)
+        var didPrepend = false
+        for part in parts {
             switch part {
-            case .text(let s): return .text(s)
-            case .image(let url): return .image(.url(url))
-            case .video(let url): return .video(.url(url))
-            case .audio(let url): return .audio(.url(url))
+            case .text(let s):
+                if !didPrepend && !promptPrefix.isEmpty {
+                    didPrepend = true
+                    let text = (s.hasPrefix("task:") || s.hasPrefix("title:")) ? s : (promptPrefix + s)
+                    vlmParts.append(.text(text))
+                } else {
+                    vlmParts.append(.text(s))
+                }
+            case .image(let url):
+                if !didPrepend && !promptPrefix.isEmpty {
+                    didPrepend = true
+                    vlmParts.append(.text(promptPrefix))
+                }
+                vlmParts.append(.image(.url(url)))
+            case .video(let url):
+                if !didPrepend && !promptPrefix.isEmpty {
+                    didPrepend = true
+                    vlmParts.append(.text(promptPrefix))
+                }
+                vlmParts.append(.video(.url(url)))
+            case .audio(let url):
+                if !didPrepend && !promptPrefix.isEmpty {
+                    didPrepend = true
+                    vlmParts.append(.text(promptPrefix))
+                }
+                vlmParts.append(.audio(.url(url)))
             }
         }
-        return MLXVLM.EmbeddingInput(vlmParts, title: title)
+        return MLXVLM.EmbeddingInput(vlmParts, title: nil)
     }
 
     nonisolated private static func buildWindowVLMInput(
         frames: [(time: Double, image: CGImage)],
-        audioWAVURL: URL?
+        audioWAVURL: URL?,
+        promptPrefix: String
     ) -> sending MLXVLM.EmbeddingInput {
         let sRGB = CGColorSpace(name: CGColorSpace.sRGB)
         let ciOptions: [CIImageOption: Any] = sRGB.map { [.colorSpace: $0] } ?? [:]
@@ -852,7 +1265,11 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                 timeStamp: CMTime(seconds: frame.time, preferredTimescale: 90_000)
             )
         }
-        var winParts: [MLXVLM.EmbeddingInput.Part] = [.video(.frames(videoFrames))]
+        var winParts: [MLXVLM.EmbeddingInput.Part] = []
+        if !promptPrefix.isEmpty {
+            winParts.append(.text(promptPrefix))
+        }
+        winParts.append(.video(.frames(videoFrames)))
         if let audioWAVURL {
             winParts.append(.text(" "))
             winParts.append(.audio(.url(audioWAVURL)))
@@ -864,28 +1281,71 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
         _ inputs: [EmbeddingInput],
         dimensions: Int? = nil
     ) async throws -> [EmbeddedOutput] {
-        var outputs: [EmbeddedOutput] = []
-        outputs.reserveCapacity(inputs.count)
+        guard !inputs.isEmpty else { return [] }
+        let targetDim = dimensions ?? nativeDimensions
+        guard supportedDimensions.contains(targetDim) else {
+            throw EmbeddingValidationError.unsupportedDimensions(
+                requested: targetDim,
+                supported: supportedDimensions
+            )
+        }
 
-        for item in inputs {
-            try Task.checkCancellation()
-            let vlmTask = Self.mapTask(item.task)
-            var resolvedParts: [ResolvedPart] = []
-            var tempURLs: [URL] = []
-            defer {
-                for url in tempURLs {
-                    try? FileManager.default.removeItem(at: url)
+        var tempURLs: [URL] = []
+        defer {
+            for url in tempURLs {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+
+        // Validate and prepare every item upfront before executing compute.
+        var preparedItems: [PreparedItem] = []
+        preparedItems.reserveCapacity(inputs.count)
+        for (idx, item) in inputs.enumerated() {
+            guard !item.parts.isEmpty else {
+                throw EmbeddingValidationError.invalidInput(
+                    statusCode: 422,
+                    detail: "input[\(idx)]: embedding item content cannot be empty"
+                )
+            }
+            let winOpts = try item.resolvedVideoWindows(itemIndex: idx)
+            if let winOpts {
+                guard descriptor.hasVideo else {
+                    throw EmbeddingValidationError.unsupportedModality(
+                        itemIndex: idx,
+                        modality: "video",
+                        supported: descriptor.supportedModalities
+                    )
+                }
+                if let secs = winOpts.seconds, secs > descriptor.maxWindowSeconds {
+                    throw EmbeddingValidationError.videoWindowsExceedMaxSeconds(
+                        itemIndex: idx,
+                        requested: secs,
+                        maxSeconds: descriptor.maxWindowSeconds
+                    )
                 }
             }
+            let promptRes = try descriptor.resolvePrompt(for: item, itemIndex: idx)
 
-            var windowedVideoRequest: (url: URL, sampling: VideoWindowSampling)?
+            var resolvedParts: [ResolvedPart] = []
+            var windowedVideoURL: URL?
             var hasCompanionAudio = false
+            var hasMedia = false
+            var combinedText = ""
 
             for part in item.parts {
                 switch part {
                 case .text(let s):
                     resolvedParts.append(.text(s))
+                    combinedText += s
                 case let .media(kind, _, data, url, windowSampling):
+                    guard descriptor.supportedModalities.contains(kind.rawValue) else {
+                        throw EmbeddingValidationError.unsupportedModality(
+                            itemIndex: idx,
+                            modality: kind.rawValue,
+                            supported: descriptor.supportedModalities
+                        )
+                    }
+                    hasMedia = true
                     let resolvedURL: URL
                     if let url {
                         resolvedURL = url
@@ -904,8 +1364,8 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                         resolvedParts.append(.image(resolvedURL))
                     case .video:
                         resolvedParts.append(.video(resolvedURL))
-                        if windowSampling != .off && windowedVideoRequest == nil {
-                            windowedVideoRequest = (resolvedURL, windowSampling)
+                        if (winOpts != nil || windowSampling != .off) && windowedVideoURL == nil {
+                            windowedVideoURL = resolvedURL
                         }
                     case .audio:
                         resolvedParts.append(.audio(resolvedURL))
@@ -916,106 +1376,566 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                 }
             }
 
-            let primary: [Float]
-            if let aneVec = try await tryEmbedOnANE(
-                parts: resolvedParts,
-                item: item,
-                dimensions: dimensions ?? nativeDimensions
-            ) {
-                primary = aneVec
+            let isTextOnly = !hasMedia
+            let formattedText: String
+            if isTextOnly && !promptRes.prefix.isEmpty {
+                formattedText = (combinedText.hasPrefix("task:") || combinedText.hasPrefix("title:"))
+                    ? combinedText
+                    : (promptRes.prefix + combinedText)
             } else {
-                let embedder = try await resolvedEmbedder()
-                primary = try await embedder.embed(
-                    Self.buildVLMInput(parts: resolvedParts, title: item.title),
-                    task: vlmTask,
-                    dimensions: dimensions
+                formattedText = combinedText
+            }
+            if isTextOnly && formattedText.allSatisfy(\.isWhitespace) {
+                throw EmbeddingValidationError.invalidInput(
+                    statusCode: 400,
+                    detail: "input[\(idx)]: embedding input cannot be empty"
                 )
             }
 
-            var windowVectors: [EmbeddedOutput.WindowVector] = []
-            if let (videoURL, sampling) = windowedVideoRequest {
-                windowVectors = try await embedVideoWindows(
-                    videoURL: videoURL,
-                    sampling: sampling,
-                    includeAudio: hasCompanionAudio,
-                    task: vlmTask,
-                    dimensions: dimensions
+            preparedItems.append(
+                PreparedItem(
+                    index: idx,
+                    item: item,
+                    promptPrefix: promptRes.prefix,
+                    promptName: promptRes.promptName,
+                    resolvedParts: resolvedParts,
+                    isTextOnly: isTextOnly,
+                    combinedText: formattedText,
+                    windowedVideoURL: windowedVideoURL,
+                    windowOptions: winOpts,
+                    hasCompanionAudio: hasCompanionAudio
                 )
-            }
-            outputs.append(EmbeddedOutput(vector: primary, windows: windowVectors))
-        }
-        return outputs
-    }
-
-    private func tryEmbedOnANE(
-        parts: [ResolvedPart],
-        item: EmbeddingInput,
-        dimensions: Int
-    ) async throws -> [Float]? {
-        let hasImageOrVideo = parts.contains {
-            if case .image = $0 { return true }
-            if case .video = $0 { return true }
-            return false
-        }
-        let hasAudio = parts.contains {
-            if case .audio = $0 { return true }
-            return false
-        }
-        let usesANEMedia = (hasImageOrVideo && computeOptions.visionEncoder != .mlxGPU)
-            || (hasAudio && computeOptions.audioEncoder != .mlxGPU)
-
-        guard computeOptions.textBackbone != .mlxGPU || usesANEMedia else { return nil }
-        for part in parts {
-            switch part {
-            case .text:
-                break
-            case .image, .video:
-                guard computeOptions.visionEncoder != .mlxGPU else { return nil }
-            case .audio:
-                guard computeOptions.audioEncoder != .mlxGPU else { return nil }
-            }
+            )
         }
 
         let tokenizer = try await resolvedTokenizer()
         let bosID = tokenizer.bosToken.flatMap({ tokenizer.convertTokenToId($0) }) ?? 2
         let eosID = tokenizer.eosTokenId ?? tokenizer.convertTokenToId("<eos>") ?? 1
 
+        let wantsFullANE = computeOptions.textBackbone != .mlxGPU
+        let wantsANEVision = computeOptions.visionEncoder != .mlxGPU && hasANEVisionBundle
+        let wantsANEAudio = computeOptions.audioEncoder != .mlxGPU && hasANEAudioBundle
+        let useHybridANE = !wantsFullANE && (wantsANEVision || wantsANEAudio)
+
+        var outputs: [EmbeddedOutput?] = Array(repeating: nil, count: inputs.count)
+
+        if wantsFullANE {
+            guard hasANETextBundle else {
+                throw EmbeddingEngineError.runtimeUnavailable(
+                    "Compiled CoreML TextANE (.mlmodelc) required for textBackbone=\(computeOptions.textBackbone.rawValue) was not found at '\(checkpointURL.path)'."
+                )
+            }
+            for prep in preparedItems {
+                try Task.checkCancellation()
+                let primaryRes = try await embedItemFullANE(
+                    prep: prep,
+                    tokenizer: tokenizer,
+                    bosID: bosID,
+                    eosID: eosID,
+                    dimensions: targetDim
+                )
+                var windowVectors: [VideoWindowEmbeddingResult] = []
+                var windowTokens = 0
+                if let videoURL = prep.windowedVideoURL, let winOpts = prep.windowOptions {
+                    let res = try await embedVideoWindows(
+                        videoURL: videoURL,
+                        windowOptions: winOpts,
+                        includeAudio: prep.hasCompanionAudio,
+                        promptPrefix: prep.promptPrefix,
+                        dimensions: dimensions,
+                        mode: .fullANE(tokenizer: tokenizer, bosID: bosID, eosID: eosID)
+                    )
+                    windowVectors = res.windows
+                    windowTokens = res.tokens
+                }
+                outputs[prep.index] = EmbeddedOutput(
+                    vector: primaryRes.vector,
+                    windows: windowVectors,
+                    inputTokens: primaryRes.tokens + windowTokens,
+                    promptName: prep.promptName
+                )
+            }
+            return outputs.compactMap { $0 }
+        }
+
+        if useHybridANE {
+            let hybridModel = try await resolvedHybridModel(
+                excludingVision: wantsANEVision,
+                excludingAudio: wantsANEAudio
+            )
+
+            let textItems = preparedItems.filter(\.isTextOnly)
+            if !textItems.isEmpty {
+                let encodedTextRows = try textItems.map { prep -> (item: PreparedItem, tokens: [Int]) in
+                    let bodyTokens = tokenizer.encode(text: prep.combinedText, addSpecialTokens: false)
+                    let fullCount = bodyTokens.count + 2
+                    if prep.item.usesExplicitPromptName && fullCount > descriptor.maxInputTokens {
+                        throw EmbeddingValidationError.invalidInput(
+                            statusCode: 400,
+                            detail: "input[\(prep.index)]: expanded input has \(fullCount) tokens; limit is \(descriptor.maxInputTokens)"
+                        )
+                    }
+                    let maxBody = max(0, descriptor.maxInputTokens - 2)
+                    let tokens = [bosID] + Array(bodyTokens.prefix(maxBody)) + [eosID]
+                    return (prep, tokens)
+                }
+
+                let batches = Self.makeLengthBatches(
+                    lengths: encodedTextRows.map(\.tokens.count),
+                    limit: Self.textBatchTokenLimit
+                )
+                for batchIndices in batches {
+                    try Task.checkCancellation()
+                    let rows = batchIndices.map { encodedTextRows[$0].tokens }
+                    let width = rows.map(\.count).max() ?? 0
+                    let ids = rows.flatMap { $0 + repeatElement(0, count: width - $0.count) }
+                    let needsMask = !rows.allSatisfy { $0.count == width }
+                    let maskArray: MLXArray? = needsMask
+                        ? MLXArray(
+                            rows.flatMap {
+                                [Int32](repeating: 1, count: $0.count) + repeatElement(Int32(0), count: width - $0.count)
+                            },
+                            [rows.count, width]
+                        )
+                        : nil
+                    let rawVectors = hybridModel.embed(
+                        inputIds: MLXArray(ids.map(Int32.init), [rows.count, width]),
+                        attentionMask: maskArray
+                    )
+                    let vectors = try Self.projectUnitRows(rawVectors, dimension: targetDim)
+                    for (rowPos, vec) in zip(batchIndices, vectors) {
+                        let row = encodedTextRows[rowPos]
+                        outputs[row.item.index] = EmbeddedOutput(
+                            vector: vec,
+                            windows: [],
+                            inputTokens: row.tokens.count,
+                            promptName: row.item.promptName
+                        )
+                    }
+                }
+            }
+
+            for prep in preparedItems where !prep.isTextOnly {
+                try Task.checkCancellation()
+                let primaryRes = try await embedMediaItemHybrid(
+                    prep: prep,
+                    model: hybridModel,
+                    tokenizer: tokenizer,
+                    bosID: bosID,
+                    eosID: eosID,
+                    wantsANEVision: wantsANEVision,
+                    wantsANEAudio: wantsANEAudio,
+                    dimensions: targetDim
+                )
+                var windowVectors: [VideoWindowEmbeddingResult] = []
+                var windowTokens = 0
+                if let videoURL = prep.windowedVideoURL, let winOpts = prep.windowOptions {
+                    let res = try await embedVideoWindows(
+                        videoURL: videoURL,
+                        windowOptions: winOpts,
+                        includeAudio: prep.hasCompanionAudio,
+                        promptPrefix: prep.promptPrefix,
+                        dimensions: dimensions,
+                        mode: .hybridANE(
+                            model: hybridModel,
+                            tokenizer: tokenizer,
+                            bosID: bosID,
+                            eosID: eosID,
+                            wantsANEVision: wantsANEVision,
+                            wantsANEAudio: wantsANEAudio
+                        )
+                    )
+                    windowVectors = res.windows
+                    windowTokens = res.tokens
+                }
+                outputs[prep.index] = EmbeddedOutput(
+                    vector: primaryRes.vector,
+                    windows: windowVectors,
+                    inputTokens: primaryRes.tokens + windowTokens,
+                    promptName: prep.promptName
+                )
+            }
+            return outputs.compactMap { $0 }
+        }
+
+        // Pure MLX GPU mode (`all_gpu`, or default `.hybridANETowers` when `.mlmodelc` bundles are absent).
+        let embedder = try await resolvedEmbedder()
+        let textItems = preparedItems.filter(\.isTextOnly)
+        if !textItems.isEmpty {
+            var batchInputs: [MLXVLM.EmbeddingInput] = []
+            var batchTokens: [Int] = []
+            batchInputs.reserveCapacity(textItems.count)
+            batchTokens.reserveCapacity(textItems.count)
+
+            for prep in textItems {
+                let encodedCount = tokenizer.encode(text: prep.combinedText, addSpecialTokens: false).count + 2
+                if prep.item.usesExplicitPromptName && encodedCount > descriptor.maxInputTokens {
+                    throw EmbeddingValidationError.invalidInput(
+                        statusCode: 400,
+                        detail: "input[\(prep.index)]: expanded input has \(encodedCount) tokens; limit is \(descriptor.maxInputTokens)"
+                    )
+                }
+                batchInputs.append(MLXVLM.EmbeddingInput([.text(prep.combinedText)], title: nil))
+                batchTokens.append(min(encodedCount, descriptor.maxInputTokens))
+            }
+
+            let batchVectors: [[Float]]
+            do {
+                batchVectors = try await embedder.embed(batchInputs, task: .none, dimensions: targetDim)
+            } catch let vlmError as MLXVLM.EmbeddingGemma2Embedding.Error {
+                throw Self.mapVLMError(vlmError, itemIndex: textItems[0].index)
+            }
+
+            for (pos, vec) in batchVectors.enumerated() {
+                let prep = textItems[pos]
+                outputs[prep.index] = EmbeddedOutput(
+                    vector: vec,
+                    windows: [],
+                    inputTokens: batchTokens[pos],
+                    promptName: prep.promptName
+                )
+            }
+        }
+
+        for prep in preparedItems where !prep.isTextOnly {
+            try Task.checkCancellation()
+            let vlmInput = Self.buildVLMInput(parts: prep.resolvedParts, promptPrefix: prep.promptPrefix)
+            let primary: [Float]
+            do {
+                primary = try await embedder.embed(vlmInput, task: .none, dimensions: targetDim)
+            } catch let vlmError as MLXVLM.EmbeddingGemma2Embedding.Error {
+                throw Self.mapVLMError(vlmError, itemIndex: prep.index)
+            }
+            let primaryTokens = await estimateItemTokenCount(prep: prep, tokenizer: tokenizer)
+            if prep.item.usesExplicitPromptName && primaryTokens > descriptor.maxInputTokens {
+                throw EmbeddingValidationError.invalidInput(
+                    statusCode: 400,
+                    detail: "input[\(prep.index)]: expanded input has \(primaryTokens) tokens; limit is \(descriptor.maxInputTokens)"
+                )
+            }
+
+            var windowVectors: [VideoWindowEmbeddingResult] = []
+            var windowTokens = 0
+            if let videoURL = prep.windowedVideoURL, let winOpts = prep.windowOptions {
+                let res = try await embedVideoWindows(
+                    videoURL: videoURL,
+                    windowOptions: winOpts,
+                    includeAudio: prep.hasCompanionAudio,
+                    promptPrefix: prep.promptPrefix,
+                    dimensions: targetDim,
+                    mode: .mlxGPU(embedder: embedder, tokenizer: tokenizer)
+                )
+                windowVectors = res.windows
+                windowTokens = res.tokens
+            }
+            outputs[prep.index] = EmbeddedOutput(
+                vector: primary,
+                windows: windowVectors,
+                inputTokens: primaryTokens + windowTokens,
+                promptName: prep.promptName
+            )
+        }
+        return outputs.compactMap { $0 }
+    }
+
+    private enum WindowExecutionMode {
+        case mlxGPU(embedder: MLXVLM.EmbeddingGemma2Embedding, tokenizer: any MLXLMCommon.Tokenizer)
+        case hybridANE(
+            model: MLXVLM.EmbeddingGemma2,
+            tokenizer: any MLXLMCommon.Tokenizer,
+            bosID: Int,
+            eosID: Int,
+            wantsANEVision: Bool,
+            wantsANEAudio: Bool
+        )
+        case fullANE(tokenizer: any MLXLMCommon.Tokenizer, bosID: Int, eosID: Int)
+    }
+
+    private func embedMediaItemHybrid(
+        prep: PreparedItem,
+        model: MLXVLM.EmbeddingGemma2,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        bosID: Int,
+        eosID: Int,
+        wantsANEVision: Bool,
+        wantsANEAudio: Bool,
+        dimensions: Int
+    ) async throws -> (vector: [Float], tokens: Int) {
+        let visionUnit: TowerComputeUnit = computeOptions.visionEncoder == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.visionEncoder
+        let audioUnit: TowerComputeUnit = computeOptions.audioEncoder == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.audioEncoder
+
+        let videoToken = model.config.softTokenIDs.count > 1 ? descriptor.videoTokenID : descriptor.imageTokenID
+        let effectiveVideoToken = model.config.softTokenIDs.contains(videoToken) ? videoToken : descriptor.imageTokenID
+
+        enum SegmentKind {
+            case text([Int])
+            case mediaBlock([Int])
+        }
+
+        var segments: [SegmentKind] = []
+        var softTokenArrays: [MLXArray] = []
+        var pendingText = ""
+        var didPrepend = false
+
+        func flushText() {
+            if !pendingText.isEmpty {
+                segments.append(.text(tokenizer.encode(text: pendingText, addSpecialTokens: false)))
+                pendingText = ""
+            }
+        }
+
+        if !prep.promptPrefix.isEmpty && !prep.item.hasNonWhitespaceText {
+            didPrepend = true
+            pendingText += prep.promptPrefix
+        }
+
+        for part in prep.resolvedParts {
+            switch part {
+            case .text(let s):
+                if !didPrepend && !prep.promptPrefix.isEmpty {
+                    didPrepend = true
+                    pendingText += (s.hasPrefix("task:") || s.hasPrefix("title:")) ? s : (prep.promptPrefix + s)
+                } else {
+                    pendingText += s
+                }
+
+            case .image(let imageURL):
+                flushText()
+                guard let imgPrep = ANECoreMLRuntime.prepareImagePixels(from: imageURL, forVideoBudget: false) else {
+                    throw EmbeddingValidationError.invalidInput(
+                        statusCode: 400,
+                        detail: "input[\(prep.index)]: failed to decode image"
+                    )
+                }
+                let softArray: MLXArray
+                let tokenCount: Int
+                if wantsANEVision,
+                   let encoded = try await aneRuntime.encodeVision(
+                       pixels: imgPrep.pixels,
+                       height: imgPrep.height,
+                       width: imgPrep.width,
+                       unit: visionUnit
+                   ) {
+                    softArray = MLXArray(encoded.softTokens, [encoded.tokenCount, descriptor.hiddenSize])
+                    tokenCount = encoded.tokenCount
+                } else {
+                    let pixels = MLXArray(imgPrep.pixels, [1, 3, imgPrep.height, imgPrep.width])
+                    guard let features = try model.imageFeatures(pixels) else {
+                        throw EmbeddingValidationError.unsupportedModality(
+                            itemIndex: prep.index,
+                            modality: "image",
+                            supported: descriptor.supportedModalities
+                        )
+                    }
+                    try MLX.checkedEval(features)
+                    tokenCount = features.dim(1)
+                    softArray = features.reshaped(-1, features.dim(-1))
+                }
+                softTokenArrays.append(softArray)
+                segments.append(.mediaBlock(
+                    [descriptor.boiTokenID] + repeatElement(descriptor.imageTokenID, count: tokenCount) + [descriptor.eoiTokenID]
+                ))
+
+            case .video(let videoURL):
+                flushText()
+                guard let metadata = try await ArtifactProcessor.inspectVideoMetadata(for: videoURL) else {
+                    throw EmbeddingValidationError.invalidInput(
+                        statusCode: 400,
+                        detail: "input[\(prep.index)]: failed to decode video track"
+                    )
+                }
+                let sampleTimes = WindowPlanner.uniformSampleTimes(
+                    duration: metadata.duration,
+                    nativeFPS: metadata.nativeFPS,
+                    fps: descriptor.videoFPS,
+                    maxFrames: descriptor.videoMaxFrames
+                )
+                let decoded = try await ArtifactProcessor.decodeVideoFrames(
+                    for: videoURL,
+                    at: sampleTimes,
+                    startOffsetSeconds: metadata.startSeconds
+                )
+                guard !decoded.isEmpty else {
+                    throw EmbeddingValidationError.invalidInput(
+                        statusCode: 400,
+                        detail: "input[\(prep.index)]: no frames decoded from video"
+                    )
+                }
+                var frameTokensBlock: [Int] = []
+                for frame in decoded {
+                    guard let framePrep = ANECoreMLRuntime.prepareImagePixels(from: frame.image, forVideoBudget: true) else {
+                        continue
+                    }
+                    let softArray: MLXArray
+                    let tokenCount: Int
+                    if wantsANEVision,
+                       let encoded = try await aneRuntime.encodeVision(
+                           pixels: framePrep.pixels,
+                           height: framePrep.height,
+                           width: framePrep.width,
+                           unit: visionUnit
+                       ) {
+                        softArray = MLXArray(encoded.softTokens, [encoded.tokenCount, descriptor.hiddenSize])
+                        tokenCount = encoded.tokenCount
+                    } else {
+                        let pixels = MLXArray(framePrep.pixels, [1, 3, framePrep.height, framePrep.width])
+                        guard let features = try model.imageFeatures(pixels) else {
+                            throw EmbeddingValidationError.unsupportedModality(
+                                itemIndex: prep.index,
+                                modality: "video",
+                                supported: descriptor.supportedModalities
+                            )
+                        }
+                        try MLX.checkedEval(features)
+                        tokenCount = features.dim(1)
+                        softArray = features.reshaped(-1, features.dim(-1))
+                    }
+                    softTokenArrays.append(softArray)
+                    frameTokensBlock.append(descriptor.boiTokenID)
+                    frameTokensBlock.append(contentsOf: repeatElement(effectiveVideoToken, count: tokenCount))
+                    frameTokensBlock.append(descriptor.eoiTokenID)
+                }
+                segments.append(.mediaBlock(frameTokensBlock))
+
+            case .audio(let audioURL):
+                flushText()
+                let pcm = try await ArtifactProcessor.decodeMonoPCM(for: audioURL)
+                if let mel = ANECoreMLRuntime.computeAudioLogMel(pcmSamples: pcm) {
+                    let softArray: MLXArray
+                    let tokenCount: Int
+                    if wantsANEAudio,
+                       let encoded = try await aneRuntime.encodeAudio(
+                           melFeatures: mel.features,
+                           frameCount: mel.frameCount,
+                           unit: audioUnit
+                       ) {
+                        softArray = MLXArray(encoded.softTokens, [encoded.tokenCount, descriptor.hiddenSize])
+                        tokenCount = encoded.tokenCount
+                    } else {
+                        let melArray = MLXArray(mel.features, [mel.frameCount, ANECoreMLRuntime.audioMelBins])
+                        guard let features = try model.audioFeatures(melArray) else {
+                            throw EmbeddingValidationError.unsupportedModality(
+                                itemIndex: prep.index,
+                                modality: "audio",
+                                supported: descriptor.supportedModalities
+                            )
+                        }
+                        try MLX.checkedEval(features)
+                        tokenCount = features.dim(1)
+                        softArray = features.reshaped(-1, features.dim(-1))
+                    }
+                    softTokenArrays.append(softArray)
+                    segments.append(.mediaBlock(
+                        [descriptor.boaTokenID] + repeatElement(descriptor.audioTokenID, count: tokenCount) + [descriptor.eoaTokenID]
+                    ))
+                } else {
+                    segments.append(.mediaBlock([descriptor.boaTokenID, descriptor.eoaTokenID]))
+                }
+            }
+        }
+        flushText()
+
+        let mediaTokenCount = segments.reduce(0) { sum, seg in
+            if case let .mediaBlock(ids) = seg { return sum + ids.count }
+            return sum
+        }
+        let placeholders: Set<Int> = Set(model.config.softTokenIDs)
+        var textBudget = descriptor.maxInputTokens - 2 - mediaTokenCount
+        guard textBudget >= 0 else {
+            throw EmbeddingValidationError.invalidInput(
+                statusCode: 400,
+                detail: "input[\(prep.index)]: expanded input exceeds \(descriptor.maxInputTokens) tokens"
+            )
+        }
+        var tokenIDs = [bosID]
+        for seg in segments {
+            switch seg {
+            case .mediaBlock(let ids):
+                tokenIDs.append(contentsOf: ids)
+            case .text(let ids):
+                if !softTokenArrays.isEmpty && ids.contains(where: placeholders.contains) {
+                    throw EmbeddingValidationError.invalidInput(
+                        statusCode: 400,
+                        detail: "input[\(prep.index)]: text next to media must not contain placeholder tokens"
+                    )
+                }
+                if prep.item.usesExplicitPromptName && ids.count > textBudget {
+                    throw EmbeddingValidationError.invalidInput(
+                        statusCode: 400,
+                        detail: "input[\(prep.index)]: expanded input exceeds \(descriptor.maxInputTokens) tokens"
+                    )
+                }
+                let takeCount = min(ids.count, textBudget)
+                tokenIDs.append(contentsOf: ids.prefix(takeCount))
+                textBudget -= takeCount
+            }
+        }
+        tokenIDs.append(eosID)
+
+        let fusedSoft: MLXArray? = softTokenArrays.isEmpty ? nil : MLX.concatenated(softTokenArrays, axis: 0)
+        let rawVector = model.embed(
+            inputIds: MLXArray(tokenIDs.map(Int32.init), [1, tokenIDs.count]),
+            attentionMask: nil,
+            softTokens: fusedSoft
+        )
+        let row = try Self.projectUnitRows(rawVector, dimension: dimensions)[0]
+        return (row, tokenIDs.count)
+    }
+
+    private func embedItemFullANE(
+        prep: PreparedItem,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        bosID: Int,
+        eosID: Int,
+        dimensions: Int
+    ) async throws -> (vector: [Float], tokens: Int) {
         var tokenIDs: [Int] = [bosID]
         var softTokens: [Float] = []
         var didPrependPrompt = false
 
-        for part in parts {
+        if !prep.promptPrefix.isEmpty && !prep.item.hasNonWhitespaceText {
+            didPrependPrompt = true
+            tokenIDs.append(contentsOf: tokenizer.encode(text: prep.promptPrefix, addSpecialTokens: false))
+        }
+
+        for part in prep.resolvedParts {
             switch part {
             case .text(let rawText):
                 let formatted: String
-                if !didPrependPrompt && item.hasNonWhitespaceText {
+                if !didPrependPrompt && !prep.promptPrefix.isEmpty {
                     didPrependPrompt = true
-                    if item.task == .document || item.task == .retrievalDocument {
-                        formatted = EmbeddingTask.documentPrompt(title: item.title, text: rawText)
-                    } else {
-                        formatted = item.task.promptPrefix + rawText
-                    }
+                    formatted = (rawText.hasPrefix("task:") || rawText.hasPrefix("title:"))
+                        ? rawText
+                        : (prep.promptPrefix + rawText)
                 } else {
                     formatted = rawText
                 }
                 if !formatted.isEmpty {
                     tokenIDs.append(contentsOf: tokenizer.encode(text: formatted, addSpecialTokens: false))
                 }
+
             case .image(let imageURL):
-                guard let prep = ANECoreMLRuntime.prepareImagePixels(from: imageURL, forVideoBudget: false),
+                guard let imgPrep = ANECoreMLRuntime.prepareImagePixels(from: imageURL, forVideoBudget: false),
                       let encoded = try await aneRuntime.encodeVision(
-                          pixels: prep.pixels,
-                          height: prep.height,
-                          width: prep.width,
+                          pixels: imgPrep.pixels,
+                          height: imgPrep.height,
+                          width: imgPrep.width,
                           unit: computeOptions.visionEncoder
                       )
                 else {
-                    return nil
+                    throw EmbeddingEngineError.runtimeUnavailable(
+                        "VisionANE.mlmodelc execution unavailable at '\(checkpointURL.path)'."
+                    )
                 }
-                tokenIDs.append(255999) // <boi>
-                tokenIDs.append(contentsOf: repeatElement(258880, count: encoded.tokenCount))
-                tokenIDs.append(258882) // <eoi>
+                tokenIDs.append(descriptor.boiTokenID)
+                tokenIDs.append(contentsOf: repeatElement(descriptor.imageTokenID, count: encoded.tokenCount))
+                tokenIDs.append(descriptor.eoiTokenID)
                 softTokens.append(contentsOf: encoded.softTokens)
+
             case .audio(let audioURL):
                 let pcm = try await ArtifactProcessor.decodeMonoPCM(for: audioURL)
                 guard let mel = ANECoreMLRuntime.computeAudioLogMel(pcmSamples: pcm),
@@ -1025,164 +1945,349 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                           unit: computeOptions.audioEncoder
                       )
                 else {
-                    return nil
+                    throw EmbeddingEngineError.runtimeUnavailable(
+                        "AudioANE.mlmodelc execution unavailable at '\(checkpointURL.path)'."
+                    )
                 }
-                tokenIDs.append(256000) // <boa>
-                tokenIDs.append(contentsOf: repeatElement(258881, count: encoded.tokenCount))
-                tokenIDs.append(258883) // <eoa>
+                tokenIDs.append(descriptor.boaTokenID)
+                tokenIDs.append(contentsOf: repeatElement(descriptor.audioTokenID, count: encoded.tokenCount))
+                tokenIDs.append(descriptor.eoaTokenID)
                 softTokens.append(contentsOf: encoded.softTokens)
+
             case .video(let videoURL):
-                let candidates = try await ArtifactProcessor.extractVideoCandidates(
-                    for: videoURL,
-                    sampling: .fps
-                )
-                let frameIndices = WindowPlanner.pickFPS(
-                    times: candidates.times,
-                    lo: 0,
-                    hi: min(candidates.duration, descriptor.maxWindowSeconds),
+                guard let metadata = try await ArtifactProcessor.inspectVideoMetadata(for: videoURL) else {
+                    throw EmbeddingValidationError.invalidInput(
+                        statusCode: 400,
+                        detail: "input[\(prep.index)]: failed to decode video track"
+                    )
+                }
+                let sampleTimes = WindowPlanner.uniformSampleTimes(
+                    duration: metadata.duration,
+                    nativeFPS: metadata.nativeFPS,
                     fps: descriptor.videoFPS,
                     maxFrames: descriptor.videoMaxFrames
                 )
-                let frameTimes = frameIndices.map { candidates.times[$0] }
                 let decoded = try await ArtifactProcessor.decodeVideoFrames(
                     for: videoURL,
-                    at: frameTimes
+                    at: sampleTimes,
+                    startOffsetSeconds: metadata.startSeconds
                 )
-                guard !decoded.isEmpty else { return nil }
+                guard !decoded.isEmpty else {
+                    throw EmbeddingValidationError.invalidInput(
+                        statusCode: 400,
+                        detail: "input[\(prep.index)]: no frames decoded from video"
+                    )
+                }
                 for frame in decoded {
-                    guard let prep = ANECoreMLRuntime.prepareImagePixels(from: frame.image, forVideoBudget: true),
+                    guard let framePrep = ANECoreMLRuntime.prepareImagePixels(from: frame.image, forVideoBudget: true),
                           let encoded = try await aneRuntime.encodeVision(
-                              pixels: prep.pixels,
-                              height: prep.height,
-                              width: prep.width,
+                              pixels: framePrep.pixels,
+                              height: framePrep.height,
+                              width: framePrep.width,
                               unit: computeOptions.visionEncoder
                           )
                     else {
-                        return nil
+                        throw EmbeddingEngineError.runtimeUnavailable(
+                            "VisionANE.mlmodelc execution unavailable for video frame."
+                        )
                     }
-                    tokenIDs.append(255999) // <boi>
-                    tokenIDs.append(contentsOf: repeatElement(258884, count: encoded.tokenCount))
-                    tokenIDs.append(258882) // <eoi>
+                    tokenIDs.append(descriptor.boiTokenID)
+                    tokenIDs.append(contentsOf: repeatElement(descriptor.videoTokenID, count: encoded.tokenCount))
+                    tokenIDs.append(descriptor.eoiTokenID)
                     softTokens.append(contentsOf: encoded.softTokens)
                 }
             }
         }
         tokenIDs.append(eosID)
-
-        let textFusionUnit: TowerComputeUnit = (computeOptions.textBackbone == .mlxGPU)
-            ? .cpuAndGPU
-            : computeOptions.textBackbone
-
-        return try await aneRuntime.encodeTextAndFuse(
+        if prep.item.usesExplicitPromptName && tokenIDs.count > descriptor.maxInputTokens {
+            throw EmbeddingValidationError.invalidInput(
+                statusCode: 400,
+                detail: "input[\(prep.index)]: expanded input has \(tokenIDs.count) tokens; limit is \(descriptor.maxInputTokens)"
+            )
+        }
+        guard let vec = try await aneRuntime.encodeTextAndFuse(
             tokenIDs: tokenIDs,
             softTokens: softTokens.isEmpty ? nil : softTokens,
-            unit: textFusionUnit,
+            softTokenIDs: [descriptor.imageTokenID, descriptor.videoTokenID, descriptor.audioTokenID],
+            unit: computeOptions.textBackbone,
             dimensions: dimensions
-        )
+        ) else {
+            throw EmbeddingEngineError.runtimeUnavailable(
+                "TextANE.mlmodelc execution unavailable at '\(checkpointURL.path)'."
+            )
+        }
+        return (vec, tokenIDs.count)
     }
 
     private func embedVideoWindows(
         videoURL: URL,
-        sampling: VideoWindowSampling,
+        windowOptions: VideoWindowOptions,
         includeAudio: Bool,
-        task: MLXVLM.EmbeddingTask,
-        dimensions: Int?
-    ) async throws -> [EmbeddedOutput.WindowVector] {
-        let candidates = try await ArtifactProcessor.extractVideoCandidates(
-            for: videoURL,
-            sampling: sampling
+        promptPrefix: String,
+        dimensions: Int?,
+        mode: WindowExecutionMode
+    ) async throws -> (windows: [VideoWindowEmbeddingResult], tokens: Int) {
+        guard let metadata = try await ArtifactProcessor.inspectVideoMetadata(for: videoURL) else {
+            return ([], 0)
+        }
+        let windowSeconds = windowOptions.seconds ?? descriptor.maxWindowSeconds
+        let ranges = WindowPlanner.consecutiveRanges(
+            duration: metadata.duration,
+            windowSeconds: windowSeconds
         )
-        let planned = WindowPlanner.planWindows(
-            times: candidates.times,
-            duration: candidates.duration,
-            windowSeconds: descriptor.maxWindowSeconds,
-            strideSeconds: descriptor.maxWindowSeconds / 2.0,
-            sampling: sampling,
-            fps: descriptor.videoFPS,
-            maxFrames: descriptor.videoMaxFrames,
-            thumbnails: candidates.thumbnails
-        )
-        guard planned.count > 1 else { return [] }
+        guard !ranges.isEmpty else { return ([], 0) }
 
         let pcmSamples: [Float] = includeAudio
             ? ((try? await ArtifactProcessor.decodeMonoPCM(for: videoURL)) ?? [])
             : []
 
-        var out: [EmbeddedOutput.WindowVector] = []
-        out.reserveCapacity(planned.count)
+        let targetDim = dimensions ?? nativeDimensions
+        var out: [VideoWindowEmbeddingResult] = []
+        out.reserveCapacity(ranges.count)
+        var totalTokens = 0
 
-        for win in planned {
+        for (lo, hi) in ranges {
             try Task.checkCancellation()
-            let decoded = try await ArtifactProcessor.decodeVideoFrames(
+            let decoded = try await ArtifactProcessor.decodeVideoWindowFrames(
                 for: videoURL,
-                at: win.frameTimes
+                metadata: metadata,
+                lo: lo,
+                hi: hi,
+                sampling: windowOptions.sampling,
+                fps: descriptor.videoFPS,
+                maxFrames: descriptor.videoMaxFrames
             )
             guard !decoded.isEmpty else { continue }
 
+            let frameTimes = decoded.map { ($0.time * 1000).rounded() / 1000 }
+            let winStart = (lo * 1000).rounded() / 1000
+            let winEnd = (hi * 1000).rounded() / 1000
+
             let vec: [Float]
-            if let aneVec = try await tryEmbedWindowOnANE(
-                frames: decoded,
-                pcmSamples: pcmSamples,
-                windowStart: win.start,
-                windowEnd: win.end,
-                dimensions: dimensions ?? nativeDimensions
-            ) {
-                vec = aneVec
-            } else {
+            let winTokens: Int
+
+            switch mode {
+            case let .mlxGPU(embedder, tokenizer):
                 var tempAudioURL: URL?
                 defer {
                     if let tempAudioURL {
                         try? FileManager.default.removeItem(at: tempAudioURL)
                     }
                 }
+                var audioMelFrames = 0
                 if !pcmSamples.isEmpty,
                    let sliceWAV = ArtifactProcessor.encodeAudioSliceWAV(
                        samples: pcmSamples,
                        sampleRate: ArtifactProcessor.audioSampleRate,
-                       startSeconds: win.start,
-                       endSeconds: min(win.end, win.start + ArtifactProcessor.audioWindowSeconds)
+                       startSeconds: lo,
+                       endSeconds: min(hi, lo + ArtifactProcessor.audioWindowSeconds)
                    ) {
                     let wavURL = FileManager.default.temporaryDirectory
                         .appendingPathComponent("heylook-win-audio-\(UUID().uuidString).wav")
                     if (try? sliceWAV.write(to: wavURL)) != nil {
                         tempAudioURL = wavURL
+                        let sr = Double(ArtifactProcessor.audioSampleRate)
+                        let sIdx = max(0, Int((lo * sr).rounded()))
+                        let eIdx = min(pcmSamples.count, Int((min(hi, lo + ArtifactProcessor.audioWindowSeconds) * sr).rounded()))
+                        if eIdx - sIdx >= 400 {
+                            let rawMelFrames = min(ANECoreMLRuntime.audioMelFrames, 1 + ((eIdx - sIdx) - 400) / 160)
+                            audioMelFrames = min(750, max(1, (((rawMelFrames + 1) / 2) + 1) / 2))
+                        }
                     }
                 }
-                let embedder = try await resolvedEmbedder()
                 vec = try await embedder.embed(
-                    Self.buildWindowVLMInput(frames: decoded, audioWAVURL: tempAudioURL),
-                    task: task,
-                    dimensions: dimensions
+                    Self.buildWindowVLMInput(frames: decoded, audioWAVURL: tempAudioURL, promptPrefix: promptPrefix),
+                    task: .none,
+                    dimensions: targetDim
                 )
+                let promptTokens = promptPrefix.isEmpty ? 0 : tokenizer.encode(text: promptPrefix, addSpecialTokens: false).count
+                let frameTokenBlock = decoded.reduce(0) { acc, frame in
+                    let estPerFrame = min(
+                        descriptor.videoMaxSoftTokens,
+                        max(1, Int((Double(frame.image.width * frame.image.height) / (28.0 * 28.0)).rounded()))
+                    )
+                    return acc + 2 + estPerFrame
+                }
+                winTokens = 2 + promptTokens + frameTokenBlock + (audioMelFrames > 0 ? (3 + audioMelFrames) : 0)
+
+            case let .hybridANE(model, tokenizer, bosID, eosID, wantsANEVision, wantsANEAudio):
+                let res = try await embedWindowHybridANE(
+                    frames: decoded,
+                    pcmSamples: pcmSamples,
+                    windowStart: lo,
+                    windowEnd: hi,
+                    promptPrefix: promptPrefix,
+                    dimensions: targetDim,
+                    model: model,
+                    tokenizer: tokenizer,
+                    bosID: bosID,
+                    eosID: eosID,
+                    wantsANEVision: wantsANEVision,
+                    wantsANEAudio: wantsANEAudio
+                )
+                vec = res.vector
+                winTokens = res.tokens
+
+            case let .fullANE(tokenizer, bosID, eosID):
+                let res = try await embedWindowFullANE(
+                    frames: decoded,
+                    pcmSamples: pcmSamples,
+                    windowStart: lo,
+                    windowEnd: hi,
+                    promptPrefix: promptPrefix,
+                    dimensions: targetDim,
+                    tokenizer: tokenizer,
+                    bosID: bosID,
+                    eosID: eosID
+                )
+                vec = res.vector
+                winTokens = res.tokens
             }
+
+            totalTokens += winTokens
             out.append(
-                EmbeddedOutput.WindowVector(
-                    start: win.start,
-                    end: win.end,
-                    frameTimes: decoded.map { ($0.time * 1000).rounded() / 1000 },
+                VideoWindowEmbeddingResult(
+                    start: winStart,
+                    end: winEnd,
+                    frameTimes: frameTimes,
                     vector: vec
                 )
             )
         }
-        return out
+        return (out, totalTokens)
     }
 
-    private func tryEmbedWindowOnANE(
+    private func embedWindowHybridANE(
         frames: [(time: Double, image: CGImage)],
         pcmSamples: [Float],
         windowStart: Double,
         windowEnd: Double,
-        dimensions: Int
-    ) async throws -> [Float]? {
-        guard computeOptions.visionEncoder != .mlxGPU else { return nil }
-        if !pcmSamples.isEmpty && computeOptions.audioEncoder == .mlxGPU {
-            return nil
-        }
-        let tokenizer = try await resolvedTokenizer()
-        let bosID = tokenizer.bosToken.flatMap({ tokenizer.convertTokenToId($0) }) ?? 2
-        let eosID = tokenizer.eosTokenId ?? tokenizer.convertTokenToId("<eos>") ?? 1
+        promptPrefix: String,
+        dimensions: Int,
+        model: MLXVLM.EmbeddingGemma2,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        bosID: Int,
+        eosID: Int,
+        wantsANEVision: Bool,
+        wantsANEAudio: Bool
+    ) async throws -> (vector: [Float], tokens: Int) {
+        let visionUnit: TowerComputeUnit = computeOptions.visionEncoder == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.visionEncoder
+        let audioUnit: TowerComputeUnit = computeOptions.audioEncoder == .mlxGPU
+            ? .cpuAndNeuralEngine
+            : computeOptions.audioEncoder
+
+        let videoToken = model.config.softTokenIDs.contains(descriptor.videoTokenID)
+            ? descriptor.videoTokenID
+            : descriptor.imageTokenID
 
         var tokenIDs: [Int] = [bosID]
+        if !promptPrefix.isEmpty {
+            tokenIDs.append(contentsOf: tokenizer.encode(text: promptPrefix, addSpecialTokens: false))
+        }
+        var softTokenArrays: [MLXArray] = []
+
+        for frame in frames {
+            guard let prep = ANECoreMLRuntime.prepareImagePixels(from: frame.image, forVideoBudget: true) else {
+                continue
+            }
+            let softArray: MLXArray
+            let tokenCount: Int
+            if wantsANEVision,
+               let encoded = try await aneRuntime.encodeVision(
+                   pixels: prep.pixels,
+                   height: prep.height,
+                   width: prep.width,
+                   unit: visionUnit
+               ) {
+                softArray = MLXArray(encoded.softTokens, [encoded.tokenCount, descriptor.hiddenSize])
+                tokenCount = encoded.tokenCount
+            } else {
+                let pixels = MLXArray(prep.pixels, [1, 3, prep.height, prep.width])
+                guard let features = try model.imageFeatures(pixels) else {
+                    throw EmbeddingValidationError.unsupportedModality(
+                        itemIndex: 0,
+                        modality: "video",
+                        supported: descriptor.supportedModalities
+                    )
+                }
+                try MLX.checkedEval(features)
+                tokenCount = features.dim(1)
+                softArray = features.reshaped(-1, features.dim(-1))
+            }
+            tokenIDs.append(descriptor.boiTokenID)
+            tokenIDs.append(contentsOf: repeatElement(videoToken, count: tokenCount))
+            tokenIDs.append(descriptor.eoiTokenID)
+            softTokenArrays.append(softArray)
+        }
+
+        if !pcmSamples.isEmpty {
+            let sr = Double(ArtifactProcessor.audioSampleRate)
+            let startIdx = max(0, Int((windowStart * sr).rounded()))
+            let endSec = min(windowEnd, windowStart + ArtifactProcessor.audioWindowSeconds)
+            let endIdx = min(pcmSamples.count, Int((endSec * sr).rounded()))
+            if endIdx > startIdx {
+                let slice = Array(pcmSamples[startIdx..<endIdx])
+                if let mel = ANECoreMLRuntime.computeAudioLogMel(pcmSamples: slice) {
+                    let softArray: MLXArray
+                    let tokenCount: Int
+                    if wantsANEAudio,
+                       let encAudio = try await aneRuntime.encodeAudio(
+                           melFeatures: mel.features,
+                           frameCount: mel.frameCount,
+                           unit: audioUnit
+                       ) {
+                        softArray = MLXArray(encAudio.softTokens, [encAudio.tokenCount, descriptor.hiddenSize])
+                        tokenCount = encAudio.tokenCount
+                    } else {
+                        let melArray = MLXArray(mel.features, [mel.frameCount, ANECoreMLRuntime.audioMelBins])
+                        guard let features = try model.audioFeatures(melArray) else {
+                            throw EmbeddingValidationError.unsupportedModality(
+                                itemIndex: 0,
+                                modality: "audio",
+                                supported: descriptor.supportedModalities
+                            )
+                        }
+                        try MLX.checkedEval(features)
+                        tokenCount = features.dim(1)
+                        softArray = features.reshaped(-1, features.dim(-1))
+                    }
+                    tokenIDs.append(contentsOf: tokenizer.encode(text: " ", addSpecialTokens: false))
+                    tokenIDs.append(descriptor.boaTokenID)
+                    tokenIDs.append(contentsOf: repeatElement(descriptor.audioTokenID, count: tokenCount))
+                    tokenIDs.append(descriptor.eoaTokenID)
+                    softTokenArrays.append(softArray)
+                }
+            }
+        }
+
+        tokenIDs.append(eosID)
+        let fusedSoft: MLXArray? = softTokenArrays.isEmpty ? nil : MLX.concatenated(softTokenArrays, axis: 0)
+        let rawVector = model.embed(
+            inputIds: MLXArray(tokenIDs.map(Int32.init), [1, tokenIDs.count]),
+            attentionMask: nil,
+            softTokens: fusedSoft
+        )
+        let row = try Self.projectUnitRows(rawVector, dimension: dimensions)[0]
+        return (row, tokenIDs.count)
+    }
+
+    private func embedWindowFullANE(
+        frames: [(time: Double, image: CGImage)],
+        pcmSamples: [Float],
+        windowStart: Double,
+        windowEnd: Double,
+        promptPrefix: String,
+        dimensions: Int,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        bosID: Int,
+        eosID: Int
+    ) async throws -> (vector: [Float], tokens: Int) {
+        var tokenIDs: [Int] = [bosID]
+        if !promptPrefix.isEmpty {
+            tokenIDs.append(contentsOf: tokenizer.encode(text: promptPrefix, addSpecialTokens: false))
+        }
         var softTokens: [Float] = []
 
         for frame in frames {
@@ -1194,11 +2299,13 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                       unit: computeOptions.visionEncoder
                   )
             else {
-                return nil
+                throw EmbeddingEngineError.runtimeUnavailable(
+                    "VisionANE.mlmodelc execution unavailable for video window."
+                )
             }
-            tokenIDs.append(255999) // <boi>
-            tokenIDs.append(contentsOf: repeatElement(258884, count: encoded.tokenCount))
-            tokenIDs.append(258882) // <eoi>
+            tokenIDs.append(descriptor.boiTokenID)
+            tokenIDs.append(contentsOf: repeatElement(descriptor.videoTokenID, count: encoded.tokenCount))
+            tokenIDs.append(descriptor.eoiTokenID)
             softTokens.append(contentsOf: encoded.softTokens)
         }
 
@@ -1216,24 +2323,146 @@ public actor MLXSwiftLMEmbeddingGemma2Engine: EmbeddingEngine {
                        unit: computeOptions.audioEncoder
                    ) {
                     tokenIDs.append(contentsOf: tokenizer.encode(text: " ", addSpecialTokens: false))
-                    tokenIDs.append(256000) // <boa>
-                    tokenIDs.append(contentsOf: repeatElement(258881, count: encodedAudio.tokenCount))
-                    tokenIDs.append(258883) // <eoa>
+                    tokenIDs.append(descriptor.boaTokenID)
+                    tokenIDs.append(contentsOf: repeatElement(descriptor.audioTokenID, count: encodedAudio.tokenCount))
+                    tokenIDs.append(descriptor.eoaTokenID)
                     softTokens.append(contentsOf: encodedAudio.softTokens)
                 }
             }
         }
 
         tokenIDs.append(eosID)
-        let textFusionUnit: TowerComputeUnit = (computeOptions.textBackbone == .mlxGPU)
-            ? .cpuAndGPU
-            : computeOptions.textBackbone
-        return try await aneRuntime.encodeTextAndFuse(
+        guard let vec = try await aneRuntime.encodeTextAndFuse(
             tokenIDs: tokenIDs,
             softTokens: softTokens.isEmpty ? nil : softTokens,
-            unit: textFusionUnit,
+            softTokenIDs: [descriptor.imageTokenID, descriptor.videoTokenID, descriptor.audioTokenID],
+            unit: computeOptions.textBackbone,
             dimensions: dimensions
-        )
+        ) else {
+            throw EmbeddingEngineError.runtimeUnavailable(
+                "TextANE.mlmodelc execution unavailable for video window."
+            )
+        }
+        return (vec, tokenIDs.count)
+    }
+
+    private func estimateItemTokenCount(
+        prep: PreparedItem,
+        tokenizer: any MLXLMCommon.Tokenizer
+    ) async -> Int {
+        var total = 2
+        if !prep.promptPrefix.isEmpty && !prep.item.hasNonWhitespaceText {
+            total += tokenizer.encode(text: prep.promptPrefix, addSpecialTokens: false).count
+        }
+        var didPrepend = false
+        for part in prep.resolvedParts {
+            switch part {
+            case .text(let s):
+                let t = (!didPrepend && !prep.promptPrefix.isEmpty && !s.hasPrefix("task:") && !s.hasPrefix("title:"))
+                    ? (prep.promptPrefix + s)
+                    : s
+                didPrepend = true
+                total += tokenizer.encode(text: t, addSpecialTokens: false).count
+            case .image:
+                total += 2 + descriptor.imageMaxSoftTokens
+            case .video(let url):
+                if let md = try? await ArtifactProcessor.inspectVideoMetadata(for: url) {
+                    let count = WindowPlanner.uniformSampleTimes(
+                        duration: md.duration,
+                        nativeFPS: md.nativeFPS,
+                        fps: descriptor.videoFPS,
+                        maxFrames: descriptor.videoMaxFrames
+                    ).count
+                    total += max(1, count) * (2 + descriptor.videoMaxSoftTokens)
+                } else {
+                    total += 2 + descriptor.videoMaxSoftTokens
+                }
+            case .audio(let url):
+                if let pcm = try? await ArtifactProcessor.decodeMonoPCM(for: url), pcm.count >= 400 {
+                    let capped = min(pcm.count, 480_000)
+                    let rawFrames = 1 + (capped - 400) / 160
+                    let audioTokens = min(750, max(1, (((rawFrames + 1) / 2) + 1) / 2))
+                    total += 2 + audioTokens
+                } else {
+                    total += 2
+                }
+            }
+        }
+        return min(total, descriptor.maxInputTokens)
+    }
+
+    /// Groups sequences into padded batches holding at most `limit` tokens (longest first-matched ascending).
+    private static func makeLengthBatches(lengths: [Int], limit: Int) -> [[Int]] {
+        let order = lengths.indices.sorted { (lengths[$0], $0) < (lengths[$1], $1) }
+        var batches: [[Int]] = []
+        for idx in order {
+            if let last = batches.last, (last.count + 1) * lengths[idx] <= limit {
+                batches[batches.count - 1].append(idx)
+            } else {
+                batches.append([idx])
+            }
+        }
+        return batches
+    }
+
+    private static func projectUnitRows(_ vectors: MLXArray, dimension: Int) throws -> [[Float]] {
+        try MLX.checkedEval(vectors)
+        let width = vectors.dim(1)
+        let values = vectors.asArray(Float.self)
+        return try stride(from: 0, to: values.count, by: width).map { start in
+            let row = values[start ..< start + width]
+            guard row.allSatisfy(\.isFinite), row.contains(where: { $0 != 0 }) else {
+                throw EmbeddingEngineError.invalidResponse(
+                    status: 500,
+                    detail: "Embedding model produced a non-finite or zero vector."
+                )
+            }
+            return Matryoshka.project(Array(row), dimensions: dimension)
+        }
+    }
+
+    private static func mapVLMError(
+        _ error: MLXVLM.EmbeddingGemma2Embedding.Error,
+        itemIndex: Int
+    ) -> Error {
+        switch error {
+        case .emptyInput:
+            return EmbeddingValidationError.invalidInput(
+                statusCode: 400,
+                detail: "input[\(itemIndex)]: embedding input must contain text or media"
+            )
+        case .unsupportedMedia:
+            return EmbeddingValidationError.unsupportedModality(
+                itemIndex: itemIndex,
+                modality: "media",
+                supported: []
+            )
+        case .invalidMedia:
+            return EmbeddingValidationError.invalidInput(
+                statusCode: 400,
+                detail: "input[\(itemIndex)]: media item could not be decoded"
+            )
+        case .placeholderInText:
+            return EmbeddingValidationError.invalidInput(
+                statusCode: 400,
+                detail: "input[\(itemIndex)]: text next to media must not contain media placeholder tokens"
+            )
+        case .contextExceeded:
+            return EmbeddingValidationError.invalidInput(
+                statusCode: 400,
+                detail: "input[\(itemIndex)]: expanded input exceeds model context length"
+            )
+        case .invalidDimension:
+            return EmbeddingValidationError.unsupportedDimensions(
+                requested: 0,
+                supported: Matryoshka.gemma2Dimensions
+            )
+        case .invalidEmbedding:
+            return EmbeddingEngineError.invalidResponse(
+                status: 500,
+                detail: error.localizedDescription
+            )
+        }
     }
 
     private static func mapTask(_ task: EmbeddingTask) -> MLXVLM.EmbeddingTask {

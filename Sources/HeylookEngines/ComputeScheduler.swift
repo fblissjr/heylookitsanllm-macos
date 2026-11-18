@@ -7,6 +7,7 @@ import Speech
 public enum ComputeSchedulerError: LocalizedError, Sendable, Equatable {
     case queueOverloaded(depth: Int, maxDepth: Int)
     case modelNotFound(String)
+    case modelBusy(String)
 
     public var errorDescription: String? {
         switch self {
@@ -14,6 +15,8 @@ public enum ComputeSchedulerError: LocalizedError, Sendable, Equatable {
             return "model_overloaded: GPU generation queue is full (\(depth)/\(maxDepth))"
         case let .modelNotFound(modelID):
             return "model_not_found: '\(modelID)' is not registered"
+        case let .modelBusy(modelID):
+            return "model_busy: '\(modelID)' has active generation traffic and cannot be unloaded"
         }
     }
 }
@@ -45,11 +48,7 @@ public protocol InferenceProvider: Sendable {
     var providerKind: EngineProviderKind { get }
 
     func describe() async -> EngineDescription
-
-    /// Eagerly loads weights / spawns runtime subprocesses and verifies readiness.
     func preload() async throws
-
-    /// Clears KV / prompt / Metal caches without unloading model weights.
     func clearCache() async -> Bool
 
     func generate(
@@ -59,7 +58,6 @@ public protocol InferenceProvider: Sendable {
         registry: RequestRegistry
     ) async -> AsyncThrowingStream<GenerationChunk, Error>
 
-    /// Releases loaded weights, clears KV/Metal caches, and terminates any child subprocesses.
     func unload() async
 }
 
@@ -67,6 +65,24 @@ public extension InferenceProvider {
     func preload() async throws {}
     func clearCache() async -> Bool { false }
     func unload() async {}
+
+    /// Explicit `onProgress` overload delivering prefill progress via `PrefillProgressBridge`.
+    func generate(
+        requestID: String,
+        request: MessagesRequest,
+        effectiveSampling: SamplerSettings,
+        registry: RequestRegistry,
+        onProgress: (@Sendable (Int, Int) async -> Void)?
+    ) async -> AsyncThrowingStream<GenerationChunk, Error> {
+        await PrefillProgressBridge.$current.withValue(onProgress) {
+            await generate(
+                requestID: requestID,
+                request: request,
+                effectiveSampling: effectiveSampling,
+                registry: registry
+            )
+        }
+    }
 }
 
 /// Hardware memory and CPU telemetry for Apple Silicon Unified Memory.
@@ -120,7 +136,6 @@ public enum HardwareMemoryMonitor {
         }
         let rssMB = kerr == KERN_SUCCESS ? Int(info.resident_size / (1024 * 1024)) : 0
 
-        // Query system-wide Mach VM page counters for real ramUsedGB & ramAvailableGB
         var vmStats = vm_statistics64()
         var vmCount = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
         var pageSize: vm_size_t = 16384
@@ -146,7 +161,6 @@ public enum HardwareMemoryMonitor {
             ramAvailableGB = max(0, ((physGB - approxUsed) * 10).rounded() / 10)
         }
 
-        // Normalized CPU utilization from 1-minute loadavg across active logical cores
         var loadAvg: Double = 0
         let nCores = max(1, ProcessInfo.processInfo.activeProcessorCount)
         let cpuPct: Double
@@ -169,8 +183,8 @@ public enum HardwareMemoryMonitor {
     }
 }
 
-/// Dual-lane Heterogeneous Compute Scheduler (`GPU GenerationGate` + `ANE Co-Residency Lane`)
-/// and LRU / Pinned model lifecycle manager.
+/// Dual-lane Heterogeneous Compute Scheduler (`GPU GenerationGate` + `ANE Co-Residency Lane`),
+/// active-generation eviction/unload guard, live RAM headroom co-residency gate, and GPU embedding serialization.
 public actor ComputeScheduler {
     public struct SchedulerMetrics: Codable, Sendable, Equatable {
         public let gpuGateBusy: Bool
@@ -231,6 +245,9 @@ public actor ComputeScheduler {
     private var auxiliaryASRProviders: [String: CoreAIProvider] = [:]
     private var lruOrderGPU: [String] = []
     private var loadedANE: Set<String> = []
+    private var activeGenerationCounts: [String: Int] = [:]
+    private var loadSnapshots: [String: [String: JSONValue]] = [:]
+    private var loadedProviders: [String: EngineProviderKind] = [:]
     private var maxLoadedGPUModels: Int
     private var maxQueueDepth: Int
 
@@ -264,22 +281,23 @@ public actor ComputeScheduler {
     }
 
     /// Registers a batch of discovered `EngineDescription` entries using `ProviderFactory`.
-    public func registerDiscoveredModels(
-        _ discovered: [EngineDescription],
-        allowSyntheticFallback: Bool = false
-    ) async {
+    public func registerDiscoveredModels(_ discovered: [EngineDescription]) async {
         for desc in discovered {
-            let provider = ProviderFactory.makeProvider(for: desc, allowSyntheticFallback: allowSyntheticFallback)
+            let provider = ProviderFactory.makeProvider(for: desc)
             await register(provider: provider, description: desc)
         }
     }
 
-    /// Replaces the registry with `discovered` (preserving currently loaded providers whose IDs match
-    /// unless `unloadRemoved` or `forceReload` is requested).
-    public func reloadRegistry(
+    @available(*, deprecated, message: "allowSyntheticFallback has been removed; use registerDiscoveredModels(_:)")
+    public func registerDiscoveredModels(
         _ discovered: [EngineDescription],
-        allowSyntheticFallback: Bool = false
+        allowSyntheticFallback: Bool
     ) async {
+        _ = allowSyntheticFallback
+        await registerDiscoveredModels(discovered)
+    }
+
+    public func reloadRegistry(_ discovered: [EngineDescription]) async {
         let newIDs = Set(discovered.map(\.modelID))
         let removedIDs = Set(descriptions.keys).subtracting(newIDs)
         for id in removedIDs {
@@ -292,10 +310,19 @@ public actor ComputeScheduler {
                 desc.isLoaded = true
                 descriptions[desc.modelID] = desc
             } else {
-                let provider = ProviderFactory.makeProvider(for: desc, allowSyntheticFallback: allowSyntheticFallback)
+                let provider = ProviderFactory.makeProvider(for: desc)
                 await register(provider: provider, description: desc)
             }
         }
+    }
+
+    @available(*, deprecated, message: "allowSyntheticFallback has been removed; use reloadRegistry(_:)")
+    public func reloadRegistry(
+        _ discovered: [EngineDescription],
+        allowSyntheticFallback: Bool
+    ) async {
+        _ = allowSyntheticFallback
+        await reloadRegistry(discovered)
     }
 
     public func removeModel(_ modelID: String) async -> Bool {
@@ -324,15 +351,70 @@ public actor ComputeScheduler {
         descriptions[id]
     }
 
+    public func activeGenerations(for modelID: String) -> Int {
+        activeGenerationCounts[modelID, default: 0]
+    }
+
+    public func beginGeneration(for modelID: String) {
+        activeGenerationCounts[modelID, default: 0] += 1
+    }
+
+    public func endGeneration(for modelID: String) {
+        let next = activeGenerationCounts[modelID, default: 0] - 1
+        if next <= 0 {
+            activeGenerationCounts.removeValue(forKey: modelID)
+        } else {
+            activeGenerationCounts[modelID] = next
+        }
+    }
+
     public func setPinned(_ pinned: Bool, for modelID: String) {
         guard var desc = descriptions[modelID] else { return }
         desc.isPinned = pinned
         descriptions[modelID] = desc
     }
 
-    /// Applies an updated `ModelSidecarConfig` (`model.heylook.toml`) to `modelID` in-place,
-    /// marking modified fields with `.configured` provenance and preserving `reasoningFormat`
-    /// and `thinkingControls`.
+    /// Computes reload-class field names that differ between the loaded snapshot and
+    /// an updated `ModelSidecarConfig`, deriving directly from `ProviderConfigSchema.staleReloadFields`.
+    public func staleReloadFields(
+        for modelID: String,
+        updatedSidecar: ModelSidecarConfig
+    ) -> [String] {
+        guard let desc = descriptions[modelID] else { return [] }
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: desc.modelPath)
+        let currentConfig = updatedSidecar.toExplicitJSONDictionary()
+        let snapshot = loadSnapshots[modelID]
+            ?? (desc.isLoaded ? (HeylookConfig.loadSidecar(in: dirURL)?.toExplicitJSONDictionary() ?? [:]) : nil)
+        let tplState = HeylookConfig.inspectChatTemplate(in: dirURL)
+        return ProviderConfigSchema.staleReloadFields(
+            provider: updatedSidecar.provider ?? desc.provider,
+            loadedSnapshot: snapshot,
+            currentConfig: currentConfig,
+            chatTemplateStale: tplState.observedStale,
+            loadedProvider: loadedProviders[modelID] ?? desc.provider
+        )
+    }
+
+    public func loadedConfigSnapshot(for modelID: String) -> [String: JSONValue]? {
+        loadSnapshots[modelID]
+    }
+
+    /// Runs live `RAMFitCalculator.assess` against a registered model with optional what-if overrides.
+    public func assessRAMFit(
+        for modelID: String,
+        overrides: RAMFitOverrides = .init(),
+        headroomGB: Double? = nil
+    ) throws -> RAMFitReport {
+        guard let desc = descriptions[modelID] else {
+            throw ComputeSchedulerError.modelNotFound(modelID)
+        }
+        return RAMFitCalculator.assess(
+            for: desc,
+            overrides: overrides,
+            headroomOverrideGB: headroomGB
+        )
+    }
+
     @discardableResult
     public func applySidecarUpdate(_ sidecar: ModelSidecarConfig, for modelID: String) throws -> EngineDescription {
         guard let existing = descriptions[modelID] else {
@@ -430,9 +512,6 @@ public actor ComputeScheduler {
         return updated
     }
 
-    /// Marks `modelID` as loaded (and when `warm == true`, invokes `provider.preload()` first so
-    /// weights / subprocesses are genuinely loaded before `isLoaded` becomes `true`) and enforces
-    /// LRU eviction on unpinned GPU models while leaving ANE-resident models untouched.
     public func activateModel(_ modelID: String, warm: Bool = false) async throws -> EngineDescription {
         guard var desc = descriptions[modelID] else {
             throw ComputeSchedulerError.modelNotFound(modelID)
@@ -451,11 +530,26 @@ public actor ComputeScheduler {
             desc.isLoaded = true
         }
         descriptions[modelID] = desc
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: desc.modelPath)
+        loadSnapshots[modelID] = HeylookConfig.loadSidecar(in: dirURL)?.toExplicitJSONDictionary() ?? [:]
+        loadedProviders[modelID] = desc.provider
         let postEvicted = recordResidency(for: desc)
         for evictedID in postEvicted {
+            loadSnapshots.removeValue(forKey: evictedID)
+            loadedProviders.removeValue(forKey: evictedID)
             await providers[evictedID]?.unload()
         }
         return desc
+    }
+
+    /// Strict HTTP-facing unload: refuses with `ComputeSchedulerError.modelBusy` (HTTP `409`)
+    /// whenever the target model currently has active generation traffic.
+    public func tryUnloadModel(_ modelID: String) async throws {
+        guard descriptions[modelID] != nil else { return }
+        guard activeGenerationCounts[modelID, default: 0] == 0 else {
+            throw ComputeSchedulerError.modelBusy(modelID)
+        }
+        await unloadModel(modelID)
     }
 
     public func unloadModel(_ modelID: String) async {
@@ -464,11 +558,11 @@ public actor ComputeScheduler {
         descriptions[modelID] = desc
         lruOrderGPU.removeAll { $0 == modelID }
         loadedANE.remove(modelID)
+        loadSnapshots.removeValue(forKey: modelID)
+        loadedProviders.removeValue(forKey: modelID)
         await providers[modelID]?.unload()
     }
 
-    /// Unloads all registered models, freeing Metal GPU memory, clearing KV caches,
-    /// and terminating all `llama-server` subprocesses.
     public func unloadAllModels() async {
         let allIDs = Array(descriptions.keys)
         for id in allIDs {
@@ -479,6 +573,9 @@ public actor ComputeScheduler {
         }
         lruOrderGPU.removeAll()
         loadedANE.removeAll()
+        activeGenerationCounts.removeAll()
+        loadSnapshots.removeAll()
+        loadedProviders.removeAll()
         for (_, provider) in providers {
             await provider.unload()
         }
@@ -488,22 +585,37 @@ public actor ComputeScheduler {
         auxiliaryASRProviders.removeAll()
     }
 
-    /// Acquires a compute lease on either the **ANE Co-Resident Lane** (concurrent, zero GPU contention)
-    /// or the **Metal GPU GenerationGate** (serialized FIFO with bounded `maxQueueDepth`).
+    /// Acquires a compute lease on either the ANE Co-Resident Lane (concurrent) or Metal GPU GenerationGate.
+    /// Automatically protects `modelID` from eviction/unload for the duration of the operation.
     public func withComputeLease<T: Sendable>(
         for modelID: String,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
         let desc = try await activateModel(modelID, warm: false)
-        let usesANELane = desc.computePlacement.value.runsOnNeuralEngineLane
+        beginGeneration(for: modelID)
+        defer { endGeneration(for: modelID) }
 
+        let usesANELane = desc.computePlacement.value.runsOnNeuralEngineLane
         if usesANELane {
             activeANETasks += 1
             defer { activeANETasks -= 1 }
             return try await operation()
         }
 
-        // Metal GPU FIFO Gate
+        return try await withGPUGateLease(operation: operation)
+    }
+
+    /// Serializes GPU-bound embedding execution on the exact `GenerationGate` used by GPU LLMs,
+    /// preventing Metal buffer/command-queue contention during concurrent multimodal indexing + chat.
+    public func withGPUEmbeddingLease<T: Sendable>(
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withGPUGateLease(operation: operation)
+    }
+
+    private func withGPUGateLease<T: Sendable>(
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
         if gpuGateBusy {
             guard gpuWaiters.count < maxQueueDepth else {
                 throw ComputeSchedulerError.queueOverloaded(
@@ -519,217 +631,143 @@ public actor ComputeScheduler {
         }
 
         defer {
-            if !gpuWaiters.isEmpty {
-                let next = gpuWaiters.removeFirst()
+            if let next = gpuWaiters.first {
+                gpuWaiters.removeFirst()
                 next.resume()
             } else {
                 gpuGateBusy = false
             }
         }
+
         return try await operation()
     }
 
     public func provider(for modelID: String) throws -> any InferenceProvider {
-        guard let p = providers[modelID] else {
+        guard let provider = providers[modelID] else {
             throw ComputeSchedulerError.modelNotFound(modelID)
         }
-        return p
+        return provider
     }
 
-    /// Reports the currently active/available ANE Voice ASR backend and candidate models.
     public func voiceASRSummary(allowSyntheticFallback: Bool = false) -> VoiceASRSummary {
-        let registeredASR = descriptions.values
-            .filter { $0.provider == .coreai && $0.isSpeechRecognizer }
-            .map(\.modelID)
-            .sorted()
-        let coreAISpeechLinked = CoreAIProvider.isCoreAISpeechLinked
+        _ = allowSyntheticFallback
+        let explicitASRs = descriptions.values
+            .filter { $0.supportsAudio.value || $0.tags.contains("asr") || $0.tags.contains("speech") }
+            .sorted { $0.modelID.localizedStandardCompare($1.modelID) == .orderedAscending }
 
-        if let envPath = ProcessInfo.processInfo.environment["HEYLOOK_ASR_MODEL_PATH"],
-           !envPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let expanded = (envPath as NSString).expandingTildeInPath
-            let id = CoreAIBundleManifest.canonicalBundleID(for: URL(fileURLWithPath: expanded))
-            let exists = FileManager.default.fileExists(atPath: expanded)
-            let avail = exists && (coreAISpeechLinked || allowSyntheticFallback)
-            return VoiceASRSummary(
-                available: avail,
-                defaultModel: id,
-                backend: coreAISpeechLinked ? "coreai_speech" : (allowSyntheticFallback ? "synthetic_fixture" : "coreai_speech_unlinked"),
-                models: ([id] + registeredASR + (SpeechTranscriber.isAvailable ? [CoreAIProvider.systemSpeechModelID] : []))
-            )
-        }
+        var availableIDs: [String] = []
+        var defaultModel: String?
+        var backend = "unavailable"
 
-        if !registeredASR.isEmpty && (coreAISpeechLinked || allowSyntheticFallback) {
-            var allModels = registeredASR
-            if SpeechTranscriber.isAvailable {
-                allModels.append(CoreAIProvider.systemSpeechModelID)
+        #if canImport(CoreAISpeech)
+        let coreAISpeechModels = explicitASRs.filter { desc in
+            guard let manifest = try? CoreAIBundleManifest.inspect(at: URL(fileURLWithPath: desc.modelPath)) else {
+                return false
             }
-            return VoiceASRSummary(
-                available: true,
-                defaultModel: registeredASR.first,
-                backend: coreAISpeechLinked ? "coreai_speech" : "synthetic_fixture",
-                models: allModels
-            )
+            return manifest.isSpeechRecognizer
         }
+        for m in coreAISpeechModels {
+            availableIDs.append(m.modelID)
+        }
+        if let first = coreAISpeechModels.first {
+            defaultModel = first.modelID
+            backend = "coreai_speech"
+        }
+        #endif
 
-        if SpeechTranscriber.isAvailable || allowSyntheticFallback {
-            return VoiceASRSummary(
-                available: true,
-                defaultModel: CoreAIProvider.systemSpeechModelID,
-                backend: SpeechTranscriber.isAvailable ? "apple_speech_transcriber" : "synthetic_fixture",
-                models: [CoreAIProvider.systemSpeechModelID]
-            )
+        if SpeechTranscriptionService.isSystemSpeechAvailable {
+            if !availableIDs.contains(SpeechTranscriptionService.systemSpeechModelID) {
+                availableIDs.append(SpeechTranscriptionService.systemSpeechModelID)
+            }
+            if defaultModel == nil {
+                defaultModel = SpeechTranscriptionService.systemSpeechModelID
+                backend = "apple_speech_transcriber"
+            }
         }
 
         return VoiceASRSummary(
-            available: false,
-            defaultModel: nil,
-            backend: "unavailable",
-            models: registeredASR
+            available: !availableIDs.isEmpty,
+            defaultModel: defaultModel,
+            backend: backend,
+            models: availableIDs
         )
     }
 
-    /// Resolves and caches the persistent ANE-lane `CoreAIProvider` used for voice ASR transcription.
     public func resolveASRProvider(
         preferredModelID: String? = nil,
         allowSyntheticFallback: Bool = false
     ) throws -> (provider: CoreAIProvider, isRegisteredInCatalog: Bool) {
-        let coreAISpeechLinked = CoreAIProvider.isCoreAISpeechLinked
-
-        let trimmedPref = preferredModelID?.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // 1. Explicit model ID or filesystem bundle path requested by caller
-        if let pref = trimmedPref, !pref.isEmpty {
-            if pref == CoreAIProvider.systemSpeechModelID || pref == CoreAIProvider.systemSpeechModelPath {
-                if let cached = auxiliaryASRProviders[CoreAIProvider.systemSpeechModelID],
-                   cached.allowSyntheticFallback == allowSyntheticFallback {
-                    return (cached, false)
+        _ = allowSyntheticFallback
+        if let preferred = preferredModelID, !preferred.isEmpty {
+            if preferred == SpeechTranscriptionService.systemSpeechModelID {
+                guard SpeechTranscriptionService.isSystemSpeechAvailable else {
+                    throw ProviderExecutionError.runtimeUnavailable(
+                        modelID: preferred,
+                        detail: "Apple SpeechTranscriber is unavailable on this host."
+                    )
                 }
-                let created = CoreAIProvider(
-                    description: CoreAIProvider.systemSpeechDescription(),
-                    allowSyntheticFallback: allowSyntheticFallback
-                )
-                auxiliaryASRProviders[CoreAIProvider.systemSpeechModelID] = created
-                return (created, false)
+                if let registered = providers[preferred] as? CoreAIProvider {
+                    return (registered, true)
+                }
+                if let aux = auxiliaryASRProviders[preferred] {
+                    return (aux, false)
+                }
+                let sysProvider = CoreAIProvider(description: SpeechTranscriptionService.systemSpeechDescription())
+                auxiliaryASRProviders[preferred] = sysProvider
+                return (sysProvider, false)
             }
+            if let explicit = providers[preferred] as? CoreAIProvider {
+                return (explicit, true)
+            }
+            throw ComputeSchedulerError.modelNotFound(preferred)
+        }
 
-            if let registered = providers[pref] as? CoreAIProvider {
+        let explicitASRs = descriptions.values
+            .filter { $0.supportsAudio.value || $0.tags.contains("asr") || $0.tags.contains("speech") }
+            .sorted { $0.modelID.localizedStandardCompare($1.modelID) == .orderedAscending }
+
+        #if canImport(CoreAISpeech)
+        for desc in explicitASRs {
+            if let manifest = try? CoreAIBundleManifest.inspect(at: URL(fileURLWithPath: desc.modelPath)),
+               manifest.isSpeechRecognizer,
+               let provider = providers[desc.modelID] as? CoreAIProvider {
+                return (provider, true)
+            }
+        }
+        #endif
+
+        if SpeechTranscriptionService.isSystemSpeechAvailable {
+            let sysID = SpeechTranscriptionService.systemSpeechModelID
+            if let registered = providers[sysID] as? CoreAIProvider {
                 return (registered, true)
             }
-
-            // Support passing an explicit filesystem `.aimodel` / bundle directory path (e.g. from CLI `--model <path>`)
-            let expanded = (pref as NSString).expandingTildeInPath
-            if pref.contains("/") || pref.lowercased().hasSuffix(".aimodel") {
-                if let cached = auxiliaryASRProviders[expanded],
-                   cached.allowSyntheticFallback == allowSyntheticFallback {
-                    return (cached, false)
-                }
-                guard FileManager.default.fileExists(atPath: expanded) else {
-                    throw ProviderExecutionError.checkpointNotFound(modelID: pref, path: expanded)
-                }
-                let bundleURL = URL(fileURLWithPath: expanded)
-                let derivedID = CoreAIBundleManifest.canonicalBundleID(for: bundleURL)
-                let desc = EngineDescription(
-                    modelID: derivedID,
-                    provider: .coreai,
-                    modelPath: expanded,
-                    architecture: ProvenanceField(
-                        value: HeylookConfig.inspectSpeechRecognizerArchitecture(in: bundleURL) ?? "speech_recognizer",
-                        provenance: .derived,
-                        effect: .reload
-                    ),
-                    computePlacement: ProvenanceField(
-                        value: .ane,
-                        provenance: .derived,
-                        effect: .reload,
-                        computePlacement: .ane
-                    ),
-                    supportsAudio: ProvenanceField(value: true, provenance: .derived, effect: .reload),
-                    supportsThinking: ProvenanceField(value: false, provenance: .derived, effect: .perRequest),
-                    tags: ["asr", "speech"]
-                )
-                let created = CoreAIProvider(description: desc, allowSyntheticFallback: allowSyntheticFallback)
-                auxiliaryASRProviders[expanded] = created
-                return (created, false)
+            if let aux = auxiliaryASRProviders[sysID] {
+                return (aux, false)
             }
-
-            throw ComputeSchedulerError.modelNotFound(pref)
+            let sysProvider = CoreAIProvider(description: SpeechTranscriptionService.systemSpeechDescription())
+            auxiliaryASRProviders[sysID] = sysProvider
+            return (sysProvider, false)
         }
 
-        // 2. Explicit `HEYLOOK_ASR_MODEL_PATH` environment variable (truthful failure if missing)
-        if let envPath = ProcessInfo.processInfo.environment["HEYLOOK_ASR_MODEL_PATH"],
-           !envPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let expanded = (envPath as NSString).expandingTildeInPath
-            if let cached = auxiliaryASRProviders[expanded],
-               cached.allowSyntheticFallback == allowSyntheticFallback {
-                return (cached, false)
-            }
-            guard FileManager.default.fileExists(atPath: expanded) else {
-                throw ProviderExecutionError.checkpointNotFound(
-                    modelID: CoreAIBundleManifest.canonicalBundleID(for: URL(fileURLWithPath: expanded)),
-                    path: expanded
-                )
-            }
-            let bundleURL = URL(fileURLWithPath: expanded)
-            let desc = EngineDescription(
-                modelID: CoreAIBundleManifest.canonicalBundleID(for: bundleURL),
-                provider: .coreai,
-                modelPath: expanded,
-                architecture: ProvenanceField(
-                    value: HeylookConfig.inspectSpeechRecognizerArchitecture(in: bundleURL) ?? "speech_recognizer",
-                    provenance: .configured,
-                    effect: .reload
-                ),
-                computePlacement: ProvenanceField(
-                    value: .ane,
-                    provenance: .configured,
-                    effect: .reload,
-                    computePlacement: .ane
-                ),
-                supportsAudio: ProvenanceField(value: true, provenance: .configured, effect: .reload),
-                supportsThinking: ProvenanceField(value: false, provenance: .derived, effect: .perRequest),
-                tags: ["asr", "speech"]
-            )
-            let created = CoreAIProvider(description: desc, allowSyntheticFallback: allowSyntheticFallback)
-            auxiliaryASRProviders[expanded] = created
-            return (created, false)
+        if let fallbackDesc = explicitASRs.first,
+           let provider = providers[fallbackDesc.modelID] as? CoreAIProvider {
+            return (provider, true)
         }
 
-        // 3. Registered CoreAISpeech bundle in catalog (when CoreAISpeech is linked or in synthetic test mode)
-        if coreAISpeechLinked || allowSyntheticFallback {
-            let sortedASR = descriptions.values
-                .filter { $0.provider == .coreai && $0.isSpeechRecognizer }
-                .sorted { $0.modelID.localizedStandardCompare($1.modelID) == .orderedAscending }
-            if let firstDesc = sortedASR.first,
-               let registered = providers[firstDesc.modelID] as? CoreAIProvider {
-                return (registered, true)
-            }
-        }
-
-        // 4. Built-in Apple `SpeechTranscriber` (`SpeechAnalyzer`) on the ANE lane
-        let sysKey = CoreAIProvider.systemSpeechModelID
-        if let cached = auxiliaryASRProviders[sysKey],
-           cached.allowSyntheticFallback == allowSyntheticFallback {
-            return (cached, false)
-        }
-        let sysProvider = CoreAIProvider(
-            description: CoreAIProvider.systemSpeechDescription(),
-            allowSyntheticFallback: allowSyntheticFallback
+        throw ProviderExecutionError.runtimeUnavailable(
+            modelID: preferredModelID ?? SpeechTranscriptionService.systemSpeechModelID,
+            detail: "No compiled CoreAISpeech .aimodel bundle or Apple SpeechTranscriber is available on this host."
         )
-        auxiliaryASRProviders[sysKey] = sysProvider
-        return (sysProvider, false)
     }
 
-    /// Executes ANE-lane speech transcription while preserving resident GPU LLMs untouched.
     public func transcribeVoice(
         wavData: Data,
         languageHint: String = "en",
         preferredASRModelID: String? = nil,
         allowSyntheticFallback: Bool = false
-    ) async throws -> CoreAIProvider.ANESpeechTranscriptionResult {
-        let resolved = try resolveASRProvider(
-            preferredModelID: preferredASRModelID,
-            allowSyntheticFallback: allowSyntheticFallback
-        )
+    ) async throws -> ANESpeechTranscriptionResult {
+        _ = allowSyntheticFallback
+        let resolved = try resolveASRProvider(preferredModelID: preferredASRModelID)
         if resolved.isRegisteredInCatalog {
             return try await withComputeLease(for: resolved.provider.modelID) {
                 try await resolved.provider.transcribeAudio(
@@ -763,16 +801,43 @@ public actor ComputeScheduler {
     private func planEvictionsIfActivating(_ desc: EngineDescription) -> [String] {
         guard !desc.computePlacement.value.runsOnNeuralEngineLane else { return [] }
         if lruOrderGPU.contains(desc.modelID) { return [] }
+
         var simulated = lruOrderGPU + [desc.modelID]
         var toEvict: [String] = []
+
+        func isEvictable(_ id: String) -> Bool {
+            id != desc.modelID
+                && descriptions[id]?.isPinned != true
+                && activeGenerationCounts[id, default: 0] == 0
+        }
+
+        // 1. Enforce maxLoadedGPUModels limit (never evicting pinned or actively-generating models)
         while simulated.count > maxLoadedGPUModels {
-            guard let candidateIdx = simulated.firstIndex(where: { id in
-                descriptions[id]?.isPinned != true && id != desc.modelID
-            }) else {
-                break
-            }
+            guard let candidateIdx = simulated.firstIndex(where: isEvictable) else { break }
             toEvict.append(simulated.remove(at: candidateIdx))
         }
+
+        // 2. Enforce live Metal headroom before keeping multiple GPU models co-resident
+        let residentOthers = simulated.filter { $0 != desc.modelID }
+        if !residentOthers.isEmpty {
+            let incomingFit = RAMFitCalculator.assess(for: desc)
+            let incomingFootprint = incomingFit.weightsGB + incomingFit.mmprojGB + incomingFit.drafterGB + incomingFit.kvGB
+            let mem = RAMFitCalculator.liveMemorySnapshot()
+            // Reclaimable RAM already excludes current wired GPU models; check if incoming fits in remaining headroom
+            var availableForIncoming = min(mem.reclaimableGB, mem.workingSetGB)
+            while availableForIncoming < incomingFootprint + 2.0 {
+                guard let candidateIdx = simulated.firstIndex(where: isEvictable) else { break }
+                let evictID = simulated.remove(at: candidateIdx)
+                toEvict.append(evictID)
+                if let evDesc = descriptions[evictID] {
+                    let evFit = RAMFitCalculator.assess(for: evDesc)
+                    availableForIncoming += evFit.weightsGB + evFit.mmprojGB + evFit.drafterGB
+                } else {
+                    availableForIncoming += 4.0
+                }
+            }
+        }
+
         return toEvict
     }
 
@@ -788,7 +853,9 @@ public actor ComputeScheduler {
         var evictedIDs: [String] = []
         while lruOrderGPU.count > maxLoadedGPUModels {
             guard let candidateIdx = lruOrderGPU.firstIndex(where: { id in
-                descriptions[id]?.isPinned != true && id != desc.modelID
+                descriptions[id]?.isPinned != true
+                    && id != desc.modelID
+                    && activeGenerationCounts[id, default: 0] == 0
             }) else {
                 break
             }

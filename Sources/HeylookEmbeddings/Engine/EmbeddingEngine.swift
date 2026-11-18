@@ -1,5 +1,6 @@
 import Accelerate
 import Foundation
+import HeylookCore
 
 /// Task prompts published by EmbeddingGemma 2 (`config_sentence_transformers.json`).
 public enum EmbeddingTask: String, Codable, CaseIterable, Sendable {
@@ -83,6 +84,95 @@ public enum VideoWindowSampling: String, Codable, CaseIterable, Sendable {
     }
 }
 
+/// Requested temporal windowing options for a single video block (`v2.0.233`–`v2.0.244` parity).
+public struct VideoWindowOptions: Codable, Sendable, Equatable {
+    public let seconds: Double?
+    public let sampling: VideoWindowSampling
+
+    public init(seconds: Double? = nil, sampling: VideoWindowSampling = .fps) {
+        self.seconds = seconds
+        self.sampling = sampling
+    }
+
+    public static func validated(seconds: Double?, samplingRaw: String?) throws -> VideoWindowOptions {
+        let sampling: VideoWindowSampling
+        if let samplingRaw {
+            guard let parsed = VideoWindowSampling(rawValue: samplingRaw), parsed != .off else {
+                throw EmbeddingValidationError.invalidWindowSampling(samplingRaw)
+            }
+            sampling = parsed
+        } else {
+            sampling = .fps
+        }
+        if let seconds, (!seconds.isFinite || seconds <= 0) {
+            throw EmbeddingValidationError.invalidWindowSeconds(seconds)
+        }
+        return VideoWindowOptions(seconds: seconds, sampling: sampling)
+    }
+}
+
+/// Typed validation errors for `/v1/embeddings` inputs and checkpoint/model constraints.
+public enum EmbeddingValidationError: LocalizedError, Sendable, Equatable {
+    case unknownPromptName(itemIndex: Int, promptName: String, available: [String])
+    case unsupportedDimensions(requested: Int, supported: [Int])
+    case unsupportedModality(itemIndex: Int, modality: String, supported: [String])
+    case videoWindowsUnsupported(itemIndex: Int, detail: String)
+    case videoWindowsExceedMaxSeconds(itemIndex: Int, requested: Double, maxSeconds: Double)
+    case invalidWindowSampling(String)
+    case invalidWindowSeconds(Double)
+    case windowedVideoRequiresSingleVideoBlock(itemIndex: Int)
+    case windowedVideoNonVideoBlock(itemIndex: Int, kind: ArtifactKind)
+    case invalidInput(statusCode: Int, detail: String)
+
+    public var statusCode: Int {
+        switch self {
+        case .invalidWindowSampling,
+             .invalidWindowSeconds,
+             .windowedVideoRequiresSingleVideoBlock,
+             .windowedVideoNonVideoBlock:
+            return 422
+        case let .invalidInput(statusCode, _):
+            return statusCode
+        case .unknownPromptName,
+             .unsupportedDimensions,
+             .unsupportedModality,
+             .videoWindowsUnsupported,
+             .videoWindowsExceedMaxSeconds:
+            return 400
+        }
+    }
+
+    public var wireValidationError: WireValidationError {
+        let message = errorDescription ?? "Invalid embedding request"
+        return statusCode == 422 ? .unprocessable(message) : .badRequest(message)
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case let .unknownPromptName(itemIndex, promptName, _):
+            return "input[\(itemIndex)]: unknown prompt_name '\(promptName)'"
+        case let .unsupportedDimensions(_, supported):
+            return "Unsupported dimensions; choose \(supported)"
+        case let .unsupportedModality(itemIndex, modality, _):
+            return "input[\(itemIndex)]: unsupported modality '\(modality)'"
+        case let .videoWindowsUnsupported(itemIndex, detail):
+            return "input[\(itemIndex)]: \(detail)"
+        case let .videoWindowsExceedMaxSeconds(itemIndex, _, maxSeconds):
+            return "input[\(itemIndex)]: windows.seconds exceeds \(maxSeconds)"
+        case let .invalidWindowSampling(raw):
+            return "Invalid video window sampling '\(raw)'; expected 'fps' or 'content'"
+        case let .invalidWindowSeconds(seconds):
+            return "Invalid video window seconds (\(seconds)); must be > 0"
+        case let .windowedVideoRequiresSingleVideoBlock(itemIndex):
+            return "input[\(itemIndex)]: an item with video windows must contain only that video block"
+        case let .windowedVideoNonVideoBlock(itemIndex, kind):
+            return "input[\(itemIndex)]: windows applies to video blocks only (got '\(kind.rawValue)')"
+        case let .invalidInput(_, detail):
+            return detail
+        }
+    }
+}
+
 /// One ordered block inside a multimodal `EmbeddingInput`.
 public enum EmbeddingPart: Sendable, Equatable {
     case text(String)
@@ -140,15 +230,42 @@ public struct EmbeddingInput: Sendable, Equatable {
     public let parts: [EmbeddingPart]
     public let task: EmbeddingTask
     public let title: String?
+    public let promptName: String?
+    public let usesExplicitPromptName: Bool
+    public let videoWindows: VideoWindowOptions?
 
     public init(parts: [EmbeddingPart], task: EmbeddingTask = .document, title: String? = nil) {
         self.parts = parts
         self.task = task
         self.title = title
+        self.promptName = task.promptName
+        self.usesExplicitPromptName = false
+        self.videoWindows = nil
+    }
+
+    /// Explicit wire/API initializer where `promptName == nil` applies NO task prefix at all
+    /// and `videoWindows` carries validated `{seconds?, sampling}` parameters.
+    public init(
+        parts: [EmbeddingPart],
+        promptName: String?,
+        title: String? = nil,
+        videoWindows: VideoWindowOptions? = nil,
+        task: EmbeddingTask = .none
+    ) {
+        self.parts = parts
+        self.task = task
+        self.title = title
+        self.promptName = promptName
+        self.usesExplicitPromptName = true
+        self.videoWindows = videoWindows
     }
 
     public static func text(_ value: String, task: EmbeddingTask, title: String? = nil) -> EmbeddingInput {
         EmbeddingInput(parts: [.text(value)], task: task, title: title)
+    }
+
+    public static func text(_ value: String, promptName: String? = nil, title: String? = nil) -> EmbeddingInput {
+        EmbeddingInput(parts: [.text(value)], promptName: promptName, title: title)
     }
 
     public var hasNonWhitespaceText: Bool {
@@ -159,34 +276,118 @@ public struct EmbeddingInput: Sendable, Equatable {
             return false
         }
     }
+
+    /// Resolves and structurally validates requested video windows for this item.
+    public func resolvedVideoWindows(itemIndex: Int = 0) throws -> VideoWindowOptions? {
+        var partSampling: VideoWindowSampling?
+        var nonVideoWindowKind: ArtifactKind?
+
+        for part in parts {
+            if case let .media(kind, _, _, _, sampling) = part, sampling != .off {
+                if kind == .video {
+                    if partSampling == nil {
+                        partSampling = sampling
+                    }
+                } else {
+                    nonVideoWindowKind = kind
+                }
+            }
+        }
+
+        if let kind = nonVideoWindowKind {
+            throw EmbeddingValidationError.windowedVideoNonVideoBlock(itemIndex: itemIndex, kind: kind)
+        }
+
+        if let explicit = videoWindows {
+            guard parts.count == 1,
+                  case let .media(kind, _, _, _, _) = parts[0] else {
+                throw EmbeddingValidationError.windowedVideoRequiresSingleVideoBlock(itemIndex: itemIndex)
+            }
+            guard kind == .video else {
+                throw EmbeddingValidationError.windowedVideoNonVideoBlock(itemIndex: itemIndex, kind: kind)
+            }
+            if let seconds = explicit.seconds, !seconds.isFinite || seconds <= 0 {
+                throw EmbeddingValidationError.invalidWindowSeconds(seconds)
+            }
+            return VideoWindowOptions(
+                seconds: explicit.seconds,
+                sampling: explicit.sampling == .off ? .fps : explicit.sampling
+            )
+        }
+
+        guard let sampling = partSampling else {
+            return nil
+        }
+
+        if usesExplicitPromptName && parts.count != 1 {
+            throw EmbeddingValidationError.windowedVideoRequiresSingleVideoBlock(itemIndex: itemIndex)
+        }
+
+        return VideoWindowOptions(seconds: nil, sampling: sampling)
+    }
+}
+
+/// Embedded temporal window vector with its time span and sampled frame timestamps.
+public struct VideoWindowEmbeddingResult: Sendable, Equatable, Codable {
+    public let start: Double
+    public let end: Double
+    public let frameTimes: [Double]
+    public let vector: [Float]
+
+    public init(start: Double, end: Double, frameTimes: [Double], vector: [Float]) {
+        self.start = start
+        self.end = end
+        self.frameTimes = frameTimes
+        self.vector = vector
+    }
 }
 
 /// Output for one `EmbeddingInput`.
-public struct EmbeddedOutput: Sendable {
-    public struct WindowVector: Sendable {
-        public let start: Double
-        public let end: Double
-        public let frameTimes: [Double]
-        public let vector: [Float]
-
-        public init(start: Double, end: Double, frameTimes: [Double], vector: [Float]) {
-            self.start = start
-            self.end = end
-            self.frameTimes = frameTimes
-            self.vector = vector
-        }
-    }
+public struct EmbeddedOutput: Sendable, Equatable {
+    public typealias WindowVector = VideoWindowEmbeddingResult
 
     public let vector: [Float]
     public let windows: [WindowVector]
+    public let inputTokens: Int?
+    public let promptName: String?
 
-    public init(vector: [Float], windows: [WindowVector] = []) {
+    public init(
+        vector: [Float],
+        windows: [WindowVector] = [],
+        inputTokens: Int? = nil,
+        promptName: String? = nil
+    ) {
         self.vector = vector
         self.windows = windows
+        self.inputTokens = inputTokens
+        self.promptName = promptName
     }
 }
 
-/// Protocol for a multimodal `EmbeddingGemma 2` embedding backend.
+/// Batch embedding output carrying per-item vectors plus cumulative `inputTokens` accounting.
+public struct EmbeddingResult: Sendable, Equatable {
+    public let outputs: [EmbeddedOutput]
+    public let inputTokens: Int
+    public let dimensions: Int
+    public let modelID: String
+    public let elapsedMS: Double
+
+    public init(
+        outputs: [EmbeddedOutput],
+        inputTokens: Int = 0,
+        dimensions: Int = Matryoshka.gemma2NativeDimensions,
+        modelID: String = "",
+        elapsedMS: Double = 0
+    ) {
+        self.outputs = outputs
+        self.inputTokens = inputTokens
+        self.dimensions = dimensions
+        self.modelID = modelID
+        self.elapsedMS = elapsedMS
+    }
+}
+
+/// Protocol for a multimodal embedding backend.
 public protocol EmbeddingEngine: Sendable {
     var modelID: String { get }
     var nativeDimensions: Int { get }
@@ -197,11 +398,33 @@ public protocol EmbeddingEngine: Sendable {
         dimensions: Int?
     ) async throws -> [EmbeddedOutput]
 
+    func embedResult(
+        _ inputs: [EmbeddingInput],
+        dimensions: Int?
+    ) async throws -> EmbeddingResult
+
     /// Releases any loaded CoreML / MLX model weights and memory-mapped token tables.
     func unload() async
 }
 
 public extension EmbeddingEngine {
+    func embedResult(
+        _ inputs: [EmbeddingInput],
+        dimensions: Int? = nil
+    ) async throws -> EmbeddingResult {
+        let start = CFAbsoluteTimeGetCurrent()
+        let outputs = try await embedBatch(inputs, dimensions: dimensions)
+        let elapsedMS = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+        let totalTokens = outputs.compactMap(\.inputTokens).reduce(0, +)
+        return EmbeddingResult(
+            outputs: outputs,
+            inputTokens: totalTokens,
+            dimensions: dimensions ?? nativeDimensions,
+            modelID: modelID,
+            elapsedMS: elapsedMS
+        )
+    }
+
     func unload() async {}
 }
 
@@ -241,6 +464,7 @@ public enum Matryoshka {
 /// Deterministic 768d n-gram / token-hash embedding engine (`EmbeddingEngine`) for fast local
 /// indexing, offline unit testing, and instant Embeddings Studio preview when a full checkpoint
 /// is not yet loaded.
+@available(*, deprecated, message: "Test-only legacy shim; removed in Wave 4")
 public struct DeterministicHashEmbeddingEngine: EmbeddingEngine, Sendable {
     public let modelID: String
     public let nativeDimensions: Int = Matryoshka.gemma2NativeDimensions
@@ -579,9 +803,11 @@ public actor HeylookMLXEngine: EmbeddingEngine {
         let endpoint = baseURL.appendingPathComponent("v1/embeddings")
         let reqID = "heylook-\(UUID().uuidString.lowercased())"
 
-        let wireItems: [[String: Any]] = try inputs.map { item in
+        let wireItems: [[String: Any]] = try inputs.enumerated().map { itemIndex, item in
             let hasText = item.hasNonWhitespaceText
-            let isDocumentWithTitle = hasText
+            let resolvedWindows = try item.resolvedVideoWindows(itemIndex: itemIndex)
+            let isDocumentWithTitle = !item.usesExplicitPromptName
+                && hasText
                 && (item.task == .document || item.task == .retrievalDocument)
                 && (item.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
             var appliedTitlePrefix = false
@@ -606,14 +832,24 @@ public actor HeylookMLXEngine: EmbeddingEngine {
                             "data": rawData.base64EncodedString(),
                         ],
                     ]
-                    if kind == .video && windowSampling != .off {
+                    if kind == .video, let opts = resolvedWindows {
+                        var winPayload: [String: Any] = ["sampling": opts.sampling.rawValue]
+                        if let secs = opts.seconds {
+                            winPayload["seconds"] = secs
+                        }
+                        block["windows"] = winPayload
+                    } else if kind == .video && windowSampling != .off {
                         block["windows"] = ["sampling": windowSampling.rawValue]
                     }
                     return block
                 }
             }
             var entry: [String: Any] = ["content": blocks]
-            if hasText, !appliedTitlePrefix, let promptName = item.task.promptName {
+            if item.usesExplicitPromptName {
+                if let promptName = item.promptName {
+                    entry["prompt_name"] = promptName
+                }
+            } else if hasText, !appliedTitlePrefix, let promptName = item.task.promptName {
                 entry["prompt_name"] = promptName
             }
             return entry
@@ -659,16 +895,23 @@ public actor HeylookMLXEngine: EmbeddingEngine {
                         actual: decoded.data.count
                     )
                 }
-                return decoded.data.sorted(by: { $0.index < $1.index }).map { row in
+                let sortedRows = decoded.data.sorted(by: { $0.index < $1.index })
+                let totalTokens = decoded.input_tokens
+                return sortedRows.enumerated().map { idx, row in
                     let wins = (row.windows ?? []).map {
-                        EmbeddedOutput.WindowVector(
+                        VideoWindowEmbeddingResult(
                             start: $0.start,
                             end: $0.end,
                             frameTimes: $0.frame_times,
                             vector: $0.embedding
                         )
                     }
-                    return EmbeddedOutput(vector: row.embedding, windows: wins)
+                    return EmbeddedOutput(
+                        vector: row.embedding,
+                        windows: wins,
+                        inputTokens: idx == 0 ? totalTokens : 0,
+                        promptName: row.prompt_name
+                    )
                 }
             } catch is CancellationError {
                 await cancelRemoteRequest(id: reqID)
@@ -703,6 +946,7 @@ private struct WireEmbeddingResult: Decodable {
     struct VectorRow: Decodable {
         let index: Int
         let embedding: [Float]
+        let prompt_name: String?
         let windows: [WindowRow]?
     }
 

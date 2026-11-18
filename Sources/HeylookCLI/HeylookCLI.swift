@@ -72,8 +72,7 @@ struct HeylookCLI {
 
     static func makeEmbeddingEngine(computeOptions: ModelComputeOptions) -> any EmbeddingEngine {
         NativeMLXEmbeddingGemma2.makeBestAvailableEngine(
-            computeOptions: computeOptions,
-            allowSyntheticFallback: false
+            computeOptions: computeOptions
         )
     }
 
@@ -91,7 +90,7 @@ struct HeylookCLI {
                 snap.metalRecommendedMaxWorkingSetGB
             )
         )
-        print("Swift Concurrency   : Swift 6.2 Strict Actor Isolation")
+        print("Swift Concurrency   : Swift 6.4 Strict Actor Isolation")
         print("Compute Lanes       : GPU GenerationGate (FIFO) + ANE Co-Residency Lane")
         print("Supported Providers : MLXSwiftProvider, CoreAIProvider (.aimodel), GGUFSubprocessProvider, RemoteHeylookProvider")
         let doctorScheduler = ComputeScheduler()
@@ -291,7 +290,7 @@ struct HeylookCLI {
     static func registerConfiguredModels(into scheduler: ComputeScheduler) async -> [EngineDescription] {
         let cfg = HeylookConfig.loadDefault()
         let found = cfg.discoverConfiguredModels()
-        await scheduler.registerDiscoveredModels(found, allowSyntheticFallback: false)
+        await scheduler.registerDiscoveredModels(found)
         return found
     }
 
@@ -505,10 +504,13 @@ struct HeylookCLI {
     }
 
     static func runEvalLab(args: [String]) async {
-        let syntheticSelfTest = args.contains("--synthetic-self-test")
+        if args.contains("--synthetic-self-test") {
+            print("Error: --synthetic-self-test has been removed under Truthful Runtime; eval-lab runs exclusively against live model weights and compiled ANE .mlmodelc towers.")
+            exit(1)
+        }
         print("=== Heylook Evaluation Lab (chain_probe + vlm_parity_probe + matryoshka_recall_probe) ===")
         do {
-            let report = try await EvalLabSuite.runAll(allowSyntheticSelfTest: syntheticSelfTest)
+            let report = try await CLIEvalLabSuite.runAll()
             for probe in report.probes {
                 let badge = probe.passed ? "PASS" : "FAIL"
                 print("- [\(badge)] \(probe.name.padding(toLength: 24, withPad: " ", startingAt: 0)) : \(probe.detail)")
@@ -658,7 +660,7 @@ struct HeylookCLI {
                     templateSource: ProvenanceField(value: "speech_recognizer", provenance: .derived, effect: .reload),
                     tags: ["asr", "speech"]
                 )
-                let prov = CoreAIProvider(description: adHocDesc, allowSyntheticFallback: false)
+                let prov = CoreAIProvider(description: adHocDesc)
                 await scheduler.register(provider: prov, description: adHocDesc)
                 preferredModelID = adHocDesc.modelID
             }
@@ -698,7 +700,7 @@ struct HeylookCLI {
                                                         Quantize & shard a safetensors LLM/VLM checkpoint in pure Swift
           transcribe <audio-path> [--model <id_or_path>] [--lang <locale>]
                                                         Transcribe WAV/M4A/FLAC speech on the Apple Neural Engine
-          eval-lab [--synthetic-self-test]              Run multi-turn KV chain, VLM parity, and MRL Recall@K probes
+          eval-lab                                      Run multi-turn KV chain, VLM parity, and MRL Recall@K probes
           chat <prompt>                                 Stream a chat completion with thinking traces
           serve [port]                                  Run the embedded /v1/messages & /v1/embeddings server
         """)

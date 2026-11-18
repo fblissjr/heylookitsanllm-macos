@@ -36,15 +36,19 @@ public enum WindowPlanner {
         maxFrames: Int = 32
     ) -> [Int] {
         guard !times.isEmpty, fps > 0, hi > lo else { return [] }
+        let inWindow = times.enumerated().compactMap { i, t in
+            (t >= lo && t < hi) ? i : nil
+        }
+        let searchIndices = inWindow.isEmpty ? Array(times.indices) : inWindow
         let step = 1.0 / fps
         var chosen = Set<Int>()
         var t = lo
         var count = 0
         while t < hi && count < maxFrames {
-            var bestIdx = 0
+            var bestIdx = searchIndices[0]
             var bestDist = Double.infinity
-            for (i, time) in times.enumerated() {
-                let d = abs(time - t)
+            for i in searchIndices {
+                let d = abs(times[i] - t)
                 if d < bestDist {
                     bestDist = d
                     bestIdx = i
@@ -119,6 +123,54 @@ public enum WindowPlanner {
         return chosen.sorted().map { inWindow[$0] }
     }
 
+    /// Returns consecutive `[start, end)` window boundaries across `duration` with non-overlapping stride `windowSeconds`.
+    public static func consecutiveRanges(
+        duration: Double,
+        windowSeconds: Double
+    ) -> [(start: Double, end: Double)] {
+        guard duration > 0, windowSeconds > 0, duration.isFinite, windowSeconds.isFinite else { return [] }
+        var ranges = [(start: Double, end: Double)]()
+        var lo = 0.0
+        while lo < duration - 1e-6 {
+            let hi = min(lo + windowSeconds, duration)
+            ranges.append((start: lo, end: hi))
+            if hi >= duration { break }
+            lo += windowSeconds
+        }
+        return ranges
+    }
+
+    /// Computes frame timestamps sampled uniformly across the full `duration` (never truncated at `maxFrames / fps`),
+    /// matching MLX-VLM `EmbeddingGemma2VideoProcessor.sampledIndices`.
+    public static func uniformSampleTimes(
+        duration: Double,
+        nativeFPS: Double = 30.0,
+        fps: Double = 1.0,
+        maxFrames: Int = 32
+    ) -> [Double] {
+        guard duration > 0, nativeFPS > 0, fps > 0, maxFrames > 0 else { return [] }
+        let frameCount = max(1, Int((duration * nativeFPS).rounded()))
+        let stepFrames = nativeFPS / fps
+        let candidateCount = max(1, Int(Double(frameCount) / nativeFPS * fps))
+        let candidates = (0..<candidateCount).map { min(frameCount - 1, Int(Double($0) * stepFrames)) }
+        let selected: [Int]
+        if candidates.count > maxFrames {
+            let linStep = Double(candidates.count - 1) / Double(max(maxFrames - 1, 1))
+            selected = (0..<maxFrames).map { pos in
+                pos > 0 && pos == maxFrames - 1
+                    ? candidates[candidates.count - 1]
+                    : candidates[Int(Double(pos) * linStep)]
+            }
+        } else {
+            selected = candidates
+        }
+        var seen = Set<Int>()
+        return selected.compactMap { frameIndex -> Double? in
+            guard seen.insert(frameIndex).inserted else { return nil }
+            return (Double(frameIndex) + 0.5) / nativeFPS
+        }
+    }
+
     public static func planWindows(
         times: [Double],
         duration: Double,
@@ -130,10 +182,10 @@ public enum WindowPlanner {
         thumbnails: [[Float]] = []
     ) -> [PlannedWindow] {
         guard sampling != .off, duration > 0, windowSeconds > 0 else { return [] }
-        let stride = max(0.5, strideSeconds ?? (windowSeconds / 2.0))
+        let stride = max(0.5, strideSeconds ?? windowSeconds)
         var out = [PlannedWindow]()
         var lo = 0.0
-        while lo < duration {
+        while lo < duration - 1e-6 {
             let hi = min(lo + windowSeconds, duration)
             let sel: [Int]
             if sampling == .content && !thumbnails.isEmpty {
@@ -166,6 +218,18 @@ public enum ArtifactProcessor {
     public static let audioSampleRate: Int = 16_000
     public static let audioWindowSeconds: Double = 30.0
     public static let audioStrideSeconds: Double = 15.0
+
+    public struct VideoTrackMetadata: Sendable, Equatable {
+        public let startSeconds: Double
+        public let duration: Double
+        public let nativeFPS: Double
+
+        public init(startSeconds: Double, duration: Double, nativeFPS: Double) {
+            self.startSeconds = startSeconds
+            self.duration = duration
+            self.nativeFPS = nativeFPS
+        }
+    }
 
     public struct VideoCandidateSet: Sendable {
         public let duration: Double
@@ -248,48 +312,154 @@ public enum ArtifactProcessor {
         }
     }
 
-    public static func extractVideoCandidates(
-        for videoURL: URL,
-        sampling: VideoWindowSampling = .content,
-        candidateFPS: Double = WindowPlanner.candidateFPS,
-        thumbEdge: Int = 32
-    ) async throws -> VideoCandidateSet {
+    /// Inspects video track timing without decoding any video frames.
+    public static func inspectVideoMetadata(for videoURL: URL) async throws -> VideoTrackMetadata? {
         let asset = AVURLAsset(url: videoURL)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
-            return VideoCandidateSet(duration: 0, times: [], thumbnails: [])
+            return nil
         }
         let (timeRange, nominalFPS) = try await track.load(.timeRange, .nominalFrameRate)
         let startSeconds = max(0, timeRange.start.seconds.isFinite ? timeRange.start.seconds : 0)
         let duration = max(0, timeRange.duration.seconds)
         let nativeFPS = Double(nominalFPS) > 0 ? Double(nominalFPS) : 30.0
-        guard duration > 0 else {
-            return VideoCandidateSet(duration: 0, times: [], thumbnails: [])
-        }
+        guard duration > 0 else { return nil }
+        return VideoTrackMetadata(startSeconds: startSeconds, duration: duration, nativeFPS: nativeFPS)
+    }
 
-        let rate = sampling == .content ? candidateFPS : 1.0
-        let stepFrames = max(1, Int((nativeFPS / rate).rounded()))
-        let totalFrames = max(1, Int((duration * nativeFPS).rounded()))
+    /// Selects and decodes frames for a single `[lo, hi)` window, bounding memory to one window at a time
+    /// instead of decoding the entire video upfront.
+    public static func decodeVideoWindowFrames(
+        for videoURL: URL,
+        metadata: VideoTrackMetadata,
+        lo: Double,
+        hi: Double,
+        sampling: VideoWindowSampling,
+        fps: Double = 1.0,
+        maxFrames: Int = 32,
+        candidateFPS: Double = WindowPlanner.candidateFPS,
+        thumbEdge: Int = 32
+    ) async throws -> [(time: Double, image: CGImage)] {
+        let clampedLo = max(0.0, lo)
+        let clampedHi = min(metadata.duration, hi)
+        guard clampedHi > clampedLo else { return [] }
+
+        let rate = sampling == .content ? candidateFPS : max(fps, 0.1)
+        let stepFrames = max(1, Int((metadata.nativeFPS / rate).rounded()))
+        let startFrame = max(0, Int(floor(clampedLo * metadata.nativeFPS)))
+        let endFrame = max(startFrame + 1, Int(ceil(clampedHi * metadata.nativeFPS)))
+
         var candidateTimes = [Double]()
         var queryCMTimes = [CMTime]()
-        var frameIdx = 0
-        while frameIdx < totalFrames {
-            let logicalTime = Double(frameIdx) / nativeFPS
-            if logicalTime < duration {
+        var frameIdx = startFrame
+        while frameIdx < endFrame {
+            let logicalTime = Double(frameIdx) / metadata.nativeFPS
+            if logicalTime >= clampedLo && logicalTime < clampedHi {
                 candidateTimes.append(logicalTime)
-                let centerSeconds = startSeconds + (Double(frameIdx) + 0.5) / nativeFPS
+                let centerSeconds = metadata.startSeconds + (Double(frameIdx) + 0.5) / metadata.nativeFPS
                 queryCMTimes.append(CMTime(seconds: centerSeconds, preferredTimescale: 90_000))
             }
             frameIdx += stepFrames
         }
         if candidateTimes.isEmpty {
-            candidateTimes = [0.0]
-            queryCMTimes = [CMTime(seconds: startSeconds, preferredTimescale: 90_000)]
+            candidateTimes = [clampedLo]
+            let centerSeconds = metadata.startSeconds + clampedLo + 0.5 / metadata.nativeFPS
+            queryCMTimes = [CMTime(seconds: centerSeconds, preferredTimescale: 90_000)]
         }
 
-        guard sampling == .content else {
-            return VideoCandidateSet(duration: duration, times: candidateTimes, thumbnails: [])
+        let selectedTimes: [Double]
+        if sampling == .content {
+            let asset = AVURLAsset(url: videoURL)
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: thumbEdge * 2, height: thumbEdge * 2)
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+
+            var decodedTimes = [Double]()
+            var thumbnails = [[Float]]()
+            var idx = 0
+            for await result in generator.images(for: queryCMTimes) {
+                try Task.checkCancellation()
+                let logicalTime = idx < candidateTimes.count ? candidateTimes[idx] : clampedLo
+                idx += 1
+                if case let .success(_, cgImage, _) = result {
+                    decodedTimes.append((logicalTime * 1000).rounded() / 1000)
+                    thumbnails.append(rasterizeRGBThumb(cgImage, edge: thumbEdge))
+                }
+            }
+            let picked = WindowPlanner.pickContent(
+                thumbnails: thumbnails,
+                times: decodedTimes,
+                lo: clampedLo,
+                hi: clampedHi,
+                fps: fps,
+                maxFrames: maxFrames
+            )
+            selectedTimes = picked.map { decodedTimes[$0] }
+        } else {
+            let picked = WindowPlanner.pickFPS(
+                times: candidateTimes,
+                lo: clampedLo,
+                hi: clampedHi,
+                fps: fps,
+                maxFrames: maxFrames
+            )
+            selectedTimes = picked.map { candidateTimes[$0] }
         }
 
+        guard !selectedTimes.isEmpty else { return [] }
+        return try await decodeVideoFrames(
+            for: videoURL,
+            at: selectedTimes,
+            startOffsetSeconds: metadata.startSeconds
+        )
+    }
+
+    public static func extractVideoCandidates(
+        for videoURL: URL,
+        sampling: VideoWindowSampling = .content,
+        candidateFPS: Double = WindowPlanner.candidateFPS,
+        thumbEdge: Int = 32,
+        windowStart: Double? = nil,
+        windowEnd: Double? = nil
+    ) async throws -> VideoCandidateSet {
+        guard let metadata = try await inspectVideoMetadata(for: videoURL) else {
+            return VideoCandidateSet(duration: 0, times: [], thumbnails: [])
+        }
+        let lo = max(0.0, windowStart ?? 0.0)
+        let hi = min(metadata.duration, windowEnd ?? metadata.duration)
+        guard hi > lo else {
+            return VideoCandidateSet(duration: metadata.duration, times: [], thumbnails: [])
+        }
+
+        let rate = sampling == .content ? candidateFPS : 1.0
+        let stepFrames = max(1, Int((metadata.nativeFPS / rate).rounded()))
+        let startFrame = max(0, Int(floor(lo * metadata.nativeFPS)))
+        let endFrame = max(startFrame + 1, Int(ceil(hi * metadata.nativeFPS)))
+        var candidateTimes = [Double]()
+        var queryCMTimes = [CMTime]()
+        var frameIdx = startFrame
+        while frameIdx < endFrame {
+            let logicalTime = Double(frameIdx) / metadata.nativeFPS
+            if logicalTime >= lo && logicalTime < hi {
+                candidateTimes.append(logicalTime)
+                let centerSeconds = metadata.startSeconds + (Double(frameIdx) + 0.5) / metadata.nativeFPS
+                queryCMTimes.append(CMTime(seconds: centerSeconds, preferredTimescale: 90_000))
+            }
+            frameIdx += stepFrames
+        }
+        if candidateTimes.isEmpty {
+            candidateTimes = [lo]
+            queryCMTimes = [CMTime(seconds: metadata.startSeconds + lo, preferredTimescale: 90_000)]
+        }
+
+        // Only decode thumbnails when a specific `[windowStart, windowEnd)` window is requested;
+        // whole-video planning never decodes all frames upfront.
+        guard sampling == .content, (windowStart != nil || windowEnd != nil) else {
+            return VideoCandidateSet(duration: metadata.duration, times: candidateTimes, thumbnails: [])
+        }
+
+        let asset = AVURLAsset(url: videoURL)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: thumbEdge * 2, height: thumbEdge * 2)
@@ -300,19 +470,21 @@ public enum ArtifactProcessor {
         var thumbnails = [[Float]]()
         var idx = 0
         for await result in generator.images(for: queryCMTimes) {
-            let logicalTime = idx < candidateTimes.count ? candidateTimes[idx] : 0.0
+            try Task.checkCancellation()
+            let logicalTime = idx < candidateTimes.count ? candidateTimes[idx] : lo
             idx += 1
             if case let .success(_, cgImage, _) = result {
                 decodedTimes.append((logicalTime * 1000).rounded() / 1000)
                 thumbnails.append(rasterizeRGBThumb(cgImage, edge: thumbEdge))
             }
         }
-        return VideoCandidateSet(duration: duration, times: decodedTimes, thumbnails: thumbnails)
+        return VideoCandidateSet(duration: metadata.duration, times: decodedTimes, thumbnails: thumbnails)
     }
 
     public static func decodeVideoFrames(
         for videoURL: URL,
-        at times: [Double]
+        at times: [Double],
+        startOffsetSeconds: Double = 0.0
     ) async throws -> [(time: Double, image: CGImage)] {
         guard !times.isEmpty else { return [] }
         let asset = AVURLAsset(url: videoURL)
@@ -321,11 +493,14 @@ public enum ArtifactProcessor {
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
 
-        let cmTimes = times.map { CMTime(seconds: $0, preferredTimescale: 90_000) }
+        let cmTimes = times.map { CMTime(seconds: startOffsetSeconds + $0, preferredTimescale: 90_000) }
         var out = [(Double, CGImage)]()
+        var idx = 0
         for await result in generator.images(for: cmTimes) {
-            if case let .success(requested, cgImage, _) = result {
-                out.append((max(0, requested.seconds), cgImage))
+            let logicalTime = idx < times.count ? times[idx] : 0.0
+            idx += 1
+            if case let .success(_, cgImage, _) = result {
+                out.append((max(0, (logicalTime * 1000).rounded() / 1000), cgImage))
             }
         }
         return out

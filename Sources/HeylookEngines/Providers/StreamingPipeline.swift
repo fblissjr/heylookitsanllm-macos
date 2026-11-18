@@ -8,13 +8,14 @@ public enum ProviderFactory {
         allowSyntheticFallback: Bool = false,
         remoteBaseURL: URL = URL(string: "http://127.0.0.1:8000")!
     ) -> any InferenceProvider {
+        _ = allowSyntheticFallback
         switch description.provider {
         case .mlx:
-            return MLXSwiftProvider(description: description, allowSyntheticFallback: allowSyntheticFallback)
+            return MLXSwiftProvider(description: description)
         case .coreai:
-            return CoreAIProvider(description: description, allowSyntheticFallback: allowSyntheticFallback)
+            return CoreAIProvider(description: description)
         case .gguf:
-            return GGUFSubprocessProvider(description: description, allowSyntheticFallback: allowSyntheticFallback)
+            return GGUFSubprocessProvider(description: description)
         case .remote:
             let resolvedURL = URL(string: description.modelPath) ?? remoteBaseURL
             return RemoteHeylookProvider(baseURL: resolvedURL, description: description)
@@ -23,7 +24,7 @@ public enum ProviderFactory {
 }
 
 /// Multi-chunk holdback filter matching `stop_sequences` across arbitrary token boundaries.
-/// Never emits a matched stop sequence or partial prefix until disambiguated.
+/// Applied strictly to visible assistant content (`delta.text`), never to `<think>` reasoning text.
 public struct StopSequenceFilter: Sendable {
     public let stopSequences: [String]
     private var pending: String = ""
@@ -50,7 +51,6 @@ public struct StopSequenceFilter: Sendable {
 
         pending.append(chunk)
 
-        // 1. Check for full stop sequence match (earliest match wins; longest wins on tie).
         var earliestRange: Range<String.Index>?
         var earliestStop: String?
         for stop in stopSequences {
@@ -75,7 +75,6 @@ public struct StopSequenceFilter: Sendable {
             return (safePrefix, stop)
         }
 
-        // 2. Hold back the longest suffix of `pending` that is a proper prefix of any stop sequence.
         var holdbackCount = 0
         for stop in stopSequences {
             let maxCheck = min(pending.count, stop.count - 1)
@@ -98,6 +97,7 @@ public struct StopSequenceFilter: Sendable {
         guard emitCount > 0 else {
             return ("", nil)
         }
+
         let splitIdx = pending.index(pending.startIndex, offsetBy: emitCount)
         let emitted = String(pending[..<splitIdx])
         pending = String(pending[splitIdx...])
@@ -116,18 +116,22 @@ public struct StopSequenceFilter: Sendable {
     }
 }
 
-/// Deterministic conversation prefix-cache state machine tracking system prompt, message turn
-/// prefixes, and exact post-template token IDs to produce truthful `CacheReport` telemetry
-/// (`cold`, `reused`, `system_changed`, `history_diverged`) and branch-edit KV truncation counts.
+/// Truthful conversation prefix-cache state machine tracking system prompt, message turn
+/// prefixes, and exact post-template token IDs.
+/// Never synthesizes fake word-multiplier token counts (`words * 2` removed): when no real
+/// `tokenCounter` or token ID array is available, structural outcomes (`cold`, `reused`,
+/// `system_changed`, `history_diverged`) are still tracked while token counts stay truthfully `0`.
 public struct PrefixCacheTracker: Sendable {
     public struct TurnEntry: Sendable, Equatable {
         public let role: String
         public let content: String
+        public let thinking: String?
         public let tokenCount: Int
 
-        public init(role: String, content: String, tokenCount: Int) {
+        public init(role: String, content: String, thinking: String? = nil, tokenCount: Int) {
             self.role = role
             self.content = content
+            self.thinking = thinking
             self.tokenCount = tokenCount
         }
     }
@@ -149,7 +153,6 @@ public struct PrefixCacheTracker: Sendable {
         cachedTurns.count
     }
 
-    /// Resets all cached prefix state when a model is unloaded, evicted, or cleared.
     public mutating func reset() {
         hasEvaluated = false
         cachedSystemPrompt = nil
@@ -159,15 +162,8 @@ public struct PrefixCacheTracker: Sendable {
         branchTruncationsCount = 0
     }
 
-    public static func estimateTokens(for text: String) -> Int {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return 0 }
-        let words = trimmed.split(whereSeparator: \.isWhitespace).count
-        return max(2, words * 2)
-    }
-
     /// Evaluates exact post-template token ID prefix overlap against `cachedTokenIDs`.
-    /// Always leaves at least 1 token to feed into `generate()` so logits are produced.
+    /// Always leaves at least 1 token to feed so logits are produced.
     public mutating func evaluateTokenIDs(_ promptTokenIDs: [Int]) -> (commonPrefixCount: Int, truncatedTrailingCount: Int) {
         guard !cachedTokenIDs.isEmpty, !promptTokenIDs.isEmpty else {
             cachedTokenIDs = promptTokenIDs
@@ -191,25 +187,24 @@ public struct PrefixCacheTracker: Sendable {
         cachedTokenIDs.append(contentsOf: tokenIDs)
     }
 
-    /// Evaluates how much of `system` + `messages` reuses the cached KV prefix and updates
-    /// the tracker state for subsequent turns. Accepts an optional `tokenCounter` closure for
-    /// exact tokenizer-backed counts.
     public mutating func evaluate(
         system: String?,
         messages: [MessagesRequest.MessageTurn],
         tokenCounter: ((String) -> Int)? = nil
     ) -> CacheReport {
-        let countFn = tokenCounter ?? Self.estimateTokens(for:)
+        let countFn: (String) -> Int = tokenCounter ?? { _ in 0 }
         let normalizedSystem = (system?.isEmpty == true) ? nil : system
         let sysTokens = normalizedSystem.map(countFn) ?? 0
         let turnEntries = messages.map { turn in
-            TurnEntry(
+            let combined = (turn.thinking.map { "\($0)\n" } ?? "") + turn.content
+            return TurnEntry(
                 role: turn.role,
                 content: turn.content,
-                tokenCount: max(2, countFn(turn.content))
+                thinking: turn.thinking,
+                tokenCount: tokenCounter == nil ? 0 : max(1, countFn(combined))
             )
         }
-        let totalPromptTokens = max(4, sysTokens + turnEntries.reduce(0) { $0 + $1.tokenCount })
+        let totalPromptTokens = sysTokens + turnEntries.reduce(0) { $0 + $1.tokenCount }
 
         if !hasEvaluated {
             hasEvaluated = true
@@ -244,13 +239,14 @@ public struct PrefixCacheTracker: Sendable {
             if let firstNew = turnEntries.first,
                let firstCached = cachedTurns.first,
                firstNew.role == firstCached.role,
-               firstNew.content == firstCached.content {
-                let reused = min(totalPromptTokens - 1, sysTokens + firstCached.tokenCount)
+               firstNew.content == firstCached.content,
+               firstNew.thinking == firstCached.thinking {
+                let reused = totalPromptTokens > 1 ? min(totalPromptTokens - 1, sysTokens + firstCached.tokenCount) : 0
                 cachedTurns = turnEntries
                 return CacheReport(
                     promptTokens: totalPromptTokens,
-                    cachedTokens: max(1, reused),
-                    processedTokens: max(1, totalPromptTokens - max(1, reused)),
+                    cachedTokens: reused,
+                    processedTokens: max(0, totalPromptTokens - reused),
                     outcome: .reused,
                     cause: nil
                 )
@@ -271,7 +267,8 @@ public struct PrefixCacheTracker: Sendable {
         let checkLimit = min(priorTurns.count, cachedTurns.count)
         for idx in 0..<checkLimit {
             if priorTurns[idx].role == cachedTurns[idx].role,
-               priorTurns[idx].content == cachedTurns[idx].content {
+               priorTurns[idx].content == cachedTurns[idx].content,
+               priorTurns[idx].thinking == cachedTurns[idx].thinking {
                 matchedTurnCount += 1
                 matchedTurnTokens += priorTurns[idx].tokenCount
             } else {
@@ -305,8 +302,10 @@ public struct PrefixCacheTracker: Sendable {
             )
         }
 
-        let cachedCount = min(max(1, totalPromptTokens - 1), sysTokens + matchedTurnTokens)
-        let processedCount = max(1, totalPromptTokens - cachedCount)
+        let cachedCount = totalPromptTokens > 1
+            ? min(totalPromptTokens - 1, sysTokens + matchedTurnTokens)
+            : 0
+        let processedCount = max(0, totalPromptTokens - cachedCount)
         return CacheReport(
             promptTokens: totalPromptTokens,
             cachedTokens: cachedCount,
@@ -316,34 +315,34 @@ public struct PrefixCacheTracker: Sendable {
         )
     }
 
-    /// Appends the completed assistant reply to the cached turn prefix so the next turn
-    /// matches both the user and assistant turns.
-    public mutating func recordAssistantReply(
-        _ content: String,
-        tokenCounter: ((String) -> Int)? = nil
-    ) {
-        guard hasEvaluated, !content.isEmpty else { return }
-        let countFn = tokenCounter ?? Self.estimateTokens(for:)
-        cachedTurns.append(
-            TurnEntry(
+    public mutating func recordAssistantReply(_ reply: String, thinking: String? = nil, tokenCounter: ((String) -> Int)? = nil) {
+        let count: Int
+        if let tokenCounter, !reply.isEmpty || !(thinking?.isEmpty ?? true) {
+            let combined = (thinking.map { "\($0)\n" } ?? "") + reply
+            count = max(1, tokenCounter(combined))
+        } else {
+            count = 0
+        }
+        if cachedTurns.last?.role == "assistant" {
+            cachedTurns[cachedTurns.count - 1] = TurnEntry(
                 role: "assistant",
-                content: content,
-                tokenCount: max(2, countFn(content))
+                content: reply,
+                thinking: thinking,
+                tokenCount: count
             )
-        )
+        } else {
+            cachedTurns.append(TurnEntry(role: "assistant", content: reply, thinking: thinking, tokenCount: count))
+        }
     }
 }
 
-/// Raw stream event emitted by a provider backend (`MLXLMCommon`, `CoreAIRunner`, `llama-server` SSE,
-/// or synthetic test fixture) into `StreamingPipeline.transformEventStream`.
+/// Unified streaming token/telemetry events pushed by every concrete inference engine.
 public enum ProviderStreamEvent: Sendable {
-    /// Unsplit token string to be parsed through `ReasoningParser` and scrubbed by `StripSpecials`.
+    case progress(processed: Int, total: Int)
     case rawToken(String)
-    /// Pre-split reasoning token (e.g. from `llama-server` `delta.reasoning_content` or `MLXLMCommon.Generation.reasoning`).
     case splitReasoning(String)
-    /// Pre-split visible text token (when upstream already separated `reasoning_content`), scrubbed only by `StripSpecials`.
     case splitContent(String)
-    /// Runtime-observed token counts and throughput telemetry.
+    case cacheDetail(promptTokens: Int, cachedTokens: Int, outcome: CacheOutcome, cause: String?)
     case telemetry(
         promptTokens: Int? = nil,
         cachedTokens: Int? = nil,
@@ -356,7 +355,7 @@ public enum ProviderStreamEvent: Sendable {
 /// Single canonical token-streaming state machine shared by `MLXSwiftProvider`, `CoreAIProvider`,
 /// and `GGUFSubprocessProvider`. Centralizes immediate `RequestRegistry` cancellation,
 /// `ReasoningParser` state transitions (`forceEndReasoning()`, `thinkingBudget`), `StripSpecials`,
-/// multi-chunk `StopSequenceFilter`, and `CacheReport` / `SpeculativeReport` / phase timing assembly.
+/// multi-chunk `StopSequenceFilter`, prefill progress delivery, and `CacheReport` / `SpeculativeReport` assembly.
 public enum StreamingPipeline {
     public static func transformEventStream(
         requestID: String,
@@ -371,6 +370,7 @@ public enum StreamingPipeline {
         thinkingBudget: Int? = nil,
         computePlacement: ComputePlacement,
         registry: RequestRegistry,
+        onProgress: (@Sendable (Int, Int) async -> Void)? = nil,
         onReasoningEndHook: (@Sendable () async -> Void)? = nil,
         onAbortHook: (@Sendable () async -> Void)? = nil,
         onComplete: (@Sendable (String) async -> Void)? = nil,
@@ -392,6 +392,7 @@ public enum StreamingPipeline {
             }
         }
         let producerBox = ProducerTaskBox()
+        let capturedProgressSink = onProgress ?? PrefillProgressBridge.current
 
         let events = AsyncThrowingStream<ProviderStreamEvent, Error> { eventCont in
             let pTask = Task {
@@ -412,7 +413,6 @@ public enum StreamingPipeline {
             }
         }
 
-        // Register synchronous abort handler so `DELETE /v1/requests/{id}` cancels prefill / HTTP reads immediately
         registry.addCancelHandler(for: requestID) {
             producerBox.cancel()
             if let onAbortHook {
@@ -442,6 +442,8 @@ public enum StreamingPipeline {
                 var accumulatedVisibleText = ""
                 var promptTokens = cacheReport.promptTokens
                 var cachedTokens = cacheReport.cachedTokens
+                var observedCacheOutcome = cacheReport.outcome
+                var observedCacheCause = cacheReport.cause
                 var sawObservedCache = false
                 var promptTPS = 0.0
                 var generationTPS = 0.0
@@ -507,6 +509,15 @@ public enum StreamingPipeline {
                             let cleanText = filteredTail + flushedStop
                             accumulatedVisibleText.append(cleanText)
                             let timings = buildTimingMetrics()
+                            let resolvedCache = sawObservedCache
+                                ? CacheReport(
+                                    promptTokens: promptTokens,
+                                    cachedTokens: cachedTokens,
+                                    processedTokens: max(0, promptTokens - cachedTokens),
+                                    outcome: observedCacheOutcome,
+                                    cause: observedCacheOutcome == .reused ? nil : observedCacheCause
+                                )
+                                : cacheReport
                             continuation.yield(
                                 GenerationChunk(
                                     text: cleanText,
@@ -523,7 +534,7 @@ public enum StreamingPipeline {
                                     generationDurationMs: timings.genDur,
                                     peakMemoryGB: memGB,
                                     stopReason: .cancelled,
-                                    cacheReport: cacheReport,
+                                    cacheReport: resolvedCache,
                                     speculativeReport: observedSpecReport,
                                     activeComputePlacement: computePlacement
                                 )
@@ -576,6 +587,11 @@ public enum StreamingPipeline {
                         }
 
                         switch event {
+                        case let .progress(processed, total):
+                            if let capturedProgressSink, total > 0 {
+                                await capturedProgressSink(max(0, processed), total)
+                            }
+
                         case .rawToken(let rawTok):
                             generatedCount += 1
                             let delta = reasoningParser.feed(rawTok)
@@ -613,8 +629,6 @@ public enum StreamingPipeline {
 
                         case .splitReasoning(let thinkTok):
                             if reasoningParser.reasoningEndedForced {
-                                // Suppress buffered upstream reasoning chunks after forced reasoning end
-                                // so internal chain-of-thought never leaks into visible assistant output.
                                 continue
                             }
                             generatedCount += 1
@@ -668,10 +682,19 @@ public enum StreamingPipeline {
                                 break streamLoop
                             }
 
+                        case let .cacheDetail(pTok, cTok, outcome, cause):
+                            promptTokens = pTok
+                            cachedTokens = cTok
+                            observedCacheOutcome = outcome
+                            observedCacheCause = cause
+                            sawObservedCache = true
+
                         case let .telemetry(pTok, cTok, pTPS, gTPS, spec):
                             if let pTok { promptTokens = pTok }
                             if let cTok {
                                 cachedTokens = cTok
+                                observedCacheOutcome = cTok > 0 ? .reused : .miss
+                                if cTok > 0 { observedCacheCause = nil }
                                 sawObservedCache = true
                             }
                             if let pTPS { promptTPS = pTPS }
@@ -686,7 +709,6 @@ public enum StreamingPipeline {
                         }
                     }
 
-                    // Check once more if abort raced with producer stream completion
                     if registry.state(for: requestID).isAborted || Task.isCancelled {
                         finalStopReason = .cancelled
                     }
@@ -714,8 +736,8 @@ public enum StreamingPipeline {
                             promptTokens: promptTokens,
                             cachedTokens: cachedTokens,
                             processedTokens: max(0, promptTokens - cachedTokens),
-                            outcome: cachedTokens > 0 ? .reused : .miss,
-                            cause: cachedTokens > 0 ? nil : cacheReport.cause
+                            outcome: observedCacheOutcome,
+                            cause: observedCacheOutcome == .reused ? nil : observedCacheCause
                         )
                         : cacheReport
                     let timings = buildTimingMetrics()
@@ -750,44 +772,6 @@ public enum StreamingPipeline {
             continuation.onTermination = { _ in
                 producerBox.cancel()
                 consumerTask.cancel()
-            }
-        }
-    }
-
-    public static func runTokenStream(
-        requestID: String,
-        rawTokens: [String],
-        cacheReport: CacheReport,
-        speculativeReport: SpeculativeReport? = nil,
-        startsInThinking: Bool,
-        reasoningFormat: ReasoningFormat? = nil,
-        thinkingEnabled: Bool = true,
-        strippableSpecialTokens: [String]? = nil,
-        stopSequences: [String] = [],
-        maxTokens: Int? = nil,
-        thinkingBudget: Int? = nil,
-        computePlacement: ComputePlacement,
-        registry: RequestRegistry,
-        onComplete: (@Sendable (String) async -> Void)? = nil
-    ) -> AsyncThrowingStream<GenerationChunk, Error> {
-        transformEventStream(
-            requestID: requestID,
-            cacheReport: cacheReport,
-            defaultSpeculativeReport: speculativeReport,
-            startsInThinking: startsInThinking,
-            reasoningFormat: reasoningFormat,
-            thinkingEnabled: thinkingEnabled,
-            strippableSpecialTokens: strippableSpecialTokens,
-            stopSequences: stopSequences,
-            maxTokens: maxTokens,
-            thinkingBudget: thinkingBudget,
-            computePlacement: computePlacement,
-            registry: registry,
-            onComplete: onComplete
-        ) { eventCont in
-            for tok in rawTokens {
-                try Task.checkCancellation()
-                eventCont.yield(.rawToken(tok))
             }
         }
     }

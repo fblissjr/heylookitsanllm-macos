@@ -1,10 +1,8 @@
 import Foundation
 import HeylookCore
 
-/// Remote HTTP/SSE client provider allowing the native `iOS 27.2+` app (or secondary Mac)
-/// to stream inference over LAN/Tailscale from a Mac Studio `HeylookServer` via `/v1/messages`,
-/// `/v1/conversations/{id}/generate`, `POST /v1/requests/{id}/reasoning-end`,
-/// and `DELETE /v1/requests/{id}`.
+/// Tier 4 Provider: Remote HTTP peer (`HeylookServer` over LAN / Tailscale) proxying `/v1/messages`,
+/// `heylook_progress` SSE events, `/v1/models` `EngineContract` projection, and remote abort / reasoning-end.
 public actor RemoteHeylookProvider: InferenceProvider {
     public struct ParsedSSEEvent: Sendable, Equatable {
         public let textDelta: String
@@ -12,6 +10,8 @@ public actor RemoteHeylookProvider: InferenceProvider {
         public let stopReason: StopReason?
         public let outputTokens: Int?
         public let performance: MessagesResponse.PerformanceExtension?
+        public let progressProcessed: Int?
+        public let progressTotal: Int?
         public let errorMessage: String?
 
         public init(
@@ -20,6 +20,8 @@ public actor RemoteHeylookProvider: InferenceProvider {
             stopReason: StopReason? = nil,
             outputTokens: Int? = nil,
             performance: MessagesResponse.PerformanceExtension? = nil,
+            progressProcessed: Int? = nil,
+            progressTotal: Int? = nil,
             errorMessage: String? = nil
         ) {
             self.textDelta = textDelta
@@ -27,6 +29,8 @@ public actor RemoteHeylookProvider: InferenceProvider {
             self.stopReason = stopReason
             self.outputTokens = outputTokens
             self.performance = performance
+            self.progressProcessed = progressProcessed
+            self.progressTotal = progressTotal
             self.errorMessage = errorMessage
         }
     }
@@ -34,8 +38,9 @@ public actor RemoteHeylookProvider: InferenceProvider {
     public nonisolated let modelID: String
     public nonisolated let providerKind: EngineProviderKind = .remote
     public nonisolated let baseURL: URL
-    private let session: URLSession
     private var descriptionState: EngineDescription
+    private var observedContract: EngineContract?
+    private let session: URLSession
 
     public init(
         baseURL: URL,
@@ -50,6 +55,17 @@ public actor RemoteHeylookProvider: InferenceProvider {
 
     public func describe() async -> EngineDescription {
         descriptionState
+    }
+
+    public func observedContractState() async -> ObservedContractState {
+        ObservedContractState(
+            runningContextLength: observedContract?.context.running.value ?? (descriptionState.isLoaded ? descriptionState.contextSize.value : nil),
+            loadedTemplateText: nil,
+            runtimeCaps: observedContract?.template.caps.value,
+            speculativeInForce: observedContract?.speculative.inForce.value,
+            isPrefixCacheWarm: false,
+            contextUsed: nil
+        )
     }
 
     public func preload() async throws {
@@ -67,7 +83,13 @@ public actor RemoteHeylookProvider: InferenceProvider {
                 detail: "Remote load HTTP \(http.statusCode)\(msg.isEmpty ? "" : ": \(msg)")"
             )
         }
-        if let decoded = try? JSONDecoder().decode(EngineDescription.self, from: data) {
+        if let decodedAdmin = try? JSONDecoder().decode(AdminModelWireRow.self, from: data) {
+            observedContract = decodedAdmin.engine
+            descriptionState = Self.applyContract(decodedAdmin.engine, onto: descriptionState, loaded: decodedAdmin.loaded)
+        } else if let decodedRow = try? JSONDecoder().decode(PublicModelWireRow.self, from: data) {
+            observedContract = decodedRow.engine
+            descriptionState = Self.applyContract(decodedRow.engine, onto: descriptionState, loaded: true)
+        } else if let decoded = try? JSONDecoder().decode(EngineDescription.self, from: data) {
             descriptionState = decoded
         } else {
             descriptionState.isLoaded = true
@@ -85,7 +107,8 @@ public actor RemoteHeylookProvider: InferenceProvider {
         _ = try? await session.data(for: req)
     }
 
-    /// Queries `GET /v1/models` on a remote `HeylookServer` peer.
+    /// Queries `GET /v1/models` on a remote `HeylookServer` peer, decoding full `PublicModelWireRow` +
+    /// `EngineContract` fields when exposed, or direct `EngineDescription` envelopes.
     public static func fetchRemoteModels(
         from baseURL: URL,
         session: URLSession = .shared
@@ -98,6 +121,40 @@ public actor RemoteHeylookProvider: InferenceProvider {
                 detail: "Remote /v1/models returned HTTP \(http.statusCode)"
             )
         }
+        struct AdminWireEnvelope: Decodable {
+            let data: [AdminModelWireRow]
+        }
+        if let adminEnv = try? JSONDecoder().decode(AdminWireEnvelope.self, from: data) {
+            return adminEnv.data.map { row in
+                descriptionFromContract(
+                    id: row.id,
+                    baseURL: baseURL,
+                    modalities: row.engine.embedding?.modalities ?? [],
+                    capabilities: row.capabilities,
+                    thinkingDefault: row.thinkingDefault,
+                    tags: row.tags,
+                    loaded: row.loaded,
+                    contract: row.engine
+                )
+            }
+        }
+        struct PublicWireEnvelope: Decodable {
+            let data: [PublicModelWireRow]
+        }
+        if let wireEnv = try? JSONDecoder().decode(PublicWireEnvelope.self, from: data) {
+            return wireEnv.data.map { row in
+                descriptionFromContract(
+                    id: row.id,
+                    baseURL: baseURL,
+                    modalities: row.modalities,
+                    capabilities: row.capabilities,
+                    thinkingDefault: row.thinkingDefault,
+                    tags: [],
+                    loaded: false,
+                    contract: row.engine
+                )
+            }
+        }
         struct ModelsEnvelope: Decodable {
             let data: [EngineDescription]
         }
@@ -107,7 +164,147 @@ public actor RemoteHeylookProvider: InferenceProvider {
         return try JSONDecoder().decode([EngineDescription].self, from: data)
     }
 
-    /// Parses an Anthropic Messages SSE `(event, data)` frame emitted by `HeylookServer`.
+    private static func descriptionFromContract(
+        id: String,
+        baseURL: URL,
+        modalities: [String],
+        capabilities: [String],
+        thinkingDefault: Bool,
+        tags: [String],
+        loaded: Bool,
+        contract: EngineContract
+    ) -> EngineDescription {
+        let base = EngineDescription(
+            modelID: id,
+            provider: .remote,
+            modelPath: baseURL.absoluteString,
+            architecture: ProvenanceField(
+                value: contract.runtime.value ?? "remote",
+                provenance: contract.runtime.provenance,
+                effect: .reload
+            ),
+            quantization: ProvenanceField(
+                value: "remote",
+                provenance: .observed,
+                effect: .reload
+            ),
+            computePlacement: ProvenanceField(
+                value: .remote,
+                provenance: .observed,
+                effect: .reload,
+                computePlacement: .remote
+            ),
+            isPinned: false,
+            isLoaded: loaded,
+            contextSize: ProvenanceField(
+                value: contract.context.running.value ?? contract.context.length.value ?? 8192,
+                provenance: contract.context.length.provenance,
+                effect: .reload
+            ),
+            flashAttention: ProvenanceField(value: false, provenance: .notApplicable, effect: .reload),
+            supportsVision: ProvenanceField(
+                value: modalities.contains("vision") || capabilities.contains("vision"),
+                provenance: .observed,
+                effect: .reload
+            ),
+            supportsAudio: ProvenanceField(
+                value: modalities.contains("audio") || capabilities.contains("audio"),
+                provenance: .observed,
+                effect: .reload
+            ),
+            supportsEmbeddings: ProvenanceField(
+                value: contract.embedding != nil || capabilities.contains("embeddings"),
+                provenance: .observed,
+                effect: .reload
+            ),
+            supportsThinking: ProvenanceField(
+                value: contract.thinking != nil || thinkingDefault || capabilities.contains("thinking"),
+                provenance: .observed,
+                effect: .perRequest
+            ),
+            thinkingBudget: ProvenanceField(value: nil, provenance: .observed, effect: .perRequest),
+            reasoningFormat: ProvenanceField(
+                value: contract.thinking != nil ? "tag_pair" : "none",
+                provenance: .observed,
+                effect: .reload
+            ),
+            thinkingControls: nil,
+            templateSource: ProvenanceField(
+                value: contract.template.origin.value ?? "remote",
+                provenance: contract.template.origin.provenance,
+                effect: .reload
+            ),
+            speculativeDrafter: ProvenanceField(
+                value: contract.speculative.drafter.value,
+                provenance: contract.speculative.drafter.provenance,
+                effect: .reload
+            ),
+            estimatedMemoryMB: 0,
+            tags: tags
+        )
+        return applyContract(contract, onto: base, loaded: loaded)
+    }
+
+    private static func applyContract(
+        _ contract: EngineContract?,
+        onto base: EngineDescription,
+        loaded: Bool
+    ) -> EngineDescription {
+        guard let contract else {
+            var copy = base
+            copy.isLoaded = loaded
+            return copy
+        }
+        return EngineDescription(
+            modelID: base.modelID,
+            provider: base.provider,
+            modelPath: base.modelPath,
+            architecture: ProvenanceField(
+                value: contract.runtime.value ?? base.architecture.value,
+                provenance: contract.runtime.provenance,
+                effect: .reload
+            ),
+            quantization: base.quantization,
+            computePlacement: base.computePlacement,
+            isPinned: base.isPinned,
+            isLoaded: loaded,
+            contextSize: ProvenanceField(
+                value: contract.context.running.value ?? contract.context.length.value ?? base.contextSize.value,
+                provenance: contract.context.length.provenance,
+                effect: .reload
+            ),
+            flashAttention: base.flashAttention,
+            supportsVision: base.supportsVision,
+            supportsAudio: base.supportsAudio,
+            supportsEmbeddings: ProvenanceField(
+                value: contract.embedding != nil || base.supportsEmbeddings.value,
+                provenance: .observed,
+                effect: .reload
+            ),
+            supportsThinking: ProvenanceField(
+                value: contract.thinking != nil || base.supportsThinking.value,
+                provenance: contract.thinking != nil ? .observed : base.supportsThinking.provenance,
+                effect: .perRequest
+            ),
+            thinkingBudget: base.thinkingBudget,
+            reasoningFormat: base.reasoningFormat,
+            thinkingControls: base.thinkingControls,
+            templateSource: ProvenanceField(
+                value: contract.template.origin.value ?? base.templateSource.value,
+                provenance: contract.template.origin.provenance,
+                effect: .reload
+            ),
+            speculativeDrafter: ProvenanceField(
+                value: contract.speculative.drafter.value ?? base.speculativeDrafter.value,
+                provenance: contract.speculative.drafter.provenance,
+                effect: .reload
+            ),
+            estimatedMemoryMB: base.estimatedMemoryMB,
+            tags: base.tags
+        )
+    }
+
+    /// Parses an Anthropic Messages SSE `(event, data)` frame (plus `heylook_progress`) emitted by `HeylookServer`.
     public static func parseAnthropicSSEEvent(event: String, data: String) -> ParsedSSEEvent? {
         guard let payload = data.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: payload) as? [String: Any]
@@ -122,6 +319,20 @@ public actor RemoteHeylookProvider: InferenceProvider {
                 return ParsedSSEEvent(errorMessage: msg)
             }
             return ParsedSSEEvent(errorMessage: (json["message"] as? String) ?? "Remote SSE stream error")
+
+        case "heylook_progress":
+            if let prefill = json["prefill"] as? [String: Any],
+               let processed = prefill["processed"] as? Int,
+               let total = prefill["total"] as? Int,
+               total > 0 {
+                return ParsedSSEEvent(progressProcessed: max(0, processed), progressTotal: total)
+            }
+            if let processed = json["processed"] as? Int,
+               let total = json["total"] as? Int,
+               total > 0 {
+                return ParsedSSEEvent(progressProcessed: max(0, processed), progressTotal: total)
+            }
+            return nil
 
         case "content_block_delta":
             guard let delta = json["delta"] as? [String: Any],
@@ -151,12 +362,20 @@ public actor RemoteHeylookProvider: InferenceProvider {
                 performance: perf
             )
 
+        case "message_stop":
+            guard let perfDict = json["performance"],
+                  let perfData = try? JSONSerialization.data(withJSONObject: perfDict),
+                  let perf = try? JSONDecoder().decode(MessagesResponse.PerformanceExtension.self, from: perfData)
+            else {
+                return nil
+            }
+            return ParsedSSEEvent(performance: perf)
+
         default:
             return nil
         }
     }
 
-    /// Forwards `POST /v1/requests/{id}/reasoning-end` to the remote `HeylookServer`.
     public func forwardReasoningEnd(requestID: String) async throws {
         let url = baseURL
             .appendingPathComponent("v1/requests")
@@ -167,7 +386,6 @@ public actor RemoteHeylookProvider: InferenceProvider {
         _ = try await session.data(for: req)
     }
 
-    /// Forwards `DELETE /v1/requests/{id}` to cancel an active request on the remote `HeylookServer`.
     public func forwardCancel(requestID: String) async throws {
         let url = baseURL
             .appendingPathComponent("v1/requests")
@@ -186,6 +404,7 @@ public actor RemoteHeylookProvider: InferenceProvider {
         let baseURL = self.baseURL
         let session = self.session
         let currentModelID = self.modelID
+        let progressCallback = PrefillProgressBridge.current
 
         return AsyncThrowingStream { continuation in
             let workTask = Task {
@@ -207,8 +426,8 @@ public actor RemoteHeylookProvider: InferenceProvider {
                     wireReq.repetitionContextSize = effectiveSampling.repetitionContextSize
                     wireReq.presencePenalty = effectiveSampling.presencePenalty
                     wireReq.seed = effectiveSampling.seed
-                    wireReq.thinking = effectiveSampling.thinking
-                    wireReq.thinkingBudget = effectiveSampling.thinkingBudget
+                    wireReq.thinking = effectiveSampling.thinking ?? request.thinking
+                    wireReq.thinkingBudget = effectiveSampling.thinkingBudget ?? request.thinkingBudget
                     wireReq.thinkingDepth = effectiveSampling.thinkingDepth ?? request.thinkingDepth
                     wireReq.stopSequences = effectiveSampling.stopSequences ?? request.stopSequences
                     wireReq.responseFormat = request.responseFormat
@@ -231,6 +450,9 @@ public actor RemoteHeylookProvider: InferenceProvider {
                         var currentEvent = ""
                         var generatedCount = 0
                         var sentReasoningEnd = false
+                        var deferredStopReason: StopReason?
+                        var deferredOutputTokens: Int?
+                        var emittedTerminalTelemetry = false
                         for try await line in bytes.lines {
                             let state = registry.state(for: requestID)
                             if state.isAborted || Task.isCancelled {
@@ -262,6 +484,12 @@ public actor RemoteHeylookProvider: InferenceProvider {
                                         detail: errMsg
                                     )
                                 }
+                                if let p = parsed.progressProcessed, let t = parsed.progressTotal, t > 0 {
+                                    if let progressCallback {
+                                        await progressCallback(p, t)
+                                    }
+                                    continue
+                                }
                                 if !parsed.textDelta.isEmpty || !parsed.thinkingDelta.isEmpty {
                                     generatedCount += 1
                                     continuation.yield(
@@ -272,20 +500,35 @@ public actor RemoteHeylookProvider: InferenceProvider {
                                             activeComputePlacement: .remote
                                         )
                                     )
-                                } else if parsed.stopReason != nil || parsed.performance != nil {
+                                } else if let perf = parsed.performance {
+                                    emittedTerminalTelemetry = true
                                     continuation.yield(
                                         GenerationChunk(
-                                            tokenCount: parsed.outputTokens ?? generatedCount,
-                                            generationTPS: parsed.performance?.generationTPS ?? 0,
-                                            promptTPS: parsed.performance?.promptTPS ?? 0,
-                                            stopReason: parsed.stopReason ?? .endTurn,
-                                            cacheReport: parsed.performance?.cache,
-                                            speculativeReport: parsed.performance?.speculative,
+                                            tokenCount: parsed.outputTokens ?? deferredOutputTokens ?? generatedCount,
+                                            generationTPS: perf.generationTPS ?? 0,
+                                            promptTPS: perf.promptTPS ?? 0,
+                                            stopReason: parsed.stopReason ?? deferredStopReason ?? .endTurn,
+                                            cacheReport: perf.cache,
+                                            speculativeReport: perf.speculative,
                                             activeComputePlacement: .remote
                                         )
                                     )
+                                } else if let stopReason = parsed.stopReason {
+                                    deferredStopReason = stopReason
+                                    if let outTok = parsed.outputTokens {
+                                        deferredOutputTokens = outTok
+                                    }
                                 }
                             }
+                        }
+                        if !emittedTerminalTelemetry, let stopReason = deferredStopReason {
+                            continuation.yield(
+                                GenerationChunk(
+                                    tokenCount: deferredOutputTokens ?? generatedCount,
+                                    stopReason: stopReason,
+                                    activeComputePlacement: .remote
+                                )
+                            )
                         }
                         continuation.finish()
                         return

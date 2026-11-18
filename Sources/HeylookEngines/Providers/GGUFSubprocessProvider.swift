@@ -1,5 +1,8 @@
+import CoreGraphics
 import Foundation
 import HeylookCore
+import ImageIO
+import UniformTypeIdentifiers
 
 /// Launch configuration for a `llama-server` subprocess (`GGUFSubprocessProvider`).
 public struct GGUFSpawnConfig: Sendable, Equatable {
@@ -24,12 +27,14 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
     public var cacheRAMMiB: Int?
     public var cacheReuse: Int?
     public var ctxCheckpoints: Int?
+    public var checkpointMinStep: Int?
     public var reasoningFormatFlag: String?
     public var reasoningBudget: Int?
+    public var reasoningPreserve: Bool
     public var extraArgs: [String]
 
     public init(
-        binaryPath: String = "/opt/homebrew/bin/llama-server",
+        binaryPath: String = GGUFSubprocessProvider.resolveBinaryPath(),
         modelPath: String,
         host: String = "127.0.0.1",
         port: Int = 18080,
@@ -50,8 +55,10 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
         cacheRAMMiB: Int? = nil,
         cacheReuse: Int? = nil,
         ctxCheckpoints: Int? = nil,
+        checkpointMinStep: Int? = nil,
         reasoningFormatFlag: String? = nil,
         reasoningBudget: Int? = nil,
+        reasoningPreserve: Bool = true,
         extraArgs: [String] = []
     ) {
         self.binaryPath = binaryPath
@@ -75,8 +82,10 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
         self.cacheRAMMiB = cacheRAMMiB
         self.cacheReuse = cacheReuse
         self.ctxCheckpoints = ctxCheckpoints
+        self.checkpointMinStep = checkpointMinStep
         self.reasoningFormatFlag = reasoningFormatFlag
         self.reasoningBudget = reasoningBudget
+        self.reasoningPreserve = reasoningPreserve
         self.extraArgs = extraArgs
     }
 
@@ -114,8 +123,8 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
         }
     }
 
-    /// Evaluates real disk weight footprint + KV cache sizing against Metal working-set headroom,
-    /// matching Python `ram_fit.py` (including dropping external drafter when RAM headroom is tight).
+    /// Evaluates real disk weight footprint + KV cache sizing against Metal working-set headroom
+    /// by delegating to `RAMFitCalculator.assess(...)`.
     public static func assessRAMFit(
         for description: EngineDescription,
         ctxSize: Int? = nil,
@@ -123,85 +132,29 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
         headroomOverrideGB: Double? = nil,
         sidecar: ModelSidecarConfig? = nil
     ) -> RAMFitAssessment {
-        let snap = HardwareMemoryMonitor.snapshot()
-        let workingSetGB = snap.metalRecommendedMaxWorkingSetGB > 0
-            ? snap.metalRecommendedMaxWorkingSetGB
-            : max(4.0, snap.totalPhysicalRAMGB * 0.75)
-
-        let rawURL = URL(fileURLWithPath: description.modelPath)
-        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: description.modelPath)
-        let resolvedSidecar = sidecar ?? HeylookConfig.loadSidecar(in: dirURL)
-
-        let diskMB = description.estimatedMemoryMB > 0
-            ? description.estimatedMemoryMB
-            : HeylookConfig.estimateModelMemoryMB(
-                in: dirURL,
-                primaryGGUFURL: rawURL.pathExtension.lowercased() == "gguf" ? rawURL : nil
-            )
-        let modelGB = Double(diskMB) / 1024.0
-
-        let mmprojPath = HeylookConfig.discoverMMProj(in: dirURL)
-        let mmprojBytes = mmprojPath.flatMap {
-            (try? FileManager.default.attributesOfItem(atPath: $0)[.size] as? NSNumber)?.int64Value
-        } ?? 0
-        let mmprojGB = Double(mmprojBytes) / (1024.0 * 1024.0 * 1024.0)
-
-        let drafter = HeylookConfig.discoverDrafter(in: dirURL, provider: .gguf, sidecar: resolvedSidecar)
-        let drafterBytes = drafter.draftModelPath.flatMap {
-            (try? FileManager.default.attributesOfItem(atPath: $0)[.size] as? NSNumber)?.int64Value
-        } ?? 0
-        let drafterGB = Double(drafterBytes) / (1024.0 * 1024.0 * 1024.0)
-
-        let targetCtx = max(512, ctxSize ?? resolvedSidecar?.ctxSize ?? description.contextSize.value)
-        let kvQuantFactor: Double = switch (cacheTypeK ?? "f16").lowercased() {
-        case let s where s.contains("q4"): 0.30
-        case let s where s.contains("q8"): 0.55
-        default: 1.0
-        }
-        // Empirical KV budget (~0.25 GB per 8k context at f16 scaled slightly by model weight size)
-        let modelScale = max(0.5, min(3.0, modelGB / 8.0))
-        let kvGB = (Double(targetCtx) / 8192.0) * 0.25 * modelScale * kvQuantFactor
-
-        let baseHeadroom = headroomOverrideGB ?? max(0.0, workingSetGB - modelGB - mmprojGB)
-        let headroomAfterKV = baseHeadroom - kvGB
-        let shouldDropDrafter = (drafter.draftModelPath != nil) && (headroomAfterKV - max(0.4, drafterGB) < 1.5)
-        let effectiveDrafterGB = shouldDropDrafter ? 0.0 : drafterGB
-        let remaining = headroomAfterKV - effectiveDrafterGB
-        let fits: Bool
-        if headroomOverrideGB != nil {
-            fits = remaining >= 0.0
-        } else {
-            fits = (modelGB + mmprojGB + kvGB + effectiveDrafterGB) <= workingSetGB
-        }
-
-        let recommendedCtx: Int
-        if remaining >= 16.0 {
-            recommendedCtx = max(targetCtx, 32768)
-        } else if remaining >= 4.0 {
-            recommendedCtx = targetCtx
-        } else if remaining >= 1.0 {
-            recommendedCtx = min(targetCtx, 8192)
-        } else {
-            recommendedCtx = min(targetCtx, 4096)
-        }
-
+        let report = RAMFitCalculator.assess(
+            for: description,
+            overrides: RAMFitOverrides(ctxSize: ctxSize, cacheTypeK: cacheTypeK),
+            headroomOverrideGB: headroomOverrideGB,
+            sidecar: sidecar
+        )
         return RAMFitAssessment(
-            modelWeightGB: (modelGB * 100).rounded() / 100,
-            mmprojWeightGB: (mmprojGB * 100).rounded() / 100,
-            drafterWeightGB: (drafterGB * 100).rounded() / 100,
-            estimatedKVGB: (kvGB * 100).rounded() / 100,
-            availableWorkingSetGB: (workingSetGB * 100).rounded() / 100,
-            remainingHeadroomGB: (remaining * 100).rounded() / 100,
-            fitsInMemory: fits,
-            droppedDrafterForMemory: shouldDropDrafter,
-            recommendedCtxSize: recommendedCtx
+            modelWeightGB: report.weightsGB,
+            mmprojWeightGB: report.mmprojGB,
+            drafterWeightGB: report.drafterGB,
+            estimatedKVGB: report.kvGB,
+            availableWorkingSetGB: report.workingSetGB,
+            remainingHeadroomGB: report.headroomGB,
+            fitsInMemory: report.fits,
+            droppedDrafterForMemory: report.droppedDrafterForMemory,
+            recommendedCtxSize: report.recommendedCtxSize
         )
     }
 
-    /// Auto-sizes `-ub` (`2048` when headroom >= 16 GB, else `512`), `-cram` (`cacheRAMMiB` from
-    /// unified memory headroom clamped to `[8192, 32768]` MiB), the 4-rung chat template ladder
-    /// (with media-blind sidecar fallback when `mmproj` is present), non-causal vision projector
-    /// `--image-max-tokens` clamping to `ubatchSize`, slot reuse flags, and RAM-aware MTP drafter.
+    /// Auto-sizes `ubatchSize`, `cacheRAMMiB`, template resolution (with media-blind sidecar fallback),
+    /// `--image-max-tokens` clamping for non-causal vision projectors, composable specialization flags
+    /// (`Gemma4Specialization` / `HybridRecurrentSWASpecialization`: `--cache-reuse` off with `--mmproj` or
+    /// SWA/SSM, `--ctx-checkpoints 32 --checkpoint-min-step 256`, `--reasoning-preserve`), and drafter flags.
     public static func autoSized(
         for description: EngineDescription,
         headroomGB: Double? = nil,
@@ -211,24 +164,13 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
         let dirURL = HeylookConfig.resolveModelDirectoryURL(from: description.modelPath)
         let resolvedSidecar = sidecar ?? HeylookConfig.loadSidecar(in: dirURL)
 
-        let fit = assessRAMFit(
+        let fitReport = RAMFitCalculator.assess(
             for: description,
-            ctxSize: resolvedSidecar?.ctxSize ?? description.contextSize.value,
+            overrides: RAMFitOverrides(ctxSize: resolvedSidecar?.ctxSize ?? description.contextSize.value),
             headroomOverrideGB: headroomGB,
             sidecar: resolvedSidecar
         )
-        let snap = HardwareMemoryMonitor.snapshot()
-        let diskMB = description.estimatedMemoryMB > 0
-            ? description.estimatedMemoryMB
-            : HeylookConfig.estimateModelMemoryMB(
-                in: dirURL,
-                primaryGGUFURL: rawURL.pathExtension.lowercased() == "gguf" ? rawURL : nil
-            )
-        let modelGB = Double(diskMB) / 1024.0
-        let workingSetGB = snap.metalRecommendedMaxWorkingSetGB > 0
-            ? snap.metalRecommendedMaxWorkingSetGB
-            : snap.totalPhysicalRAMGB * 0.75
-        let effectiveHeadroomGB = headroomGB ?? max(0, workingSetGB - modelGB)
+        let effectiveHeadroomGB = headroomGB ?? max(0, fitReport.workingSetGB - fitReport.weightsGB)
 
         let thinHeadroomGB = 16.0
         let autoUbatch = effectiveHeadroomGB >= thinHeadroomGB ? 2048 : 512
@@ -243,7 +185,6 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
         let mmproj = HeylookConfig.discoverMMProj(in: dirURL)
         let assignedPort = GGUFPortPool.shared.acquirePort(for: description.modelID)
 
-        // Check primary GGUF header for hybrid-recurrent SSM state (`--cache-ram 8192`) and built-in MTP
         var ggufHeader: GGUFHeaderReader.HeaderSummary?
         var resolvedGGUFModelPath = description.modelPath
         if rawURL.pathExtension.lowercased() == "gguf" {
@@ -268,9 +209,6 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
             }
         }
 
-        // Guard against media-blind non-operator sidecar chat_template.jinja when --mmproj is present:
-        // if the sidecar lacks vision/audio markers while the GGUF's embedded template supports media,
-        // drop `--chat-template-file` so llama-server uses the embedded multimodal template.
         var resolvedTemplateFile = templateResolution.resolvedFilePath
         if mmproj != nil,
            let candidateFile = resolvedTemplateFile,
@@ -286,8 +224,6 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
             }
         }
 
-        // Check mmproj header for non-causal vision projectors (`clip.projector_type`) that require
-        // `--image-max-tokens <= n_ubatch` so `llama_context::decode` never aborts.
         var clampedImageMaxTokens: Int? = resolvedSidecar?.imageMaxTokens
         if let mmproj,
            let mmprojHeader = GGUFHeaderReader.readFileHeader(at: URL(fileURLWithPath: mmproj)),
@@ -295,7 +231,15 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
             clampedImageMaxTokens = min(clampedImageMaxTokens ?? autoUbatch, autoUbatch)
         }
 
-        let isHybrid = ggufHeader?.isHybridRecurrent == true
+        let signature = CheckpointSignature.inspect(
+            modelDirectoryOrFile: URL(fileURLWithPath: resolvedGGUFModelPath),
+            drafterDirectory: drafter.draftModelPath.map { URL(fileURLWithPath: $0) },
+            mmprojPath: mmproj
+        )
+        let specialization = ModelSpecializationRegistry.resolve(for: signature)
+        let specFlags = specialization.ggufFlags(for: signature)
+
+        let isHybrid = ggufHeader?.isHybridRecurrent == true || signature.isHybridRecurrentOrSWA
         let effectiveCacheRAM: Int?
         if let autoCacheRAMMiB {
             effectiveCacheRAM = autoCacheRAMMiB
@@ -306,9 +250,9 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
         }
 
         let unset = Set(resolvedSidecar?.unsetKeys ?? [])
-        let effectiveDraftModelPath = fit.droppedDrafterForMemory ? nil : drafter.draftModelPath
+        let effectiveDraftModelPath = fitReport.droppedDrafterForMemory ? nil : drafter.draftModelPath
         let effectiveSpecType: String?
-        if fit.droppedDrafterForMemory {
+        if fitReport.droppedDrafterForMemory {
             effectiveSpecType = (ggufHeader?.hasBuiltInMTP == true && !unset.contains("spec_type")) ? "draft-mtp" : nil
         } else if let spec = drafter.specType {
             effectiveSpecType = spec
@@ -320,11 +264,21 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
             effectiveSpecType = nil
         }
 
-        let effectiveCacheReuse: Int? = isHybrid ? nil : 256
-        let effectiveCtxCheckpoints: Int? = isHybrid ? 8 : nil
+        let effectiveCacheReuse: Int? = (mmproj != nil || specFlags.disableCacheReuse) ? nil : 256
+        let effectiveCtxCheckpoints: Int? = specFlags.ctxCheckpoints
+        let effectiveCheckpointMinStep: Int? = specFlags.checkpointMinStep
         let reasoningFlag: String? = description.supportsThinking.value ? "deepseek" : nil
 
+        let configuredServerBinary: String? = {
+            if case .string(let s)? = resolvedSidecar?.extraConfig["server_binary"] {
+                let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            return nil
+        }()
+
         return GGUFSpawnConfig(
+            binaryPath: GGUFSubprocessProvider.resolveBinaryPath(configuredPath: configuredServerBinary),
             modelPath: resolvedGGUFModelPath,
             port: assignedPort,
             ctxSize: resolvedSidecar?.ctxSize ?? description.contextSize.value,
@@ -335,21 +289,25 @@ public struct GGUFSpawnConfig: Sendable, Equatable {
             chatTemplateFile: resolvedTemplateFile,
             draftModelPath: effectiveDraftModelPath,
             specType: effectiveSpecType,
+            cacheTypeK: { if case .string(let s)? = resolvedSidecar?.extraConfig["cache_type_k"] { return s }; return nil }(),
+            cacheTypeV: { if case .string(let s)? = resolvedSidecar?.extraConfig["cache_type_v"] { return s }; return nil }(),
             cacheRAMMiB: effectiveCacheRAM,
             cacheReuse: effectiveCacheReuse,
             ctxCheckpoints: effectiveCtxCheckpoints,
+            checkpointMinStep: effectiveCheckpointMinStep,
             reasoningFormatFlag: reasoningFlag,
-            reasoningBudget: resolvedSidecar?.sampling.thinkingBudget
+            reasoningBudget: resolvedSidecar?.sampling.thinkingBudget,
+            reasoningPreserve: specFlags.reasoningPreserve
         )
     }
 }
 
 /// Tier 3 Provider (macOS): Out-of-process `llama-server` subprocess (`-np 1`) for `.gguf` models.
-/// Implements the CLI argument builder, environment sanitizer (`LLAMA_ARG_LOG_FILE` removal +
-/// `GGML_METAL_RESIDENCY_KEEP_ALIVE_S=604800`), `/health` + `/props` lifecycle with fast-exit &
-/// drafter fallback retry, piped stderr ring buffer, and OpenAI SSE delta + `timings` + `error` parser.
+/// Strictly truthful (never synthesizes fallback outputs), wires `reasoning_control`, `prompt_progress`,
+/// continuation echo stripping, `/apply-template`, `/v1/chat/completions/input_tokens`, and `/props` caps.
 public actor GGUFSubprocessProvider: InferenceProvider {
     public struct OpenAISSEDelta: Sendable, Equatable {
+        public let completionID: String?
         public let content: String
         public let reasoningContent: String
         public let finishReason: String?
@@ -360,9 +318,12 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         public let generationTPS: Double?
         public let draftedTokens: Int?
         public let acceptedTokens: Int?
+        public let progressProcessed: Int?
+        public let progressTotal: Int?
         public let errorMessage: String?
 
         public init(
+            completionID: String? = nil,
             content: String = "",
             reasoningContent: String = "",
             finishReason: String? = nil,
@@ -373,8 +334,11 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             generationTPS: Double? = nil,
             draftedTokens: Int? = nil,
             acceptedTokens: Int? = nil,
+            progressProcessed: Int? = nil,
+            progressTotal: Int? = nil,
             errorMessage: String? = nil
         ) {
+            self.completionID = completionID
             self.content = content
             self.reasoningContent = reasoningContent
             self.finishReason = finishReason
@@ -385,6 +349,8 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             self.generationTPS = generationTPS
             self.draftedTokens = draftedTokens
             self.acceptedTokens = acceptedTokens
+            self.progressProcessed = progressProcessed
+            self.progressTotal = progressTotal
             self.errorMessage = errorMessage
         }
     }
@@ -421,15 +387,32 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         }
     }
 
+    private final class CompletionIDBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: String?
+        func setIfUnset(_ id: String?) {
+            guard let id, !id.isEmpty else { return }
+            lock.lock()
+            if value == nil { value = id }
+            lock.unlock()
+        }
+        func get() -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     public nonisolated let modelID: String
     public nonisolated let providerKind: EngineProviderKind = .gguf
-    public nonisolated let allowSyntheticFallback: Bool
     private var templateInfo: ModelTemplateInfo
     private var descriptionState: EngineDescription
     public nonisolated let spawnConfig: GGUFSpawnConfig
     private var activeSpawnConfig: GGUFSpawnConfig
     private var prefixCache = PrefixCacheTracker()
     private var unloadCount: Int = 0
+    private var observedProps: GGUFServerProps?
+    private var lastContextUsed: Int?
     private let stderrBuffer = StderrRingBuffer()
 
     #if os(macOS)
@@ -437,21 +420,59 @@ public actor GGUFSubprocessProvider: InferenceProvider {
     private var stderrPipe: Pipe?
     #endif
 
+    /// Resolves `llama-server` via `server_binary` (`configuredPath`) -> `$HEYLOOK_LLAMA_SERVER` -> `~/.heylook/llama.cpp/build/bin/llama-server` -> `/opt/homebrew/bin/llama-server`.
+    /// Never silently masks an explicit missing `server_binary` or `$HEYLOOK_LLAMA_SERVER` override.
+    public static func resolveBinaryPath(
+        configuredPath: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String {
+        if let configured = configuredPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty {
+            return configured
+        }
+        if let envPath = environment["HEYLOOK_LLAMA_SERVER"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envPath.isEmpty {
+            return envPath
+        }
+        let fm = FileManager.default
+        #if os(macOS)
+        let localBuild = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".heylook/llama.cpp/build/bin/llama-server")
+            .path
+        if fm.isExecutableFile(atPath: localBuild) {
+            return localBuild
+        }
+        #endif
+        let homebrew = "/opt/homebrew/bin/llama-server"
+        if fm.isExecutableFile(atPath: homebrew) {
+            return homebrew
+        }
+        return homebrew
+    }
+
     public init(
         description: EngineDescription,
-        spawnConfig: GGUFSpawnConfig? = nil,
-        allowSyntheticFallback: Bool = false
+        spawnConfig: GGUFSpawnConfig? = nil
     ) {
         self.modelID = description.modelID
         self.descriptionState = description
         let resolved = spawnConfig ?? GGUFSpawnConfig.autoSized(for: description)
         self.spawnConfig = resolved
         self.activeSpawnConfig = resolved
-        self.allowSyntheticFallback = allowSyntheticFallback
         self.templateInfo = ModelTemplateInfo.inspect(
             modelDirectory: HeylookConfig.resolveModelDirectoryURL(from: description.modelPath),
             modelID: description.modelID
         )
+    }
+
+    @available(*, deprecated, message: "allowSyntheticFallback has been removed; GGUFSubprocessProvider always requires a real llama-server executable and GGUF checkpoint.")
+    public init(
+        description: EngineDescription,
+        spawnConfig: GGUFSpawnConfig? = nil,
+        allowSyntheticFallback: Bool
+    ) {
+        _ = allowSyntheticFallback
+        self.init(description: description, spawnConfig: spawnConfig)
     }
 
     /// Builds the `llama-server` CLI flag array matching `llama_server_provider.py`.
@@ -508,11 +529,16 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         if let cram = config.cacheRAMMiB {
             args.append(contentsOf: ["-cram", String(cram)])
         }
-        if let reuse = config.cacheReuse, reuse > 0 {
+        // Disable `--cache-reuse` whenever `--mmproj` is present
+        let hasMMProj = config.mmprojPath?.isEmpty == false
+        if !hasMMProj, let reuse = config.cacheReuse, reuse > 0 {
             args.append(contentsOf: ["--cache-reuse", String(reuse)])
         }
         if let ckpts = config.ctxCheckpoints, ckpts > 0 {
             args.append(contentsOf: ["--ctx-checkpoints", String(ckpts)])
+        }
+        if let minStep = config.checkpointMinStep, minStep > 0 {
+            args.append(contentsOf: ["--checkpoint-min-step", String(minStep)])
         }
         if let rFmt = config.reasoningFormatFlag, !rFmt.isEmpty {
             args.append(contentsOf: ["--reasoning-format", rFmt])
@@ -520,15 +546,14 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         if let rBudget = config.reasoningBudget {
             args.append(contentsOf: ["--reasoning-budget", String(rBudget)])
         }
+        if config.reasoningPreserve {
+            args.append("--reasoning-preserve")
+        }
         args.append(contentsOf: ["-lv", "4"])
         args.append(contentsOf: config.extraArgs)
         return args
     }
 
-    /// Sanitizes the child environment for `llama-server`:
-    /// 1. Strips `LLAMA_ARG_LOG_FILE` so slot/cache telemetry flows to piped stderr.
-    /// 2. Sets `GGML_METAL_RESIDENCY_KEEP_ALIVE_S=604800` if not already set so Metal weight
-    ///    buffers stay wired across idle gaps.
     public static func childEnvironment(
         from baseEnv: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
@@ -540,8 +565,6 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         return env
     }
 
-    /// Parses a single `data: {...}` SSE line from `llama-server` `/v1/chat/completions`,
-    /// including mid-stream `data: {"error": ...}` frames so decode OOM/slot errors are never swallowed.
     public static func parseOpenAISSEDataLine(_ line: String) -> OpenAISSEDelta? {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("data:") else { return nil }
@@ -564,6 +587,7 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             return OpenAISSEDelta(errorMessage: errStr)
         }
 
+        let completionID = json["id"] as? String
         var content = ""
         var reasoningContent = ""
         var finishReason: String?
@@ -576,18 +600,45 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             }
         }
 
+        var progressProcessed: Int?
+        var progressTotal: Int?
+        if let progress = json["prompt_progress"] as? [String: Any] {
+            let cacheHit = (progress["cache"] as? Int) ?? 0
+            let rawTotal = (progress["total"] as? Int) ?? 0
+            let rawProc = (progress["processed"] as? Int) ?? 0
+            let workTotal = rawTotal - cacheHit
+            if workTotal > 0 {
+                progressTotal = workTotal
+                progressProcessed = max(0, rawProc - cacheHit)
+            }
+        }
+
         let usage = json["usage"] as? [String: Any]
+        let usageDetails = usage?["prompt_tokens_details"] as? [String: Any]
         let timings = json["timings"] as? [String: Any]
 
-        let promptTokens = (timings?["prompt_n"] as? Int) ?? (usage?["prompt_tokens"] as? Int)
-        let cachedTokens = timings?["cache_n"] as? Int
-        let predictedTokens = (timings?["predicted_n"] as? Int) ?? (usage?["completion_tokens"] as? Int)
+        let usagePrompt = usage?["prompt_tokens"] as? Int
+        let timingsCached = timings?["cache_n"] as? Int
+        let usageCached = usageDetails?["cached_tokens"] as? Int
+        let cachedTokens = usageCached ?? timingsCached
+
+        let promptTokens: Int?
+        if let usagePrompt {
+            promptTokens = usagePrompt
+        } else if let promptN = timings?["prompt_n"] as? Int {
+            promptTokens = promptN + (cachedTokens ?? 0)
+        } else {
+            promptTokens = nil
+        }
+
+        let predictedTokens = (usage?["completion_tokens"] as? Int) ?? (timings?["predicted_n"] as? Int)
         let promptTPS = timings?["prompt_per_second"] as? Double
         let generationTPS = timings?["predicted_per_second"] as? Double
         let draftedTokens = timings?["draft_n"] as? Int
         let acceptedTokens = timings?["draft_n_accepted"] as? Int
 
         return OpenAISSEDelta(
+            completionID: completionID,
             content: content,
             reasoningContent: reasoningContent,
             finishReason: finishReason,
@@ -597,12 +648,12 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             promptTPS: promptTPS,
             generationTPS: generationTPS,
             draftedTokens: draftedTokens,
-            acceptedTokens: acceptedTokens
+            acceptedTokens: acceptedTokens,
+            progressProcessed: progressProcessed,
+            progressTotal: progressTotal
         )
     }
 
-    /// Converts an Anthropic-style `MessagesRequest` (preserving exact `turn.parts` interleaving of
-    /// `text`, `image`, and `audio` blocks) into the OpenAI `/v1/chat/completions` `messages` array.
     public static func buildOpenAIChatMessages(from request: MessagesRequest) -> [[String: Any]] {
         var wireMessages: [[String: Any]] = []
         if let sys = request.system, !sys.isEmpty {
@@ -628,10 +679,7 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                         break
                     case .text(let txt):
                         if !txt.isEmpty {
-                            wireParts.append([
-                                "type": "text",
-                                "text": txt,
-                            ])
+                            wireParts.append(["type": "text", "text": txt])
                         }
                     case .media(let att):
                         if att.kind == "image" {
@@ -669,6 +717,7 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         public let supportsTools: Bool?
         public let supportsParallelToolCalls: Bool?
         public let supportsSystemRole: Bool?
+        public let rawCaps: [String: Bool]
 
         public init(
             contextSize: Int? = nil,
@@ -678,7 +727,8 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             supportsTypedContent: Bool? = nil,
             supportsTools: Bool? = nil,
             supportsParallelToolCalls: Bool? = nil,
-            supportsSystemRole: Bool? = nil
+            supportsSystemRole: Bool? = nil,
+            rawCaps: [String: Bool] = [:]
         ) {
             self.contextSize = contextSize
             self.chatTemplate = chatTemplate
@@ -688,11 +738,10 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             self.supportsTools = supportsTools
             self.supportsParallelToolCalls = supportsParallelToolCalls
             self.supportsSystemRole = supportsSystemRole
+            self.rawCaps = rawCaps
         }
     }
 
-    /// Parses `GET /props` JSON from a running `llama-server` instance to extract runtime-observed
-    /// `n_ctx` (`default_generation_settings.n_ctx`), `chat_template`, `chat_template_caps`, and `total_slots`.
     public static func parsePropsJSON(_ data: Data) -> GGUFServerProps? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
@@ -704,24 +753,31 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             ?? (defaultGen?["chat_template"] as? String)
         let slots = (json["total_slots"] as? NSNumber)?.intValue
         let modelPath = json["model_path"] as? String
-        let caps = (json["chat_template_caps"] as? [String: Any])
+        let capsAny = (json["chat_template_caps"] as? [String: Any])
             ?? (defaultGen?["chat_template_caps"] as? [String: Any])
+        var boolCaps: [String: Bool] = [:]
+        if let capsAny {
+            for (k, v) in capsAny {
+                if let b = v as? Bool {
+                    boolCaps[k] = b
+                }
+            }
+        }
         return GGUFServerProps(
             contextSize: nCtx,
             chatTemplate: chatTmpl,
             totalSlots: slots,
             modelPath: modelPath,
-            supportsTypedContent: caps?["supports_typed_content"] as? Bool,
-            supportsTools: caps?["supports_tools"] as? Bool,
-            supportsParallelToolCalls: caps?["supports_parallel_tool_calls"] as? Bool,
-            supportsSystemRole: caps?["supports_system_role"] as? Bool
+            supportsTypedContent: boolCaps["supports_typed_content"],
+            supportsTools: boolCaps["supports_tools"],
+            supportsParallelToolCalls: boolCaps["supports_parallel_tool_calls"],
+            supportsSystemRole: boolCaps["supports_system_role"],
+            rawCaps: boolCaps
         )
     }
 
-    /// Upgrades `descriptionState.contextSize` and `descriptionState.templateSource` (plus
-    /// `reasoningFormat` and `thinkingControls` when `props.chatTemplate` is present) to `.observed`
-    /// provenance from `llama-server` `GET /props`.
     public func applyObservedProps(_ props: GGUFServerProps) {
+        self.observedProps = props
         let newCtx = (props.contextSize ?? 0) > 0
             ? ProvenanceField(value: props.contextSize!, provenance: .observed, effect: .reload)
             : descriptionState.contextSize
@@ -769,6 +825,19 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         descriptionState
     }
 
+    public func observedContractState() async -> ObservedContractState {
+        ObservedContractState(
+            runningContextLength: observedProps?.contextSize ?? (descriptionState.isLoaded ? activeSpawnConfig.ctxSize : nil),
+            loadedTemplateText: observedProps?.chatTemplate,
+            runtimeCaps: observedProps?.rawCaps.isEmpty == false ? observedProps?.rawCaps : nil,
+            speculativeInForce: descriptionState.isLoaded
+                ? ((activeSpawnConfig.draftModelPath != nil) || (activeSpawnConfig.specType != nil))
+                : nil,
+            isPrefixCacheWarm: prefixCache.isWarm,
+            contextUsed: lastContextUsed
+        )
+    }
+
     public func isPrefixCacheWarm() -> Bool {
         prefixCache.isWarm
     }
@@ -788,10 +857,6 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             return
         }
         #endif
-        if allowSyntheticFallback {
-            descriptionState.isLoaded = true
-            return
-        }
         let fm = FileManager.default
         if !fm.isExecutableFile(atPath: activeSpawnConfig.binaryPath) {
             throw ProviderExecutionError.binaryNotFound(
@@ -807,6 +872,7 @@ public actor GGUFSubprocessProvider: InferenceProvider {
 
     public func clearCache() async -> Bool {
         prefixCache.reset()
+        lastContextUsed = nil
         #if os(macOS)
         if let proc = process, proc.isRunning {
             let slotURL = URL(string: "http://\(activeSpawnConfig.host):\(activeSpawnConfig.port)/slots/0?action=erase")!
@@ -828,14 +894,186 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         process = nil
         #endif
         prefixCache.reset()
+        observedProps = nil
+        lastContextUsed = nil
         descriptionState.isLoaded = false
     }
 
-    /// True when both the `llama-server` executable and `.gguf` file exist on disk.
     public nonisolated var canLaunchLiveSubprocess: Bool {
         let fm = FileManager.default
         return fm.isExecutableFile(atPath: spawnConfig.binaryPath)
             && fm.fileExists(atPath: spawnConfig.modelPath)
+    }
+
+    public func renderPromptPreview(request: MessagesRequest) async throws -> PromptPreviewResult {
+        #if os(macOS)
+        if let proc = process, proc.isRunning {
+            let baseURL = URL(string: "http://\(activeSpawnConfig.host):\(activeSpawnConfig.port)")!
+            let enableThinking = ModelSpecializationRegistry.resolveThinkingEnabled(
+                requestThinking: request.thinking,
+                sidecarThinking: nil,
+                modelCapable: descriptionState.supportsThinking.value
+            )
+            var templateKwargs: [String: Any] = [
+                templateInfo.thinkingControls.switchVariable ?? "enable_thinking": enableThinking
+            ]
+            if let depthVar = templateInfo.thinkingControls.depthVariable,
+               let depthVal = request.thinkingDepth,
+               !depthVal.isEmpty {
+                templateKwargs[depthVar] = depthVal
+            }
+            let body: [String: Any] = [
+                "messages": Self.buildOpenAIChatMessages(from: request),
+                "chat_template_kwargs": templateKwargs,
+            ]
+            var req = URLRequest(url: baseURL.appendingPathComponent("apply-template"))
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let prompt = json["prompt"] as? String {
+                let tokCount = try? await queryGGUFInputTokenCount(baseURL: baseURL, messages: Self.buildOpenAIChatMessages(from: request))
+                return PromptPreviewResult(
+                    prompt: prompt,
+                    tokenCount: tokCount,
+                    tokens: nil,
+                    templateSource: "llama-server:/apply-template",
+                    chatTemplateCaps: observedProps?.rawCaps
+                )
+            }
+        }
+        #endif
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: descriptionState.modelPath)
+        let enableThinking = ModelSpecializationRegistry.resolveThinkingEnabled(
+            requestThinking: request.thinking,
+            sidecarThinking: nil,
+            modelCapable: descriptionState.supportsThinking.value
+        )
+        let rendered = try HeylookConfig.renderPromptDetailed(
+            in: dirURL,
+            system: request.system,
+            turns: request.messages,
+            thinkingEnabled: enableThinking,
+            thinkingDepth: request.thinkingDepth
+        )
+        return PromptPreviewResult(
+            prompt: rendered.prompt,
+            tokenCount: nil,
+            tokens: nil,
+            templateSource: rendered.source,
+            chatTemplateCaps: observedProps?.rawCaps
+        )
+    }
+
+    public func planImages(sizes: [[Int]]) async throws -> ImagePlanResult {
+        try ModelSpecializationRegistry.validateImagePlanSizes(sizes)
+        guard descriptionState.supportsVision.value else {
+            throw ProviderExecutionError.invalidRequest(
+                detail: "\(modelID) is served as text; it takes no images"
+            )
+        }
+        #if os(macOS)
+        try await ensureSubprocessRunning()
+        let baseURL = URL(string: "http://\(activeSpawnConfig.host):\(activeSpawnConfig.port)")!
+        let textOnlyMessages: [[String: Any]] = [["role": "user", "content": "x"]]
+        let baseCount = try await queryGGUFInputTokenCount(baseURL: baseURL, messages: textOnlyMessages)
+        var rows: [ImagePlanRow] = []
+        rows.reserveCapacity(sizes.count)
+        for pair in sizes {
+            let w = pair[0]
+            let h = pair[1]
+            let pngBase64 = try Self.encodeSyntheticPNGBase64(width: w, height: h)
+            let imgMessages: [[String: Any]] = [[
+                "role": "user",
+                "content": [
+                    ["type": "image_url", "image_url": ["url": "data:image/png;base64,\(pngBase64)"]],
+                    ["type": "text", "text": "x"],
+                ],
+            ]]
+            let withImgCount = try await queryGGUFInputTokenCount(baseURL: baseURL, messages: imgMessages)
+            rows.append(ImagePlanRow(size: [w, h], tokens: max(0, withImgCount - baseCount), target: nil))
+        }
+        return ImagePlanResult(
+            engine: "gguf",
+            images: rows,
+            source: "llama-server /v1/chat/completions/input_tokens"
+        )
+        #else
+        throw ProviderExecutionError.runtimeUnavailable(
+            modelID: modelID,
+            detail: "GGUF llama-server subprocesses run on macOS only."
+        )
+        #endif
+    }
+
+    private func queryGGUFInputTokenCount(baseURL: URL, messages: [[String: Any]]) async throws -> Int {
+        var req = URLRequest(url: baseURL.appendingPathComponent("v1/chat/completions/input_tokens"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "messages": messages,
+            "add_generation_prompt": true,
+        ])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let msg = String(decoding: data, as: UTF8.self)
+            throw ProviderExecutionError.runtimeUnavailable(
+                modelID: modelID,
+                detail: "llama-server /input_tokens HTTP \(http.statusCode): \(msg)"
+            )
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ProviderExecutionError.runtimeUnavailable(
+                modelID: modelID,
+                detail: "Malformed /v1/chat/completions/input_tokens payload from llama-server"
+            )
+        }
+        if let n = json["input_tokens"] as? Int { return n }
+        if let arr = json["tokens"] as? [Any] { return arr.count }
+        throw ProviderExecutionError.runtimeUnavailable(
+            modelID: modelID,
+            detail: "llama-server /input_tokens omitted count"
+        )
+    }
+
+    private static func encodeSyntheticPNGBase64(width: Int, height: Int) throws -> String {
+        let clampedW = max(1, width)
+        let clampedH = max(1, height)
+        let bytesPerRow = clampedW * 4
+        var pixelBuffer = [UInt8](repeating: 128, count: bytesPerRow * clampedH)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: &pixelBuffer,
+            width: clampedW,
+            height: clampedH,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ),
+              let cgImage = ctx.makeImage(),
+              let mutData = CFDataCreateMutable(nil, 0),
+              let dest = CGImageDestinationCreateWithData(
+                  mutData,
+                  UTType.png.identifier as CFString,
+                  1,
+                  nil
+              ) else {
+            throw ProviderExecutionError.runtimeUnavailable(
+                modelID: "image-plan",
+                detail: "Failed to synthesize PNG buffer for \(width)x\(height)"
+            )
+        }
+        CGImageDestinationAddImage(dest, cgImage, nil)
+        guard CGImageDestinationFinalize(dest) else {
+            throw ProviderExecutionError.runtimeUnavailable(
+                modelID: "image-plan",
+                detail: "Failed to finalize PNG buffer for \(width)x\(height)"
+            )
+        }
+        return (mutData as Data).base64EncodedString()
     }
 
     public func generate(
@@ -845,7 +1083,13 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         registry: RequestRegistry
     ) -> AsyncThrowingStream<GenerationChunk, Error> {
         let cacheReport = prefixCache.evaluate(system: request.system, messages: request.messages)
-        let enableThinking = (effectiveSampling.thinking ?? true) && descriptionState.supportsThinking.value
+        let dirURL = HeylookConfig.resolveModelDirectoryURL(from: descriptionState.modelPath)
+        let sidecar = HeylookConfig.loadSidecar(in: dirURL)
+        let enableThinking = ModelSpecializationRegistry.resolveThinkingEnabled(
+            requestThinking: effectiveSampling.thinking ?? request.thinking,
+            sidecarThinking: sidecar?.supportsThinking,
+            modelCapable: descriptionState.supportsThinking.value
+        )
         let resolvedStops = effectiveSampling.stopSequences ?? request.stopSequences ?? []
 
         #if os(macOS)
@@ -862,51 +1106,27 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         }
         #endif
 
-        guard allowSyntheticFallback else {
-            let fm = FileManager.default
-            let err: ProviderExecutionError = !fm.isExecutableFile(atPath: spawnConfig.binaryPath)
-                ? .binaryNotFound(modelID: modelID, binaryPath: spawnConfig.binaryPath)
-                : .checkpointNotFound(modelID: modelID, path: spawnConfig.modelPath)
-            return AsyncThrowingStream { continuation in
-                continuation.finish(throwing: err)
-            }
+        let fm = FileManager.default
+        let err: ProviderExecutionError = !fm.isExecutableFile(atPath: spawnConfig.binaryPath)
+            ? .binaryNotFound(modelID: modelID, binaryPath: spawnConfig.binaryPath)
+            : .checkpointNotFound(modelID: modelID, path: spawnConfig.modelPath)
+        return AsyncThrowingStream { continuation in
+            continuation.finish(throwing: err)
         }
-
-        let userText = request.messages.last?.content ?? ""
-        var tokens: [String] = []
-        if enableThinking {
-            tokens.append(contentsOf: ["<think>", "Evaluating GGUF slot 0...", "</think>\n"])
-        }
-        tokens.append(contentsOf: ["[GGUF \(modelID)] ", userText])
-
-        return StreamingPipeline.runTokenStream(
-            requestID: requestID,
-            rawTokens: tokens,
-            cacheReport: cacheReport,
-            startsInThinking: false,
-            reasoningFormat: templateInfo.reasoningFormat,
-            thinkingEnabled: enableThinking,
-            strippableSpecialTokens: Array(templateInfo.strippableSpecialTokens),
-            stopSequences: resolvedStops,
-            maxTokens: effectiveSampling.maxTokens,
-            thinkingBudget: effectiveSampling.thinkingBudget,
-            computePlacement: .ggufSubprocess,
-            registry: registry,
-            onComplete: { [weak self] reply in
-                await self?.recordAssistantTurn(reply)
-            }
-        )
     }
 
-    private func recordAssistantTurn(_ reply: String) {
+    private func recordAssistantTurn(_ reply: String, usedContext: Int? = nil) {
         prefixCache.recordAssistantReply(reply)
+        if let usedContext {
+            lastContextUsed = usedContext
+        }
+    }
+
+    private func recordContextUsedOnly(_ total: Int) {
+        lastContextUsed = total
     }
 
     #if os(macOS)
-    /// Spawns and registers the child subprocess in `SubprocessLifecycleRegistry.shared`.
-    /// Monitors child liveness during `/health` polling, retries once without drafter (`-md` / `--spec-type`)
-    /// if an incompatible drafter causes immediate startup exit, and throws `ProviderExecutionError`
-    /// if `/health` fails or times out.
     @discardableResult
     public func launchSubprocess(
         customArguments: [String]? = nil,
@@ -1012,7 +1232,6 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             try await Task.sleep(for: .milliseconds(250))
         }
 
-        // Timed out without ever receiving HTTP 200 on /health — terminate child and fail loudly!
         pipe.fileHandleForReading.readabilityHandler = nil
         SubprocessLifecycleRegistry.shared.terminate(for: modelID)
         self.process = nil
@@ -1028,6 +1247,19 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         _ = try await launchSubprocess(checkHealth: true)
     }
 
+    private func describeComputeError(_ msg: String) -> String {
+        let lower = msg.lowercased()
+        guard lower.contains("compute error") else {
+            return "llama-server error for '\(modelID)': \(msg)"
+        }
+        let fit = RAMFitCalculator.assess(for: descriptionState)
+        var text = "llama-server compute error for '\(modelID)' -- Metal working-set headroom is \(String(format: "%.1f", fit.kvHeadroomGB)) GiB at \(String(format: "%.0f", fit.workingSetGB)) GiB limit"
+        if let suggest = fit.sysctlSuggestMB {
+            text += ". Raise wired limit: sudo sysctl iogpu.wired_limit_mb=\(suggest)"
+        }
+        return text + ", or reduce ctx_size / n_ubatch."
+    }
+
     private func generateWithLiveSubprocess(
         requestID: String,
         request: MessagesRequest,
@@ -1040,13 +1272,55 @@ public actor GGUFSubprocessProvider: InferenceProvider {
         let cfg = self.activeSpawnConfig
         let currentModelID = self.modelID
         let activeTemplate = self.templateInfo
+        let descSnapshot = self.descriptionState
         let baseURL = URL(string: "http://\(cfg.host):\(cfg.port)")!
+        let cmplBox = CompletionIDBox()
+
+        let lastTurn = request.messages.last
+        let isAssistantContinuation = lastTurn?.role.lowercased() == "assistant"
+        if let rawCont = request.metadata?["continue_final_message"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !rawCont.isEmpty {
+            let requestedContinue: Bool
+            if ["true", "1", "yes"].contains(rawCont) {
+                requestedContinue = true
+            } else if ["false", "0", "no"].contains(rawCont) {
+                requestedContinue = false
+            } else {
+                let err = ProviderExecutionError.invalidRequest(
+                    detail: "Invalid metadata.continue_final_message value '\(rawCont)'."
+                )
+                return AsyncThrowingStream { $0.finish(throwing: err) }
+            }
+            if requestedContinue && !isAssistantContinuation {
+                let err = ProviderExecutionError.invalidRequest(
+                    detail: "continue_final_message=true requires final message role to be 'assistant' for GGUF."
+                )
+                return AsyncThrowingStream { $0.finish(throwing: err) }
+            }
+            if !requestedContinue && isAssistantContinuation {
+                let err = ProviderExecutionError.invalidRequest(
+                    detail: "continue_final_message=false conflicts with trailing 'assistant' message."
+                )
+                return AsyncThrowingStream { $0.finish(throwing: err) }
+            }
+        }
+
+        let strippedTrailingThinking = lastTurn?.thinking.map { String($0.drop(while: \.isWhitespace)) }
+        let hasTrailingThinking = isAssistantContinuation && !(strippedTrailingThinking?.isEmpty ?? true)
+        let hasTrailingContent = isAssistantContinuation && !(lastTurn?.content.isEmpty ?? true)
+        let startsInThinking = enableThinking && hasTrailingThinking && !hasTrailingContent
+
+        let initialEchoChars = hasTrailingContent ? (lastTurn?.content.count ?? 0) : 0
+        let initialEchoThinkingChars = hasTrailingThinking ? (strippedTrailingThinking?.count ?? 0) : 0
+        let initialClosedThought = (initialEchoThinkingChars > 0) && (initialEchoChars > 0)
+
+        let reasoningControlEnabled = enableThinking || (hasTrailingThinking && !hasTrailingContent)
 
         return StreamingPipeline.transformEventStream(
             requestID: requestID,
             cacheReport: fallbackCacheReport,
             defaultSpeculativeReport: nil,
-            startsInThinking: false,
+            startsInThinking: startsInThinking,
             reasoningFormat: activeTemplate.reasoningFormat,
             thinkingEnabled: enableThinking,
             strippableSpecialTokens: Array(activeTemplate.strippableSpecialTokens),
@@ -1056,10 +1330,12 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             computePlacement: .ggufSubprocess,
             registry: registry,
             onReasoningEndHook: {
+                guard reasoningControlEnabled, let cid = cmplBox.get() else { return }
                 var ctrlReq = URLRequest(url: baseURL.appendingPathComponent("v1/chat/completions/control"))
                 ctrlReq.httpMethod = "POST"
                 ctrlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                ctrlReq.httpBody = Data("{\"action\":\"reasoning_end\"}".utf8)
+                let bodyObj: [String: String] = ["id": cid, "action": "reasoning_end"]
+                ctrlReq.httpBody = try? JSONSerialization.data(withJSONObject: bodyObj)
                 _ = try? await URLSession.shared.data(for: ctrlReq)
             },
             onComplete: { [weak self] reply in
@@ -1067,6 +1343,9 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             }
         ) { [weak self] eventCont in
             guard let self else { return }
+            var echoChars = initialEchoChars
+            var echoThinkingChars = initialEchoThinkingChars
+            var closedThought = initialClosedThought
             try await self.ensureSubprocessRunning()
             let chatURL = baseURL.appendingPathComponent("v1/chat/completions")
             var urlReq = URLRequest(url: chatURL)
@@ -1083,17 +1362,29 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                 templateKwargs[depthVar] = depthVal
             }
 
+            // NOTE: Intentionally DO NOT forward `stop_sequences` in `body["stop"]`:
+            // `StreamingPipeline`'s `StopSequenceFilter` cuts visible reply only and never aborts `<think>`.
             var body: [String: Any] = [
                 "messages": wireMessages,
                 "stream": true,
+                "stream_options": ["include_usage": true],
                 "cache_prompt": true,
-                "temperature": effectiveSampling.temperature ?? 0.7,
-                "top_p": effectiveSampling.topP ?? 0.95,
-                "top_k": effectiveSampling.topK ?? 40,
+                "return_progress": true,
+                "temperature": effectiveSampling.temperature ?? SamplerCascade.fallbackTemperature,
+                "top_p": effectiveSampling.topP ?? SamplerCascade.fallbackTopP,
                 "min_p": effectiveSampling.minP ?? 0.0,
-                "max_tokens": effectiveSampling.maxTokens ?? 2048,
+                "max_tokens": effectiveSampling.maxTokens ?? SamplerCascade.defaultMaxTokens,
                 "chat_template_kwargs": templateKwargs,
             ]
+            if let topK = effectiveSampling.topK {
+                body["top_k"] = topK
+            }
+            if let repCtx = effectiveSampling.repetitionContextSize {
+                body["repeat_last_n"] = repCtx
+            }
+            if reasoningControlEnabled {
+                body["reasoning_control"] = true
+            }
             if let repPen = effectiveSampling.repetitionPenalty {
                 body["repeat_penalty"] = repPen
             }
@@ -1103,19 +1394,13 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             if let seed = effectiveSampling.seed {
                 body["seed"] = seed
             }
-            if !stopSequences.isEmpty {
-                body["stop"] = stopSequences
-            }
             if let thinkBudget = effectiveSampling.thinkingBudget {
-                body["reasoning_budget"] = enableThinking ? thinkBudget : 0
+                body["reasoning_budget_tokens"] = enableThinking ? thinkBudget : 0
             } else if !enableThinking {
-                body["reasoning_budget"] = 0
+                body["reasoning_budget_tokens"] = 0
             }
             if let rf = request.responseFormat {
-                if let rfData = try? JSONEncoder().encode(rf),
-                   let rfObj = try? JSONSerialization.jsonObject(with: rfData) {
-                    body["response_format"] = rfObj
-                }
+                body["response_format"] = rf.toOpenAIObject()
             }
             urlReq.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -1134,15 +1419,26 @@ public actor GGUFSubprocessProvider: InferenceProvider {
             }
 
             var sawPreSplitReasoning = false
+            var lastPromptTotal = 0
+            var lastGenTotal = 0
 
             for try await line in bytes.lines {
                 try Task.checkCancellation()
                 guard let delta = Self.parseOpenAISSEDataLine(line) else { continue }
                 if let errMsg = delta.errorMessage {
+                    let diag = await self.describeComputeError(errMsg)
                     throw ProviderExecutionError.runtimeUnavailable(
-                        modelID: currentModelID,
-                        detail: "llama-server error: \(errMsg)"
+                        modelID: descSnapshot.modelID,
+                        detail: diag
                     )
+                }
+
+                if reasoningControlEnabled {
+                    cmplBox.setIfUnset(delta.completionID)
+                }
+
+                if let proc = delta.progressProcessed, let tot = delta.progressTotal, tot > 0 {
+                    eventCont.yield(.progress(processed: proc, total: tot))
                 }
 
                 let specReport: SpeculativeReport? = if let d = delta.draftedTokens, let a = delta.acceptedTokens, d > 0 {
@@ -1156,6 +1452,8 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                     nil
                 }
 
+                if let pTok = delta.promptTokens { lastPromptTotal = pTok }
+                if let gTok = delta.predictedTokens { lastGenTotal = gTok }
                 if delta.promptTokens != nil || delta.cachedTokens != nil || delta.promptTPS != nil || delta.generationTPS != nil || specReport != nil {
                     eventCont.yield(
                         .telemetry(
@@ -1168,19 +1466,45 @@ public actor GGUFSubprocessProvider: InferenceProvider {
                     )
                 }
 
-                if !delta.reasoningContent.isEmpty {
-                    sawPreSplitReasoning = true
-                    eventCont.yield(.splitReasoning(delta.reasoningContent))
-                    if !delta.content.isEmpty {
-                        eventCont.yield(.splitContent(delta.content))
-                    }
-                } else if !delta.content.isEmpty {
-                    if sawPreSplitReasoning {
-                        eventCont.yield(.splitContent(delta.content))
-                    } else {
-                        eventCont.yield(.rawToken(delta.content))
+                // Strip leading continuation prefill echo from both content and reasoning channels
+                var contentText = delta.content
+                var thinkText = delta.reasoningContent
+
+                if echoChars > 0 && !contentText.isEmpty {
+                    let cut = min(echoChars, contentText.count)
+                    echoChars -= cut
+                    contentText = String(contentText.dropFirst(cut))
+                }
+                if echoThinkingChars > 0 && !thinkText.isEmpty {
+                    let cut = min(echoThinkingChars, thinkText.count)
+                    echoThinkingChars -= cut
+                    thinkText = String(thinkText.dropFirst(cut))
+                }
+                if closedThought && echoThinkingChars == 0 && !thinkText.isEmpty {
+                    let trimmed = String(thinkText.drop(while: { $0.isWhitespace }))
+                    thinkText = trimmed
+                    if !thinkText.isEmpty {
+                        closedThought = false
                     }
                 }
+
+                if !thinkText.isEmpty {
+                    sawPreSplitReasoning = true
+                    eventCont.yield(.splitReasoning(thinkText))
+                    if !contentText.isEmpty {
+                        eventCont.yield(.splitContent(contentText))
+                    }
+                } else if !contentText.isEmpty {
+                    if sawPreSplitReasoning {
+                        eventCont.yield(.splitContent(contentText))
+                    } else {
+                        eventCont.yield(.rawToken(contentText))
+                    }
+                }
+            }
+
+            if lastPromptTotal > 0 {
+                await self.recordContextUsedOnly(lastPromptTotal + lastGenTotal)
             }
         }
     }

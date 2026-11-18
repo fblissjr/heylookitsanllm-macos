@@ -523,14 +523,24 @@ public actor ANECoreMLRuntime {
     }
 
     /// Selects the closest aspect-preserving `(height, width)` bucket in `supportedVisionBuckets`
-    /// and decodes upright sRGB `[1, 3, height, width]` pixels in `[0, 1]`.
+    /// and decodes upright sRGB `[1, 3, height, width]` pixels in `[0, 1]` (applying EXIF orientation).
     public static func prepareImagePixels(
         from imageURL: URL,
         forVideoBudget: Bool = false
     ) -> (pixels: [Float], height: Int, width: Int)? {
-        guard let src = CGImageSourceCreateWithURL(imageURL as CFURL, nil),
-              let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil)
-        else {
+        guard let src = CGImageSourceCreateWithURL(imageURL as CFURL, nil) else {
+            return nil
+        }
+        let maxEdge = forVideoBudget ? 672 : 960
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxEdge,
+        ]
+        if let oriented = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOptions as CFDictionary) {
+            return prepareImagePixels(from: oriented, forVideoBudget: forVideoBudget)
+        }
+        guard let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
             return nil
         }
         return prepareImagePixels(from: cgImage, forVideoBudget: forVideoBudget)
