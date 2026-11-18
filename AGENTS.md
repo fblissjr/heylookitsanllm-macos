@@ -7,7 +7,7 @@ Operating guide and **LLM Knowledge Wiki Index Router** for `heylookitsanllm-mac
 - **[VISION.md](./VISION.md)**: Core design principles (*Commodity Upstream, Surgical Specialization*, *Runtime-Agnostic Core*, *Truthful Runtime*, *Derive, Don't Copy*, *Heterogeneous Silicon Harmony*, *Intimate in the Hand, Effortless at the Desk*, *Sovereign by Construction*). Breaks ties when a design choice is unclear.
 - **[docs/USER_GUIDE.md](./docs/USER_GUIDE.md)**: Complete operator guide to the 6-surface Workbench app, `heylook.toml` setup, `heylook-cli`, and `/v1/*` API usage.
 - **[docs/wiki/README.md](./docs/wiki/README.md)**: Master entrypoint to the **LLM Knowledge Wiki**.
-- **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** and **[docs/project/TODO.md](./docs/project/TODO.md)**: Honest subsystem audit matrix against `heylookitsanllm` `v2.0.251` and the Parity Completion Roadmap (**Phases 16A–16E**) + Post-Parity Horizons.
+- **[docs/project/CURRENT.md](./docs/project/CURRENT.md)**, **[docs/project/TODO.md](./docs/project/TODO.md)**, and **[docs/project/PARITY_EXECUTION_PLAN.md](./docs/project/PARITY_EXECUTION_PLAN.md)**: Honest post-audit readiness matrix against `heylookitsanllm` `v2.0.251`, active **Phase 17 (`Waves A–E`)** parity execution blueprint, and parked Post-Parity Horizons.
 
 ## LLM Knowledge Wiki Router (Read Before Editing an Area)
 

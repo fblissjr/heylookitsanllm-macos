@@ -60,4 +60,4 @@ swift test
 - **[AGENTS.md](./AGENTS.md)** — Operating rules, build/test commands, and LLM Knowledge Wiki index router.
 - **[docs/USER_GUIDE.md](./docs/USER_GUIDE.md)** — Operator handbook for the 6-surface workbench, `heylook.toml`, `heylook-cli`, and `/v1/*` APIs.
 - **[docs/wiki/README.md](./docs/wiki/README.md)** — Deep-dive architecture wiki across all 8 subsystems.
-- **[docs/project/CURRENT.md](./docs/project/CURRENT.md)** & **[docs/project/TODO.md](./docs/project/TODO.md)** — Subsystem readiness matrix and parity roadmap.
+- **[docs/project/CURRENT.md](./docs/project/CURRENT.md)**, **[docs/project/TODO.md](./docs/project/TODO.md)**, & **[docs/project/PARITY_EXECUTION_PLAN.md](./docs/project/PARITY_EXECUTION_PLAN.md)** — Subsystem readiness matrix, Phase 17 parity backlog, and Waves A–E execution blueprint.
