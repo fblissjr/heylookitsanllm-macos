@@ -5,12 +5,15 @@ import HeylookCore
 public struct PresetsSurface: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     @State private var draftID: String?
     @State private var draftName: String = ""
     @State private var draftScope: String = "sampler"
     @State private var draftDescription: String = ""
     @State private var draftSystemPrompt: String = ""
+    @State private var draftLoadedUpdatedUnixMs: Int64?
+    @State private var draftOriginalHadSystemPrompt: Bool = false
 
     @State private var draftTemperature: Double?
     @State private var draftTopP: Double?
@@ -26,6 +29,10 @@ public struct PresetsSurface: View {
     @State private var draftThinkingBudget: Int?
     @State private var draftStopSequencesText: String = ""
     @State private var isCreatingNew: Bool = false
+
+    @State private var previewModelID: String = ""
+    @State private var showRemovePromptConfirmation: Bool = false
+    @State private var showConcurrencyConflictDialog: Bool = false
 
     public init(viewModel: HeylookWorkbenchViewModel) {
         self.viewModel = viewModel
@@ -81,6 +88,12 @@ public struct PresetsSurface: View {
         }
         .onAppear {
             syncInitialSelection()
+            if previewModelID.isEmpty {
+                previewModelID = viewModel.selectedModelID.isEmpty
+                    ? (viewModel.notebookPresets.availableGenerationModels.first?.modelID ?? "")
+                    : viewModel.selectedModelID
+            }
+            Task { await viewModel.notebookPresets.refreshRemotePublicModelsForPreview() }
         }
         .onChange(of: viewModel.selectedPresetRecordID) { _, newID in
             guard !isCreatingNew else { return }
@@ -88,67 +101,83 @@ public struct PresetsSurface: View {
                 loadDraft(from: preset)
             }
         }
+        .confirmationDialog(
+            "Remove System Prompt?",
+            isPresented: $showRemovePromptConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Remove Prompt & Save", role: .destructive) {
+                Task { await executeDraftSave(forceOverwrite: false, skipPromptRemovalConfirm: true) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Saving this preset without a system prompt clears its saved prompt for future applies.")
+        }
+        .confirmationDialog(
+            "Preset Updated Concurrently",
+            isPresented: $showConcurrencyConflictDialog,
+            titleVisibility: .visible
+        ) {
+            if let serverRecord = viewModel.notebookPresets.presetConflictServerRecord {
+                Button("Reload Latest Copy") {
+                    loadDraft(from: serverRecord)
+                    viewModel.notebookPresets.clearPresetConflict()
+                }
+            }
+            Button("Overwrite Anyway", role: .destructive) {
+                Task { await executeDraftSave(forceOverwrite: true, skipPromptRemovalConfirm: true) }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.notebookPresets.clearPresetConflict()
+            }
+        } message: {
+            Text(viewModel.notebookPresets.presetConcurrencyConflictMessage ?? "This preset changed after you opened it.")
+        }
     }
 
     @ViewBuilder
     private var editorPane: some View {
+        let contrastStyle = AdaptiveContrastStyle(colorSchemeContrast)
         if isCreatingNew || selectedPreset != nil {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    HStack(alignment: .center, spacing: 10) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(isCreatingNew ? "New Preset" : (draftName.isEmpty ? "Edit Preset" : draftName))
-                                .font(.title3.weight(.semibold))
-                            Text(
-                                isCreatingNew
-                                    ? "Create a reusable sampler or full (sampler + system prompt) preset."
-                                    : "Preset ID: \(draftID ?? "—")"
-                            )
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .center, spacing: 10) {
+                            editorTitleHeader
+                            Spacer()
+                            editorActionButtons
                         }
-                        Spacer()
 
-                        if !isCreatingNew, let active = selectedPreset {
-                            Button {
-                                viewModel.applyPreset(active)
-                            } label: {
-                                Label(
-                                    viewModel.selectedPresetName == active.name ? "Applied" : "Apply to Chat / Notebook",
-                                    systemImage: viewModel.selectedPresetName == active.name ? "checkmark.circle.fill" : "play.circle"
-                                )
+                        VStack(alignment: .leading, spacing: 10) {
+                            editorTitleHeader
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                editorActionButtons
                             }
-                            .buttonStyle(.glass)
-                            .controlSize(.small)
+                        }
+                    }
 
-                            Button {
-                                if let copy = viewModel.duplicatePresetRecord(active) {
-                                    isCreatingNew = false
-                                    loadDraft(from: copy)
-                                }
-                            } label: {
-                                Label("Duplicate", systemImage: "plus.square.on.square")
+                    if let conflictMessage = viewModel.notebookPresets.presetConcurrencyConflictMessage {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            Text(conflictMessage)
+                                .font(.caption)
+                            Spacer()
+                            Button("Resolve…") {
+                                showConcurrencyConflictDialog = true
                             }
                             .buttonStyle(.bordered)
-                            .controlSize(.small)
-
-                            Button(role: .destructive) {
-                                viewModel.pendingConfirmation = .deletePreset(id: active.id, name: active.name)
-                            } label: {
-                                Label("Delete…", systemImage: "trash")
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
+                            .controlSize(.mini)
                         }
-
-                        Button {
-                            saveDraftPreset()
-                        } label: {
-                            Label(isCreatingNew ? "Create Preset" : "Save Changes", systemImage: "checkmark")
+                        .padding(10)
+                        .background(
+                            Color.orange.opacity(contrastStyle.bannerFillOpacity),
+                            in: RoundedRectangle(cornerRadius: 8)
+                        )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(contrastStyle.borderColor(.orange), lineWidth: contrastStyle.isIncreased ? 1 : 0.5)
                         }
-                        .buttonStyle(.glassProminent)
-                        .controlSize(.small)
-                        .disabled(draftName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
 
                     GroupBox("Identity & Scope") {
@@ -325,8 +354,15 @@ public struct PresetsSurface: View {
                             .font(.caption2)
                         }
                     }
+
+                    PresetModelPreviewSection(
+                        controller: viewModel.notebookPresets,
+                        previewModelID: $previewModelID,
+                        draftSettings: buildDraftSettings(),
+                        contrastStyle: contrastStyle
+                    )
                 }
-                .padding(18)
+                .padding(horizontalSizeClass == .compact ? 12 : 18)
             }
         } else {
             ContentUnavailableView(
@@ -334,6 +370,67 @@ public struct PresetsSurface: View {
                 systemImage: "slider.horizontal.3",
                 description: Text("Select a preset from the list or create a new sampler / full preset.")
             )
+        }
+    }
+
+    private var editorTitleHeader: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(isCreatingNew ? "New Preset" : (draftName.isEmpty ? "Edit Preset" : draftName))
+                .font(.title3.weight(.semibold))
+            Text(
+                isCreatingNew
+                    ? "Create a reusable sampler or full (sampler + system prompt) preset."
+                    : "Preset ID: \(draftID ?? "—")"
+            )
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+        }
+    }
+
+    private var editorActionButtons: some View {
+        HStack(spacing: 8) {
+            if !isCreatingNew, let active = selectedPreset {
+                Button {
+                    viewModel.applyPreset(active)
+                } label: {
+                    Label(
+                        viewModel.selectedPresetName == active.name ? "Applied" : "Apply",
+                        systemImage: viewModel.selectedPresetName == active.name ? "checkmark.circle.fill" : "play.circle"
+                    )
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+
+                Button {
+                    if let copy = viewModel.duplicatePresetRecord(active) {
+                        isCreatingNew = false
+                        loadDraft(from: copy)
+                    }
+                } label: {
+                    Label("Duplicate", systemImage: "plus.square.on.square")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button(role: .destructive) {
+                    viewModel.pendingConfirmation = .deletePreset(id: active.id, name: active.name)
+                } label: {
+                    Label("Delete…", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            Button {
+                saveDraftPreset()
+            } label: {
+                Label(isCreatingNew ? "Create Preset" : "Save Changes", systemImage: "checkmark")
+            }
+            .buttonStyle(.glassProminent)
+            .controlSize(.small)
+            .disabled(draftName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
 
@@ -351,6 +448,9 @@ public struct PresetsSurface: View {
     private func beginCreateNewPreset() {
         isCreatingNew = true
         draftID = nil
+        draftLoadedUpdatedUnixMs = nil
+        draftOriginalHadSystemPrompt = false
+        viewModel.notebookPresets.clearPresetConflict()
         draftName = "Custom Preset"
         draftScope = "sampler"
         draftDescription = ""
@@ -373,6 +473,10 @@ public struct PresetsSurface: View {
 
     private func loadDraft(from preset: PresetRecord) {
         draftID = preset.id
+        draftLoadedUpdatedUnixMs = preset.updatedUnixMs
+        let trimmedPresetPrompt = preset.systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        draftOriginalHadSystemPrompt = !trimmedPresetPrompt.isEmpty
+        viewModel.notebookPresets.clearPresetConflict()
         draftName = preset.name
         draftScope = preset.scope
         draftDescription = preset.description
@@ -432,14 +536,25 @@ public struct PresetsSurface: View {
     }
 
     private func saveDraftPreset() {
+        let trimmedSys = draftSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let willClearPrompt = !isCreatingNew && draftOriginalHadSystemPrompt && (draftScope != "full" || trimmedSys.isEmpty)
+        if willClearPrompt {
+            showRemovePromptConfirmation = true
+            return
+        }
+        Task { await executeDraftSave(forceOverwrite: false, skipPromptRemovalConfirm: false) }
+    }
+
+    private func executeDraftSave(forceOverwrite: Bool, skipPromptRemovalConfirm: Bool) async {
         let settings = buildDraftSettings()
         let trimmedSys = draftSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedPrompt: String? = draftScope == "full" ? (trimmedSys.isEmpty ? nil : draftSystemPrompt) : nil
         if isCreatingNew {
             if let created = viewModel.createNewPresetRecord(
                 name: draftName,
                 scope: draftScope,
                 description: draftDescription,
-                systemPrompt: draftScope == "full" ? (trimmedSys.isEmpty ? nil : draftSystemPrompt) : nil,
+                systemPrompt: resolvedPrompt,
                 settings: settings
             ) {
                 isCreatingNew = false
@@ -451,17 +566,160 @@ public struct PresetsSurface: View {
                 name: draftName.trimmingCharacters(in: .whitespacesAndNewlines),
                 scope: draftScope,
                 settings: settings,
-                systemPrompt: draftScope == "full" ? (trimmedSys.isEmpty ? nil : draftSystemPrompt) : nil,
-                description: draftDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                systemPrompt: resolvedPrompt,
+                description: draftDescription.trimmingCharacters(in: .whitespacesAndNewlines),
+                updatedUnixMs: draftLoadedUpdatedUnixMs ?? SQLiteStore.nowMillis(),
+                createdUnixMs: selectedPreset?.createdUnixMs ?? SQLiteStore.nowMillis()
             )
-            if let saved = viewModel.updatePresetRecord(record) {
+            if let saved = await viewModel.notebookPresets.savePresetRecordCheckingConcurrency(
+                record,
+                expectedUpdatedUnixMs: draftLoadedUpdatedUnixMs,
+                forceOverwrite: forceOverwrite
+            ) {
                 loadDraft(from: saved)
+            } else if viewModel.notebookPresets.presetConcurrencyConflictMessage != nil {
+                showConcurrencyConflictDialog = true
             }
         }
     }
 }
 
 // MARK: - Subviews
+
+private struct PresetModelPreviewSection: View {
+    @Bindable var controller: NotebookAndPresetsController
+    @Binding var previewModelID: String
+    let draftSettings: SamplerSettings
+    let contrastStyle: AdaptiveContrastStyle
+
+    private var models: [EngineDescription] {
+        controller.availableGenerationModels
+    }
+
+    private var effectiveModelID: String {
+        if !previewModelID.isEmpty, models.contains(where: { $0.modelID == previewModelID }) {
+            return previewModelID
+        }
+        return models.first?.modelID ?? ""
+    }
+
+    var body: some View {
+        GroupBox("Preview against Model (sampler_defaults & compatibility)") {
+            VStack(alignment: .leading, spacing: 10) {
+                if models.isEmpty {
+                    Text("No loaded or configured generation models available to preview against.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    HStack(spacing: 8) {
+                        Text("Preview against")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        Picker("Preview against model", selection: $previewModelID) {
+                            ForEach(models, id: \.modelID) { model in
+                                Text(model.modelID).tag(model.modelID)
+                            }
+                        }
+                        .labelsHidden()
+                        .onChange(of: previewModelID) { _, newValue in
+                            if models.first(where: { $0.modelID == newValue })?.provider == .remote {
+                                Task { await controller.refreshRemotePublicModelsForPreview() }
+                            }
+                        }
+                    }
+
+                    if let summary = controller.resolvePresetPreview(
+                        for: effectiveModelID,
+                        draftSettings: draftSettings
+                    ) {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 6) {
+                                Text("thinking_default: \(summary.thinkingDefault ? "true" : "false")")
+                                    .font(.caption2.monospaced())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.secondary.opacity(contrastStyle.chipFillOpacity), in: Capsule())
+
+                                ForEach(summary.capabilities, id: \.self) { cap in
+                                    Text(cap)
+                                        .font(.caption2.monospaced())
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.accentColor.opacity(contrastStyle.chipFillOpacity), in: Capsule())
+                                }
+                            }
+                        }
+
+                        if summary.unsupportedCount > 0 {
+                            Label(
+                                "\(summary.unsupportedCount) pinned preset field(s) are unsupported by \(summary.modelID) and will be ignored or dropped on apply.",
+                                systemImage: "exclamationmark.triangle.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        }
+
+                        VStack(spacing: 6) {
+                            ForEach(summary.entries) { entry in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(alignment: .center, spacing: 8) {
+                                        Text(entry.label)
+                                            .font(.caption.monospaced())
+                                            .frame(minWidth: 112, alignment: .leading)
+                                            .lineLimit(1)
+
+                                        Text(entry.presetValueText ?? "inherit")
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(entry.isOverriddenByPreset ? .primary : .secondary)
+                                            .lineLimit(1)
+
+                                        Spacer(minLength: 4)
+
+                                        HStack(spacing: 4) {
+                                            Text(entry.modelDefaultText ?? "—")
+                                                .font(.caption.monospaced())
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                            if let src = entry.modelDefaultSource {
+                                                Text(src)
+                                                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                                    .padding(.horizontal, 5)
+                                                    .padding(.vertical, 1)
+                                                    .background(
+                                                        (src == "model" ? Color.teal : (src == "vendor" ? Color.blue : Color.secondary))
+                                                            .opacity(contrastStyle.chipFillOpacity),
+                                                        in: Capsule()
+                                                    )
+                                            }
+                                        }
+
+                                        Text("→ \(entry.effectiveValueText)")
+                                            .font(.caption.monospaced().weight(.semibold))
+                                            .foregroundStyle(entry.isUnsupported ? .orange : (entry.isOverriddenByPreset ? Color.accentColor : .primary))
+                                            .lineLimit(1)
+                                    }
+
+                                    if let reason = entry.unsupportedReason {
+                                        Label(reason, systemImage: "exclamationmark.triangle.fill")
+                                            .font(.caption2)
+                                            .foregroundStyle(.orange)
+                                    }
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(
+                                    (entry.isUnsupported ? Color.orange.opacity(contrastStyle.bannerFillOpacity) : Color.clear),
+                                    in: RoundedRectangle(cornerRadius: 6)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(6)
+        }
+    }
+}
 
 private struct PresetsHeaderBar: View {
     @Bindable var viewModel: HeylookWorkbenchViewModel

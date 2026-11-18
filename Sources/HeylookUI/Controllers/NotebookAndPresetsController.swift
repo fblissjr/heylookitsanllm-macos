@@ -4,6 +4,55 @@ import HeylookCore
 import HeylookEngines
 import HeylookServer
 
+public enum NotebookPromptChipState: Equatable, Sendable {
+    case empty
+    case custom
+    case presetUnmodified(name: String)
+    case presetModified(name: String)
+
+    public var chipLabel: String {
+        switch self {
+        case .empty:
+            return "System prompt"
+        case .custom:
+            return "System prompt (custom)"
+        case .presetUnmodified(let name):
+            return "Prompt: \(name)"
+        case .presetModified(let name):
+            return "Prompt: \(name) (modified)"
+        }
+    }
+
+    public var isActiveOrModified: Bool {
+        switch self {
+        case .empty: return false
+        case .custom, .presetUnmodified, .presetModified: return true
+        }
+    }
+}
+
+public struct PresetModelPreviewEntry: Identifiable, Sendable, Equatable {
+    public let id: String
+    public let label: String
+    public let presetValueText: String?
+    public let modelDefaultText: String?
+    public let modelDefaultSource: String?
+    public let effectiveValueText: String
+    public let unsupportedReason: String?
+
+    public var isOverriddenByPreset: Bool { presetValueText != nil }
+    public var isUnsupported: Bool { unsupportedReason != nil }
+}
+
+public struct PresetModelPreviewSummary: Sendable, Equatable {
+    public let modelID: String
+    public let thinkingDefault: Bool
+    public let capabilities: [String]
+    public let entries: [PresetModelPreviewEntry]
+    public let unsupportedCount: Int
+    public let isRemoteDerived: Bool
+}
+
 /// Domain controller for Notebooks (inline cursor continuation, summarize, selection analysis,
 /// auto-save, Chat export) and Global Presets CRUD/filtering.
 ///
@@ -67,11 +116,15 @@ public final class NotebookAndPresetsController {
         didSet { recomputeFilteredPresets() }
     }
     public var selectedPresetRecordID: String? = nil
+    public private(set) var presetConflictServerRecord: PresetRecord?
+    public var presetConcurrencyConflictMessage: String?
+    public private(set) var cachedRemotePublicRows: [String: PublicModelWireRow] = [:]
 
     // MARK: - Shell Dependencies & Callbacks
 
     @ObservationIgnored private var isApplyingProgrammaticState: Bool = false
     @ObservationIgnored private var notebookAutoSaveTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingNotebookSaveSnapshot: (docID: String?, title: String, body: String, modelID: String?)?
     @ObservationIgnored private var remoteBackendProvider: () -> RemoteWorkbenchBackend? = { nil }
     @ObservationIgnored private var activeModelIDProvider: () -> String = { "" }
     @ObservationIgnored private var activeModelProvider: () -> EngineDescription? = { nil }
@@ -177,11 +230,22 @@ public final class NotebookAndPresetsController {
                 }
             }
             notebooks = loaded
-            if let first = loaded.first {
-                hydrateSelectedNotebook(first)
+            let preferredID = notebookSettings.readLastDocumentID()
+            if !loaded.isEmpty {
+                let initial = preferredID.flatMap { id in loaded.first(where: { $0.id == id }) } ?? loaded.first
+                if let initial {
+                    hydrateSelectedNotebook(initial)
+                }
+            } else if selectedNotebookID != nil {
+                hydrateEmptyNotebookState()
             }
         } catch {
             onStatusMessage("Remote notebook list failed: \(error.localizedDescription)")
+        }
+
+        let publicModels = await remote.listPublicModels()
+        if !publicModels.isEmpty {
+            cachedRemotePublicRows = Dictionary(uniqueKeysWithValues: publicModels.map { ($0.id, $0) })
         }
     }
 
@@ -248,11 +312,26 @@ public final class NotebookAndPresetsController {
     public func noteNotebookUserEdited() {
         guard !isApplyingProgrammaticState else { return }
         isNotebookDirty = true
+        let capturedDocID = selectedNotebookID
+        let capturedTitle = notebookTitle
+        let capturedBody = notebookBody
+        let capturedModel = activeModelIDProvider()
+        pendingNotebookSaveSnapshot = (
+            docID: capturedDocID,
+            title: capturedTitle,
+            body: capturedBody,
+            modelID: capturedModel.isEmpty ? nil : capturedModel
+        )
         notebookAutoSaveTask?.cancel()
         notebookAutoSaveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled else { return }
-            self?.saveNotebook()
+            self?.commitPendingNotebookSnapshotIfMatching(
+                docID: capturedDocID,
+                title: capturedTitle,
+                body: capturedBody,
+                modelID: capturedModel.isEmpty ? nil : capturedModel
+            )
         }
     }
 
@@ -260,7 +339,16 @@ public final class NotebookAndPresetsController {
         notebookAutoSaveTask?.cancel()
         notebookAutoSaveTask = nil
         notebookSettings.flushPendingWrites()
-        if isNotebookDirty {
+        if let pending = pendingNotebookSaveSnapshot {
+            pendingNotebookSaveSnapshot = nil
+            commitNotebookSnapshot(
+                targetID: pending.docID,
+                title: pending.title,
+                body: pending.body,
+                modelID: pending.modelID,
+                syncActiveSettings: pending.docID == nil || pending.docID == selectedNotebookID
+            )
+        } else if isNotebookDirty {
             saveNotebook()
         }
     }
@@ -348,7 +436,6 @@ public final class NotebookAndPresetsController {
                 selectNotebook(first.id)
             } else {
                 hydrateEmptyNotebookState()
-                notebookTitle = "Scratchpad"
             }
         }
     }
@@ -356,40 +443,117 @@ public final class NotebookAndPresetsController {
     public func saveNotebook() {
         notebookAutoSaveTask?.cancel()
         notebookAutoSaveTask = nil
-        do {
-            let targetID = selectedNotebookID ?? UUID().uuidString
-            let existing = selectedNotebookID.flatMap { try? store.getNotebook(id: $0) }
-            let selectedID = activeModelIDProvider()
-            let model = selectedID.isEmpty ? (generationModelsProvider().first?.modelID ?? "") : selectedID
-            let resolvedParams = notebookSettings.currentManualParamsForPersistence
-            let resolvedPresetID = notebookSettings.appliedPresetID
+        pendingNotebookSaveSnapshot = nil
+        notebookSettings.flushPendingWrites()
+        let selectedID = activeModelIDProvider()
+        let model = selectedID.isEmpty ? (generationModelsProvider().first?.modelID ?? "") : selectedID
+        commitNotebookSnapshot(
+            targetID: selectedNotebookID,
+            title: notebookTitle,
+            body: notebookBody,
+            modelID: model.isEmpty ? nil : model,
+            syncActiveSettings: true
+        )
+    }
 
+    private func commitPendingNotebookSnapshotIfMatching(
+        docID: String?,
+        title: String,
+        body: String,
+        modelID: String?
+    ) {
+        pendingNotebookSaveSnapshot = nil
+        commitNotebookSnapshot(
+            targetID: docID,
+            title: title,
+            body: body,
+            modelID: modelID,
+            syncActiveSettings: false
+        )
+    }
+
+    private func commitNotebookSnapshot(
+        targetID: String?,
+        title: String,
+        body: String,
+        modelID: String?,
+        syncActiveSettings: Bool
+    ) {
+        do {
+            let resolvedID = targetID ?? UUID().uuidString
+            let existing = targetID.flatMap { try? store.getNotebook(id: $0) }
+            let isStillSelected = (targetID == nil && selectedNotebookID == nil) || (resolvedID == selectedNotebookID)
+
+            // Field-scoped autosave (`notebook.js:doSave`): existing notebooks only update
+            // title/content/model_id on body debounce so prompt/params writes never clobber.
+            let resolvedSystemPrompt: String
+            let resolvedParams: SamplerSettings?
+            let resolvedPresetID: String?
+            if let existing, !syncActiveSettings {
+                resolvedSystemPrompt = existing.systemPrompt
+                resolvedParams = existing.params
+                resolvedPresetID = existing.appliedPresetID
+            } else {
+                resolvedSystemPrompt = isStillSelected ? notebookSettings.systemPrompt : (existing?.systemPrompt ?? "")
+                resolvedParams = isStillSelected ? notebookSettings.currentManualParamsForPersistence : existing?.params
+                resolvedPresetID = isStillSelected ? notebookSettings.appliedPresetID : existing?.appliedPresetID
+            }
+
+            let resolvedModel = (modelID?.isEmpty == false) ? modelID : existing?.modelID
             let nb = NotebookRecord(
-                id: targetID,
-                title: notebookTitle,
-                body: notebookBody,
-                systemPrompt: notebookSettings.systemPrompt,
-                modelID: model.isEmpty ? existing?.modelID : model,
+                id: resolvedID,
+                title: title,
+                body: body,
+                systemPrompt: resolvedSystemPrompt,
+                modelID: resolvedModel,
                 params: resolvedParams,
                 appliedPresetID: resolvedPresetID
             )
             try store.upsertNotebook(nb)
-            selectedNotebookID = nb.id
-            notebookSettings.saveLastDocumentID(nb.id)
+            if isStillSelected {
+                if selectedNotebookID == nil {
+                    selectedNotebookID = nb.id
+                    notebookSettings.saveLastDocumentID(nb.id)
+                    let targetModel = nb.modelID.flatMap { id in
+                        generationModelsProvider().first(where: { $0.modelID == id })
+                    } ?? activeModelProvider()
+                    notebookSettings.hydrateDocument(
+                        id: nb.id,
+                        systemPrompt: nb.systemPrompt,
+                        params: nb.params,
+                        appliedPresetID: nb.appliedPresetID,
+                        activeModel: targetModel,
+                        engineContract: nil
+                    )
+                } else {
+                    notebookSettings.saveLastDocumentID(nb.id)
+                }
+                if pendingNotebookSaveSnapshot == nil {
+                    isNotebookDirty = false
+                }
+            }
             notebooks = try store.listNotebooks()
-            isNotebookDirty = false
 
             if let remote = remoteBackendProvider() {
                 Task {
-                    _ = try? await remote.updateNotebook(
-                        id: nb.id,
-                        title: nb.title,
-                        content: nb.body,
-                        systemPrompt: nb.systemPrompt,
-                        modelID: nb.modelID,
-                        params: resolvedParams,
-                        appliedPresetID: resolvedPresetID
-                    )
+                    if existing != nil && !syncActiveSettings {
+                        _ = try? await remote.updateNotebook(
+                            id: nb.id,
+                            title: nb.title,
+                            content: nb.body,
+                            modelID: nb.modelID
+                        )
+                    } else {
+                        _ = try? await remote.updateNotebook(
+                            id: nb.id,
+                            title: nb.title,
+                            content: nb.body,
+                            systemPrompt: nb.systemPrompt,
+                            modelID: nb.modelID,
+                            params: resolvedParams,
+                            appliedPresetID: resolvedPresetID
+                        )
+                    }
                 }
             }
         } catch {
@@ -426,16 +590,15 @@ public final class NotebookAndPresetsController {
         let head = nsBody.substring(to: insertionPoint)
         let tail = nsBody.substring(from: insertionPoint)
 
-        guard !head.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            onStatusMessage("Place the cursor after text in the notebook to continue from.")
-            return
-        }
+        // Allow generating into an empty notebook (or before any text) using upstream default prompt (`notebook.js:543`).
+        let trimmedHead = head.trimmingCharacters(in: .whitespacesAndNewlines)
+        let promptContent = trimmedHead.isEmpty ? "Continue writing." : head
 
         let trimmedNbSys = notebookSettings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         await streamNotebookInsertion(
             modelID: modelID,
             systemOverride: trimmedNbSys.isEmpty ? nil : notebookSettings.systemPrompt,
-            promptContent: head,
+            promptContent: promptContent,
             head: head,
             prefixInjection: "",
             tail: tail
@@ -713,12 +876,35 @@ public final class NotebookAndPresetsController {
 
     @discardableResult
     public func updatePresetRecord(_ updated: PresetRecord) -> PresetRecord? {
+        updatePresetRecord(updated, expectedUpdatedUnixMs: updated.updatedUnixMs, forceOverwrite: false)
+    }
+
+    @discardableResult
+    public func updatePresetRecord(
+        _ updated: PresetRecord,
+        expectedUpdatedUnixMs: Int64?,
+        forceOverwrite: Bool = false
+    ) -> PresetRecord? {
         do {
-            let saved = try store.updatePreset(id: updated.id, updated)
+            if !forceOverwrite, let expectedUpdatedUnixMs, let fresh = try? store.getPreset(id: updated.id),
+               fresh.updatedUnixMs != expectedUpdatedUnixMs {
+                presetConflictServerRecord = fresh
+                presetConcurrencyConflictMessage =
+                    "Preset \"\(fresh.name)\" changed in another window or background update. Review the latest copy or choose Overwrite Anyway."
+                onErrorMessage(presetConcurrencyConflictMessage)
+                onStatusMessage(presetConcurrencyConflictMessage)
+                return nil
+            }
+            var stamped = updated
+            stamped.updatedUnixMs = SQLiteStore.nowMillis()
+            let saved = try store.updatePreset(id: stamped.id, stamped)
+            presetConflictServerRecord = nil
+            presetConcurrencyConflictMessage = nil
             presets = try store.listPresets()
             selectedPresetRecordID = saved.id
             if let remote = remoteBackendProvider() {
-                Task { _ = try? await remote.updatePreset(id: saved.id, name: saved.name, systemPrompt: saved.systemPrompt, params: saved.settings) }
+                let clearPrompt: String?? = saved.systemPrompt == nil ? .some(nil) : .some(saved.systemPrompt)
+                Task { _ = try? await remote.updatePreset(id: saved.id, name: saved.name, systemPrompt: clearPrompt, params: saved.settings) }
             }
             onErrorMessage(nil)
             onStatusMessage("Saved preset \"\(saved.name)\".")
@@ -728,6 +914,45 @@ public final class NotebookAndPresetsController {
             onStatusMessage("Preset update failed: \(error.localizedDescription)")
             return nil
         }
+    }
+
+    /// Remote-aware preset update enforcing optimistic concurrency (`updated_at` / `updatedUnixMs`)
+    /// across both local SQLite and connected remote Heylook server before writing.
+    @discardableResult
+    public func savePresetRecordCheckingConcurrency(
+        _ updated: PresetRecord,
+        expectedUpdatedUnixMs: Int64?,
+        forceOverwrite: Bool = false
+    ) async -> PresetRecord? {
+        if !forceOverwrite, let expectedUpdatedUnixMs, let remote = remoteBackendProvider() {
+            if let remoteDTO = try? await remote.getPreset(id: updated.id),
+               let remoteUpdatedMs = WireTimestamp.unixMs(fromISO8601: remoteDTO.updatedAt),
+               remoteUpdatedMs != expectedUpdatedUnixMs {
+                let trimmedSys = remoteDTO.systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let remoteRecord = PresetRecord(
+                    id: remoteDTO.id,
+                    name: remoteDTO.name,
+                    scope: trimmedSys.isEmpty ? "sampler" : "full",
+                    settings: remoteDTO.params.settings,
+                    systemPrompt: trimmedSys.isEmpty ? nil : remoteDTO.systemPrompt,
+                    description: updated.description,
+                    updatedUnixMs: remoteUpdatedMs,
+                    createdUnixMs: WireTimestamp.unixMs(fromISO8601: remoteDTO.createdAt)
+                )
+                presetConflictServerRecord = remoteRecord
+                presetConcurrencyConflictMessage =
+                    "Preset \"\(remoteDTO.name)\" was updated on the server while you were editing. Reload or choose Overwrite Anyway."
+                onErrorMessage(presetConcurrencyConflictMessage)
+                onStatusMessage(presetConcurrencyConflictMessage)
+                return nil
+            }
+        }
+        return updatePresetRecord(updated, expectedUpdatedUnixMs: expectedUpdatedUnixMs, forceOverwrite: forceOverwrite)
+    }
+
+    public func clearPresetConflict() {
+        presetConflictServerRecord = nil
+        presetConcurrencyConflictMessage = nil
     }
 
     @discardableResult
@@ -794,6 +1019,241 @@ public final class NotebookAndPresetsController {
         notebooks = (try? store.listNotebooks()) ?? notebooks
         if let remote = remoteBackendProvider() {
             Task { _ = try? await remote.updateNotebook(id: docID, systemPrompt: systemPrompt) }
+        }
+    }
+
+    // MARK: - Notebook Model & 4-State System Prompt Chip
+
+    public var availableGenerationModels: [EngineDescription] {
+        generationModelsProvider()
+    }
+
+    public var activeNotebookModelID: String {
+        if let nbID = selectedNotebookID,
+           let nb = notebooks.first(where: { $0.id == nbID }),
+           let modelID = nb.modelID,
+           !modelID.isEmpty {
+            return modelID
+        }
+        return activeModelIDProvider()
+    }
+
+    public func selectNotebookModel(_ modelID: String) {
+        let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        onSelectModelID(trimmed)
+        let modelDesc = generationModelsProvider().first(where: { $0.modelID == trimmed })
+        notebookSettings.reconcileSettings(for: modelDesc, engineContract: nil, persistIfDropped: true)
+
+        guard let docID = selectedNotebookID,
+              var nb = try? store.getNotebook(id: docID) else {
+            noteNotebookUserEdited()
+            return
+        }
+        guard nb.modelID != trimmed else { return }
+        nb.modelID = trimmed
+        nb.updatedUnixMs = SQLiteStore.nowMillis()
+        try? store.upsertNotebook(nb)
+        notebooks = (try? store.listNotebooks()) ?? notebooks
+        if let remote = remoteBackendProvider() {
+            Task { _ = try? await remote.updateNotebook(id: docID, modelID: trimmed) }
+        }
+    }
+
+    /// 4-state prompt chip derivation matching upstream `preset-bar.js:promptState()`.
+    public var notebookPromptChipState: NotebookPromptChipState {
+        let livePrompt = notebookSettings.systemPrompt
+        let trimmedLive = livePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let stamped = notebookSettings.stampedPreset,
+           let presetSys = stamped.systemPrompt,
+           !presetSys.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return livePrompt == presetSys
+                ? .presetUnmodified(name: stamped.name)
+                : .presetModified(name: stamped.name)
+        }
+        return trimmedLive.isEmpty ? .empty : .custom
+    }
+
+    // MARK: - Preset Preview Against Model
+
+    public func refreshRemotePublicModelsForPreview() async {
+        guard let remote = remoteBackendProvider() else { return }
+        let publicModels = await remote.listPublicModels()
+        if !publicModels.isEmpty {
+            cachedRemotePublicRows = Dictionary(uniqueKeysWithValues: publicModels.map { ($0.id, $0) })
+        }
+    }
+
+    public func resolvePresetPreview(
+        for modelID: String?,
+        draftSettings: SamplerSettings
+    ) -> PresetModelPreviewSummary? {
+        let models = generationModelsProvider()
+        guard let targetID = modelID?.isEmpty == false ? modelID : (activeModelIDProvider().isEmpty ? models.first?.modelID : activeModelIDProvider()) else {
+            return nil
+        }
+        let desc = models.first(where: { $0.modelID == targetID })
+        let row: PublicModelWireRow
+        let isRemoteDerived: Bool
+        if let desc, desc.provider == .remote, let cachedRemote = cachedRemotePublicRows[desc.modelID] {
+            row = cachedRemote
+            isRemoteDerived = true
+        } else if let desc {
+            row = HeylookConfig.buildPublicWireRow(for: desc)
+            isRemoteDerived = false
+        } else if let cachedRemote = cachedRemotePublicRows[targetID] {
+            row = cachedRemote
+            isRemoteDerived = true
+        } else {
+            return nil
+        }
+
+        var entries: [PresetModelPreviewEntry] = []
+        var unsupportedCount = 0
+        for key in SamplerCascade.SamplerFieldKey.allCases {
+            let wireKey = key.canonicalWireKey
+            let presetVal = Self.jsonValue(in: draftSettings, for: key)
+            let defaultVal = row.samplerDefaults[wireKey]
+            let source = row.samplerSources[wireKey]
+            let effectiveVal = presetVal ?? defaultVal
+            let unsupported = Self.unsupportedPresetReason(
+                key: key,
+                presetValue: presetVal,
+                row: row,
+                modelDescription: desc
+            )
+            if unsupported != nil {
+                unsupportedCount += 1
+            }
+            entries.append(
+                PresetModelPreviewEntry(
+                    id: wireKey,
+                    label: Self.label(for: key),
+                    presetValueText: presetVal.map(Self.formatJSONValue),
+                    modelDefaultText: defaultVal.map(Self.formatJSONValue),
+                    modelDefaultSource: source,
+                    effectiveValueText: effectiveVal.map(Self.formatJSONValue) ?? "unset",
+                    unsupportedReason: unsupported
+                )
+            )
+        }
+
+        return PresetModelPreviewSummary(
+            modelID: row.id,
+            thinkingDefault: row.thinkingDefault,
+            capabilities: row.capabilities,
+            entries: entries,
+            unsupportedCount: unsupportedCount,
+            isRemoteDerived: isRemoteDerived
+        )
+    }
+
+    private static func jsonValue(in settings: SamplerSettings, for key: SamplerCascade.SamplerFieldKey) -> JSONValue? {
+        switch key {
+        case .temperature: return settings.temperature.map(JSONValue.double)
+        case .topP: return settings.topP.map(JSONValue.double)
+        case .topK: return settings.topK.map(JSONValue.int)
+        case .minP: return settings.minP.map(JSONValue.double)
+        case .repetitionPenalty: return settings.repetitionPenalty.map(JSONValue.double)
+        case .repetitionContextSize: return settings.repetitionContextSize.map(JSONValue.int)
+        case .presencePenalty: return settings.presencePenalty.map(JSONValue.double)
+        case .maxTokens: return settings.maxTokens.map(JSONValue.int)
+        case .seed: return settings.seed.map(JSONValue.int)
+        case .thinking: return settings.thinking.map(JSONValue.bool)
+        case .thinkingDepth: return settings.thinkingDepth.map(JSONValue.string)
+        case .thinkingBudget: return settings.thinkingBudget.map(JSONValue.int)
+        case .stopSequences:
+            guard let seq = settings.stopSequences, !seq.isEmpty else { return nil }
+            return .array(seq.map(JSONValue.string))
+        }
+    }
+
+    private static func label(for key: SamplerCascade.SamplerFieldKey) -> String {
+        switch key {
+        case .temperature: return "temperature"
+        case .topP: return "top_p"
+        case .topK: return "top_k"
+        case .minP: return "min_p"
+        case .repetitionPenalty: return "repetition_penalty"
+        case .repetitionContextSize: return "repetition_context_size"
+        case .presencePenalty: return "presence_penalty"
+        case .maxTokens: return "max_tokens"
+        case .seed: return "seed"
+        case .thinking: return "enable_thinking"
+        case .thinkingDepth: return "thinking_depth"
+        case .thinkingBudget: return "thinking_budget"
+        case .stopSequences: return "stop_sequences"
+        }
+    }
+
+    private static func formatJSONValue(_ value: JSONValue) -> String {
+        switch value {
+        case .null: return "null"
+        case .bool(let v): return v ? "true" : "false"
+        case .int(let v): return String(v)
+        case .double(let v): return String(format: "%.3g", v)
+        case .string(let v): return "\"\(v)\""
+        case .array(let arr): return "[\(arr.map(formatJSONValue).joined(separator: ", "))]"
+        case .object: return "{...}"
+        }
+    }
+
+    private static func unsupportedPresetReason(
+        key: SamplerCascade.SamplerFieldKey,
+        presetValue: JSONValue?,
+        row: PublicModelWireRow,
+        modelDescription: EngineDescription?
+    ) -> String? {
+        guard let presetValue else { return nil }
+        let wireKey = key.canonicalWireKey
+        if let supportedFields = row.engine.decoding.requestFields.value,
+           !supportedFields.contains(wireKey) && !supportedFields.contains(key.rawValue) {
+            return "Not in model decoding.request_fields"
+        }
+
+        let supportsThinking = row.capabilities.contains("thinking")
+            || (modelDescription?.supportsThinking.value ?? false)
+        let controls = modelDescription?.thinkingControls
+        let thinkingFacts = row.engine.thinking
+
+        switch key {
+        case .thinking:
+            if !supportsThinking {
+                return "Model does not support thinking"
+            }
+            let canDisable = controls?.canDisableThinking ?? true
+            if !canDisable, case .bool(false) = presetValue {
+                return "Thinking is always-on for this model (cannot disable)"
+            }
+            return nil
+
+        case .thinkingDepth:
+            if !supportsThinking {
+                return "Model does not support thinking"
+            }
+            let supportedDepths = controls?.depthValues ?? thinkingFacts?.depth?.values ?? []
+            if supportedDepths.isEmpty {
+                return "Model has no depth / reasoning_effort control"
+            }
+            if case .string(let depth) = presetValue, !supportedDepths.contains(depth) {
+                return "Supported levels: \(supportedDepths.joined(separator: ", "))"
+            }
+            return nil
+
+        case .thinkingBudget:
+            if !supportsThinking {
+                return "Model does not support thinking"
+            }
+            let budgetEnforced = (thinkingFacts?.budget?.enforced ?? false)
+                || row.capabilities.contains("thinking_budget")
+                || (controls?.budgetEnforced ?? false)
+            if !budgetEnforced {
+                return "thinking_budget is not enforced on this model"
+            }
+            return nil
+
+        default:
+            return nil
         }
     }
 }

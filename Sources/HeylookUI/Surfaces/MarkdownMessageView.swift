@@ -17,7 +17,7 @@ public struct MarkdownMessageView: View {
     public let text: String
     public var isStreaming: Bool = false
 
-    @State private var committedCharCount: Int = 0
+    @State private var committedPrefix: String = ""
     @State private var committedBlocks: [MarkdownBlock] = []
     @State private var activeTailBlocks: [MarkdownBlock] = []
     @State private var throttleTask: Task<Void, Never>?
@@ -77,9 +77,9 @@ public struct MarkdownMessageView: View {
 
     private func synchronizeStreamingNow(fullText: String) {
         lastThrottleTick = .now
-        if fullText.count < committedCharCount {
-            // Stream restarted or reset
-            committedCharCount = 0
+        if fullText.count < committedPrefix.count || (!committedPrefix.isEmpty && !fullText.hasPrefix(committedPrefix)) {
+            // Stream restarted, reset, or switched to a different turn.
+            committedPrefix = ""
             committedBlocks = []
         }
 
@@ -89,9 +89,9 @@ public struct MarkdownMessageView: View {
         let clampedOffset = min(max(0, splitUTF16Offset), totalUTF16)
 
         let prefixString = clampedOffset > 0 ? nsText.substring(to: clampedOffset) : ""
-        if prefixString.count != committedCharCount {
+        if prefixString != committedPrefix {
             committedBlocks = MarkdownParser.parseBlocks(prefixString, idOffset: 0)
-            committedCharCount = prefixString.count
+            committedPrefix = prefixString
         }
 
         let tailString = clampedOffset < totalUTF16 ? nsText.substring(from: clampedOffset) : ""
@@ -911,9 +911,14 @@ private struct MarkdownBlockView: View {
 }
 
 private struct MarkdownCodeBlockView: View {
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     let language: String?
     let code: String
     @State private var didCopy: Bool = false
+
+    private var contrast: AdaptiveContrastStyle {
+        AdaptiveContrastStyle(colorSchemeContrast)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -940,7 +945,8 @@ private struct MarkdownCodeBlockView: View {
                     }
                     .foregroundStyle(didCopy ? .green : .secondary)
                     .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
+                    .padding(.vertical, 4)
+                    .frame(minHeight: 28)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -948,10 +954,10 @@ private struct MarkdownCodeBlockView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .background(Color.secondary.opacity(0.14))
+            .background(Color.secondary.opacity(contrast.isIncreased ? 0.22 : 0.14))
 
             Divider()
-                .opacity(0.5)
+                .opacity(contrast.isIncreased ? 0.85 : 0.5)
 
             ScrollView(.horizontal, showsIndicators: true) {
                 Text(SyntaxHighlighter.highlight(code: code, language: language))
@@ -964,12 +970,12 @@ private struct MarkdownCodeBlockView: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(Color.secondary.opacity(0.08))
+                .fill(Color.secondary.opacity(contrast.isIncreased ? 0.14 : 0.08))
         )
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+                .strokeBorder(contrast.borderColor(.secondary), lineWidth: contrast.borderWidth)
         }
     }
 
@@ -984,9 +990,14 @@ private struct MarkdownCodeBlockView: View {
 }
 
 private struct MarkdownTableView: View {
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     let headers: [String]
     let alignments: [MarkdownTableAlignment]
     let rows: [[String]]
+
+    private var contrast: AdaptiveContrastStyle {
+        AdaptiveContrastStyle(colorSchemeContrast)
+    }
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: true) {
@@ -998,11 +1009,12 @@ private struct MarkdownTableView: View {
                             .padding(.horizontal, 10)
                             .padding(.vertical, 7)
                             .frame(maxWidth: .infinity, alignment: align.frameAlignment)
-                            .background(Color.secondary.opacity(0.14))
+                            .background(Color.secondary.opacity(contrast.isIncreased ? 0.22 : 0.14))
                     }
                 }
 
                 Divider()
+                    .opacity(contrast.isIncreased ? 0.9 : 0.6)
 
                 ForEach(rows.indices, id: \.self) { rowIdx in
                     let row = rows[rowIdx]
@@ -1014,18 +1026,18 @@ private struct MarkdownTableView: View {
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .frame(maxWidth: .infinity, alignment: align.frameAlignment)
-                                .background(rowIdx.isMultiple(of: 2) ? Color.clear : Color.secondary.opacity(0.04))
+                                .background(rowIdx.isMultiple(of: 2) ? Color.clear : Color.secondary.opacity(contrast.isIncreased ? 0.08 : 0.04))
                         }
                     }
                     if rowIdx < rows.count - 1 {
-                        Divider().opacity(0.45)
+                        Divider().opacity(contrast.isIncreased ? 0.8 : 0.45)
                     }
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay {
                 RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(Color.secondary.opacity(0.22), lineWidth: 1)
+                    .strokeBorder(contrast.borderColor(.secondary), lineWidth: max(1, contrast.borderWidth))
             }
         }
     }

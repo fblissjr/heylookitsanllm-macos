@@ -12,17 +12,20 @@ public struct CursorAwareTextEditor: NSViewRepresentable {
     @Binding public var selectedRange: NSRange
     public var isEditable: Bool
     public var onUserEdit: (() -> Void)?
+    public var onCommitBlur: (() -> Void)?
 
     public init(
         text: Binding<String>,
         selectedRange: Binding<NSRange>,
         isEditable: Bool = true,
-        onUserEdit: (() -> Void)? = nil
+        onUserEdit: (() -> Void)? = nil,
+        onCommitBlur: (() -> Void)? = nil
     ) {
         self._text = text
         self._selectedRange = selectedRange
         self.isEditable = isEditable
         self.onUserEdit = onUserEdit
+        self.onCommitBlur = onCommitBlur
     }
 
     public func makeCoordinator() -> Coordinator {
@@ -132,6 +135,11 @@ public struct CursorAwareTextEditor: NSViewRepresentable {
                 }
             }
         }
+
+        public func textDidEndEditing(_ notification: Notification) {
+            guard !isUpdatingProgrammatically else { return }
+            parent.onCommitBlur?()
+        }
     }
 }
 
@@ -143,17 +151,20 @@ public struct CursorAwareTextEditor: UIViewRepresentable {
     @Binding public var selectedRange: NSRange
     public var isEditable: Bool
     public var onUserEdit: (() -> Void)?
+    public var onCommitBlur: (() -> Void)?
 
     public init(
         text: Binding<String>,
         selectedRange: Binding<NSRange>,
         isEditable: Bool = true,
-        onUserEdit: (() -> Void)? = nil
+        onUserEdit: (() -> Void)? = nil,
+        onCommitBlur: (() -> Void)? = nil
     ) {
         self._text = text
         self._selectedRange = selectedRange
         self.isEditable = isEditable
         self.onUserEdit = onUserEdit
+        self.onCommitBlur = onCommitBlur
     }
 
     public func makeCoordinator() -> Coordinator {
@@ -243,6 +254,11 @@ public struct CursorAwareTextEditor: UIViewRepresentable {
                     self.parent.selectedRange = newRange
                 }
             }
+        }
+
+        public func textViewDidEndEditing(_ textView: UITextView) {
+            guard !isUpdatingProgrammatically else { return }
+            parent.onCommitBlur?()
         }
     }
 }

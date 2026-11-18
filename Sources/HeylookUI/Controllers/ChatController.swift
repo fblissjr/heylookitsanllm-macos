@@ -10,7 +10,106 @@ import HeylookServer
 
 #if os(macOS)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
 #endif
+
+/// Resident server or fallback image plan telemetry and target resize recommendation for a staged image.
+public struct StagedImagePlanState: Sendable, Equatable {
+    public let tokens: Int
+    public let targetWidth: Int?
+    public let targetHeight: Int?
+    public let currentWidth: Int
+    public let currentHeight: Int
+    public let originalWidth: Int
+    public let originalHeight: Int
+    public let isExactServerPlan: Bool
+    public let note: String?
+
+    public init(
+        tokens: Int,
+        targetWidth: Int? = nil,
+        targetHeight: Int? = nil,
+        currentWidth: Int,
+        currentHeight: Int,
+        originalWidth: Int,
+        originalHeight: Int,
+        isExactServerPlan: Bool,
+        note: String? = nil
+    ) {
+        self.tokens = tokens
+        self.targetWidth = targetWidth
+        self.targetHeight = targetHeight
+        self.currentWidth = currentWidth
+        self.currentHeight = currentHeight
+        self.originalWidth = originalWidth
+        self.originalHeight = originalHeight
+        self.isExactServerPlan = isExactServerPlan
+        self.note = note
+    }
+
+    public var actionLabel: String? {
+        guard isExactServerPlan else { return nil }
+        if currentWidth != originalWidth || currentHeight != originalHeight {
+            return "Full res"
+        }
+        if let tw = targetWidth, let th = targetHeight, (tw != currentWidth || th != currentHeight) {
+            return "Fit \(tw)×\(th)"
+        }
+        return nil
+    }
+}
+
+/// Editable attachment entry used inside inline turn editing, preserving kept stored media blocks
+/// verbatim alongside newly staged attachments.
+public struct EditableChatAttachment: Identifiable, Sendable, Equatable {
+    public enum Source: Sendable, Equatable {
+        case kept(MessagesRequest.MediaAttachment)
+        case staged(StagedChatAttachment)
+    }
+
+    public let id: String
+    public let kind: MessagesRequest.MediaKind
+    public let filename: String
+    public let dimensionsLabel: String?
+    public let previewData: Data?
+    public let source: Source
+
+    public init(kept attachment: MessagesRequest.MediaAttachment, hydrated: StagedChatAttachment? = nil) {
+        self.id = hydrated?.id ?? UUID().uuidString
+        self.kind = (attachment.kind == "audio") ? .audio : .image
+        self.filename = attachment.filename
+            ?? hydrated?.filename
+            ?? (self.kind == .audio ? "audio" : "image")
+        self.dimensionsLabel = hydrated?.dimensionsLabel
+        if let data = hydrated?.effectiveData {
+            self.previewData = data
+        } else if !attachment.dataBase64.isEmpty {
+            self.previewData = Data(base64Encoded: attachment.dataBase64)
+        } else {
+            self.previewData = nil
+        }
+        self.source = .kept(attachment)
+    }
+
+    public init(staged attachment: StagedChatAttachment) {
+        self.id = attachment.id
+        self.kind = attachment.kind
+        self.filename = attachment.filename
+        self.dimensionsLabel = attachment.dimensionsLabel
+        self.previewData = attachment.effectiveData
+        self.source = .staged(attachment)
+    }
+
+    public var contentPart: MessagesRequest.MessageTurn.ContentPart {
+        switch source {
+        case .kept(let att):
+            return .media(att)
+        case .staged(let staged):
+            return .media(staged.wireAttachment)
+        }
+    }
+}
 
 /// Domain controller for Chat conversations, multimodal staged/historical media, voice ASR,
 /// off-MainActor prompt preview, turn editing/forking/continuation, and token streaming.
@@ -21,11 +120,14 @@ import AppKit
 @Observable
 public final class ChatController {
     private static let orphanConversationKey = "__orphan__"
+    public static let maxStagedImages = 8
+    public static let maxStagedAudio = 2
 
     public let store: SQLiteStore
     public let scheduler: ComputeScheduler
     public let registry: RequestRegistry
     public let chatSettings: DocumentSettingsController
+    @ObservationIgnored private let localService: WorkbenchService
 
     // MARK: - Conversation & Message State
 
@@ -49,11 +151,14 @@ public final class ChatController {
 
     public var stagedAttachments: [StagedChatAttachment] = [] {
         didSet {
+            scheduleStagedImagePlanRefresh()
             if showPromptPreview {
                 schedulePromptPreviewRefresh()
             }
         }
     }
+    public private(set) var stagedImagePlansByID: [String: StagedImagePlanState] = [:]
+    public private(set) var isRefreshingImagePlans: Bool = false
     public private(set) var messageAttachmentsByID: [String: [StagedChatAttachment]] = [:]
     public private(set) var lastDroppedMediaCount: Int = 0
 
@@ -73,17 +178,60 @@ public final class ChatController {
     """
     public var responseFormatStrict: Bool = true
 
-    // MARK: - Streaming & Prompt Preview State
+    // MARK: - Streaming, Prefill & Background Re-Adoption State
 
     public var isGenerating: Bool = false
     public private(set) var generatingConversationID: String?
     public var activeRequestID: String?
     public private(set) var isEndingThinking: Bool = false
     public private(set) var streamStatusLine: String?
+    public private(set) var prefillProcessed: Int = 0
+    public private(set) var prefillTotal: Int = 0
     public var streamingThinking: String = ""
     public var streamingContent: String = ""
     public var streamingTPS: Double = 0
     public var streamingTokens: Int = 0
+
+    /// Non-destructive visual masking for `regenerate` / `continue` until `heylook_saved` commits.
+    public private(set) var streamingHiddenFromPosition: Int?
+    public private(set) var streamingContinueAnchorMessageID: String?
+    public private(set) var pendingStreamingUserMessage: MessageRecord?
+
+    /// Re-adopted live background generation when re-entering an active conversation.
+    public private(set) var backgroundGeneratingConversationID: String?
+
+    public var isSelectedConversationGenerating: Bool {
+        guard let sel = selectedConversationID else { return false }
+        return (isGenerating && generatingConversationID == sel)
+            || backgroundGeneratingConversationID == sel
+    }
+
+    public var isActivelyStreamingSelectedConversation: Bool {
+        guard let sel = selectedConversationID else { return false }
+        return isGenerating && generatingConversationID == sel
+    }
+
+    public var visibleConversationMessages: [MessageRecord] {
+        var rows = currentMessages.filter { msg in
+            if let sel = selectedConversationID,
+               isGenerating,
+               generatingConversationID == sel {
+                if let anchorID = streamingContinueAnchorMessageID, msg.id == anchorID {
+                    return false
+                }
+                if let hideFrom = streamingHiddenFromPosition, msg.position >= hideFrom {
+                    return false
+                }
+            }
+            return true
+        }
+        if let pending = pendingStreamingUserMessage,
+           pending.conversationID == selectedConversationID,
+           !rows.contains(where: { $0.id == pending.id }) {
+            rows.append(pending)
+        }
+        return rows
+    }
 
     public var showPromptPreview: Bool = false {
         didSet {
@@ -97,11 +245,24 @@ public final class ChatController {
     public private(set) var promptPreviewMarkers: [PromptMarkerSpan] = []
     public private(set) var isRenderingPromptPreview: Bool = false
 
+    // MARK: - Inline Model Load / Reload Panel State
+
+    public private(set) var activeAdminRow: AdminModelWireRow?
+    public var loadPanelCtxSize: Int? = nil
+    public var loadPanelFlashAttn: String? = nil
+    public private(set) var isLoadingPanelModel: Bool = false
+    public private(set) var loadPanelStatusMessage: String?
+    public private(set) var loadPanelStatusIsError: Bool = false
+
     // MARK: - Inline Message Edit & Model Switch Guard State
 
     public var editingMessageID: String?
     public var editingContent: String = ""
     public var editingThinking: String = ""
+    public var editingAttachments: [EditableChatAttachment] = []
+    public private(set) var editorPreviewResponse: PromptPreviewWireResponse?
+    public private(set) var editorPreviewError: String?
+    public private(set) var isRenderingEditorPreview: Bool = false
 
     public var pendingModelSwitchTargetID: String?
     public var modelSwitchWarningMessage: String?
@@ -129,6 +290,10 @@ public final class ChatController {
     @ObservationIgnored private var composerDraftByConversationID: [String: String] = [:]
     @ObservationIgnored private var composerMediaByConversationID: [String: [StagedChatAttachment]] = [:]
     @ObservationIgnored private var promptPreviewTask: Task<Void, Never>?
+    @ObservationIgnored private var imagePlanTask: Task<Void, Never>?
+    @ObservationIgnored private var activeGenerationTask: Task<Void, Never>?
+    @ObservationIgnored private var resyncPollTask: Task<Void, Never>?
+    @ObservationIgnored private var activeCancellationSignal: StreamCancellationSignal?
     @ObservationIgnored private var pendingVoiceAutoSend: Bool?
     @ObservationIgnored private var voiceRecorder: AVAudioRecorder?
     @ObservationIgnored private var voiceRecordingURL: URL?
@@ -160,6 +325,12 @@ public final class ChatController {
         self.scheduler = scheduler
         self.registry = registry
         self.chatSettings = chatSettings
+        self.localService = WorkbenchService(
+            store: store,
+            scheduler: scheduler,
+            registry: registry,
+            allowSyntheticFallback: false
+        )
     }
 
     public func configureDependencies(
@@ -181,6 +352,9 @@ public final class ChatController {
         self.activeEngineContractProvider = activeEngineContract
         self.sidecarLoader = sidecarLoader
         refreshASRAvailability()
+        Task { [weak self] in
+            await self?.refreshActiveAdminModel(resetDrafts: true)
+        }
     }
 
     // MARK: - Filtered Conversations & Store Sync
@@ -202,6 +376,11 @@ public final class ChatController {
             } else if let first = conversations.first {
                 selectConversation(first.id)
             }
+        } else if let sel = selectedConversationID {
+            checkBackgroundGenerationStatus(for: sel)
+        }
+        Task { [weak self] in
+            await self?.refreshActiveAdminModel(resetDrafts: false)
         }
     }
 
@@ -209,29 +388,44 @@ public final class ChatController {
         do {
             let list = try await remote.listConversations()
             var loadedConvs: [ConversationRecord] = []
+            var generatingIDs: Set<String> = []
             for summary in list.conversations {
                 if let detail = try? await remote.getConversation(id: summary.id) {
-                        let updatedMs = WireTimestamp.unixMs(fromISO8601: detail.updatedAt) ?? SQLiteStore.nowMillis()
-                        let createdMs = WireTimestamp.unixMs(fromISO8601: detail.createdAt) ?? updatedMs
-                        let record = ConversationRecord(
-                            id: detail.id,
-                            title: detail.title,
-                            systemPrompt: detail.systemPrompt ?? "",
-                            defaultModelID: detail.modelID,
-                            params: detail.params.settings == SamplerSettings() ? nil : detail.params.settings,
-                            appliedPresetID: detail.appliedPresetID,
-                            createdUnixMs: createdMs,
-                            updatedUnixMs: updatedMs
-                        )
+                    let updatedMs = WireTimestamp.unixMs(fromISO8601: detail.updatedAt) ?? SQLiteStore.nowMillis()
+                    let createdMs = WireTimestamp.unixMs(fromISO8601: detail.createdAt) ?? updatedMs
+                    let record = ConversationRecord(
+                        id: detail.id,
+                        title: detail.title,
+                        systemPrompt: detail.systemPrompt ?? "",
+                        defaultModelID: detail.modelID,
+                        params: detail.params.settings == SamplerSettings() ? nil : detail.params.settings,
+                        appliedPresetID: detail.appliedPresetID,
+                        createdUnixMs: createdMs,
+                        updatedUnixMs: updatedMs
+                    )
+                    if detail.generating {
+                        generatingIDs.insert(detail.id)
+                    }
                     loadedConvs.append(record)
                     try? store.upsertConversation(record)
                 }
             }
             conversations = loadedConvs
-            if let first = loadedConvs.first {
+            let preferredID = selectedConversationID ?? chatSettings.readLastDocumentID()
+            if let targetID = preferredID, loadedConvs.contains(where: { $0.id == targetID }) {
+                selectedConversationID = nil
+                selectConversation(targetID)
+                if generatingIDs.contains(targetID) {
+                    adoptBackgroundGeneration(for: targetID)
+                }
+            } else if let first = loadedConvs.first {
                 selectedConversationID = nil
                 selectConversation(first.id)
+                if generatingIDs.contains(first.id) {
+                    adoptBackgroundGeneration(for: first.id)
+                }
             }
+            await refreshActiveAdminModel(resetDrafts: true)
         } catch {
             onStatusMessage("Remote conversation list failed: \(error.localizedDescription)")
         }
@@ -241,7 +435,7 @@ public final class ChatController {
         switch event {
         case .conversationUpserted(let upsertedID):
             conversations = (try? store.listConversations()) ?? conversations
-            if selectedConversationID == upsertedID && activeSurface == .chat && !isGenerating {
+            if selectedConversationID == upsertedID && activeSurface == .chat && !isActivelyStreamingSelectedConversation {
                 if let conv = conversations.first(where: { $0.id == upsertedID }) {
                     chatSettings.hydrateDocument(
                         id: conv.id,
@@ -265,8 +459,24 @@ public final class ChatController {
                 }
             }
         case .messagesChanged(let convID):
-            if selectedConversationID == convID && !(isGenerating && generatingConversationID == convID) {
-                if let loaded = try? loadAndHydrateMessages(conversationID: convID) {
+            if selectedConversationID == convID {
+                if isGenerating && generatingConversationID == convID {
+                    // During `.append`, orchestrator commits the user turn right before streaming;
+                    // clear the optimistic placeholder once SQLite already contains it, while
+                    // keeping visual masking intact for `regenerate` / `continue`.
+                    if let loaded = try? loadAndHydrateMessages(conversationID: convID) {
+                        if let pending = pendingStreamingUserMessage,
+                           loaded.last?.role == "user",
+                           loaded.last?.content == pending.content {
+                            pendingStreamingUserMessage = nil
+                        }
+                        if streamingHiddenFromPosition != nil {
+                            currentMessages = loaded
+                        } else if loaded.count >= currentMessages.count {
+                            currentMessages = loaded
+                        }
+                    }
+                } else if let loaded = try? loadAndHydrateMessages(conversationID: convID) {
                     currentMessages = loaded
                 }
             }
@@ -276,6 +486,10 @@ public final class ChatController {
             messageAttachmentsByID.removeAll()
             composerDraftByConversationID.removeAll()
             composerMediaByConversationID.removeAll()
+            pendingStreamingUserMessage = nil
+            streamingHiddenFromPosition = nil
+            streamingContinueAnchorMessageID = nil
+            backgroundGeneratingConversationID = nil
             chatSettings.saveLastDocumentID(nil)
             chatSettings.hydrateDocument(
                 id: nil,
@@ -294,9 +508,200 @@ public final class ChatController {
     public func cancelBackgroundTasks() {
         promptPreviewTask?.cancel()
         promptPreviewTask = nil
+        imagePlanTask?.cancel()
+        imagePlanTask = nil
+        resyncPollTask?.cancel()
+        resyncPollTask = nil
+        activeCancellationSignal?.cancel()
+        activeGenerationTask?.cancel()
+        activeGenerationTask = nil
     }
 
-    // MARK: - Model Selection & Multimodal Switch Guard
+    // MARK: - Model Selection, Load Panel & Multimodal Switch Guard
+
+    public var isActiveModelGGUF: Bool {
+        if let row = activeAdminRow {
+            return row.provider == .gguf
+        }
+        return activeModelProvider()?.provider == .gguf
+    }
+
+    public var activeModelContextCeiling: Int {
+        if let len = activeAdminRow?.engine.context.length.value, len > 0 {
+            return len
+        }
+        if let ctx = activeModelProvider()?.contextSize.value, ctx > 0 {
+            return ctx
+        }
+        return 32_768
+    }
+
+    public var activeModelRunningContext: Int? {
+        guard let row = activeAdminRow, row.loaded,
+              let running = row.engine.context.running.value, running > 0 else {
+            return nil
+        }
+        return running
+    }
+
+    public var activeModelStaleReloadFields: [String] {
+        activeAdminRow?.staleReloadFields ?? []
+    }
+
+    public var activeModelFlashAttnDefaultLabel: String {
+        if case .string(let val)? = activeAdminRow?.engine.settings["flash_attn"]?.auto, !val.isEmpty {
+            return "Default (\(val))"
+        }
+        return "Default (on)"
+    }
+
+    public var activeModelContextStepChoices: [Int] {
+        let ceiling = max(512, activeModelContextCeiling)
+        var values = Set<Int>()
+        var power = 4096
+        while power < ceiling {
+            if power >= 512 {
+                values.insert(power)
+            }
+            power *= 2
+        }
+        values.insert(ceiling)
+        if case .int(let cfgCtx)? = activeAdminRow?.config["ctx_size"], cfgCtx >= 512 {
+            values.insert(min(cfgCtx, ceiling))
+        }
+        if let running = activeModelRunningContext, running >= 512 {
+            values.insert(min(running, ceiling))
+        }
+        if let draft = loadPanelCtxSize, draft >= 512 {
+            values.insert(min(draft, ceiling))
+        }
+        return values.sorted()
+    }
+
+    private var savedLoadCtxSize: Int? {
+        if case .int(let val)? = activeAdminRow?.config["ctx_size"], val >= 512 {
+            return val
+        }
+        return nil
+    }
+
+    private var savedLoadFlashAttn: String? {
+        if case .string(let val)? = activeAdminRow?.config["flash_attn"], !val.isEmpty {
+            return val
+        }
+        return nil
+    }
+
+    public var loadPanelHasPendingChanges: Bool {
+        guard isActiveModelGGUF else { return false }
+        let ceiling = max(512, activeModelContextCeiling)
+        let clampedDraftCtx = loadPanelCtxSize.map { min(max(512, $0), ceiling) }
+        return clampedDraftCtx != savedLoadCtxSize || loadPanelFlashAttn != savedLoadFlashAttn
+    }
+
+    public var canReloadActiveModel: Bool {
+        let isLoaded = activeAdminRow?.loaded ?? activeModelProvider()?.isLoaded ?? false
+        guard isLoaded else { return false }
+        return !activeModelStaleReloadFields.isEmpty || loadPanelHasPendingChanges
+    }
+
+    public func refreshActiveAdminModel(resetDrafts: Bool = false) async {
+        let modelID = activeModelIDProvider()
+        guard !modelID.isEmpty else {
+            activeAdminRow = nil
+            if resetDrafts {
+                loadPanelCtxSize = nil
+                loadPanelFlashAttn = nil
+                loadPanelStatusMessage = nil
+                loadPanelStatusIsError = false
+            }
+            return
+        }
+        do {
+            let row: AdminModelWireRow
+            if let remote = remoteBackendProvider() {
+                row = try await remote.adminModel(id: modelID)
+            } else {
+                row = try await localService.adminModel(id: modelID)
+            }
+            guard activeModelIDProvider() == modelID else { return }
+            activeAdminRow = row
+            if resetDrafts {
+                loadPanelCtxSize = savedLoadCtxSize
+                loadPanelFlashAttn = savedLoadFlashAttn
+                loadPanelStatusMessage = nil
+                loadPanelStatusIsError = false
+            }
+        } catch {
+            if resetDrafts {
+                activeAdminRow = nil
+                loadPanelCtxSize = nil
+                loadPanelFlashAttn = nil
+            }
+        }
+    }
+
+    public func performLoadOrReloadActiveModel(warm: Bool = true, reloadAnyway: Bool = false) async {
+        let modelID = activeModelIDProvider()
+        guard !modelID.isEmpty, !isLoadingPanelModel else { return }
+        isLoadingPanelModel = true
+        loadPanelStatusMessage = activeAdminRow?.loaded == true ? "Reloading \(modelID)…" : "Loading \(modelID)…"
+        loadPanelStatusIsError = false
+        defer { isLoadingPanelModel = false }
+
+        do {
+            let result: ModelLoadResult
+            let isLoaded = activeAdminRow?.loaded ?? activeModelProvider()?.isLoaded ?? false
+            var loadSettings: [String: JSONValue] = [:]
+            if isActiveModelGGUF {
+                let ceiling = max(512, activeModelContextCeiling)
+                let targetCtx = loadPanelCtxSize.map { min(max(512, $0), ceiling) }
+                if targetCtx != savedLoadCtxSize {
+                    loadSettings["ctx_size"] = targetCtx.map { .int($0) } ?? .null
+                }
+                if loadPanelFlashAttn != savedLoadFlashAttn {
+                    loadSettings["flash_attn"] = loadPanelFlashAttn.map { .string($0) } ?? .null
+                }
+            }
+
+            if isLoaded || reloadAnyway || !loadSettings.isEmpty {
+                let settingsPayload: [String: JSONValue]? = loadSettings.isEmpty ? nil : loadSettings
+                if let remote = remoteBackendProvider() {
+                    result = try await remote.reloadModel(id: modelID, loadSettings: settingsPayload, warm: warm)
+                } else {
+                    result = try await localService.reloadModel(id: modelID, loadSettings: settingsPayload, warm: warm)
+                }
+            } else {
+                if let remote = remoteBackendProvider() {
+                    result = try await remote.loadModel(id: modelID, warm: warm)
+                } else {
+                    result = try await localService.loadModel(id: modelID, warm: warm)
+                }
+            }
+
+            await refreshActiveAdminModel(resetDrafts: true)
+            scheduleStagedImagePlanRefresh()
+            if showPromptPreview {
+                schedulePromptPreviewRefresh()
+            }
+
+            if let warmErr = result.warmError, !warmErr.isEmpty {
+                loadPanelStatusMessage = "Loaded, warm-up failed: \(warmErr)"
+                loadPanelStatusIsError = true
+            } else if result.warmed == true, let ms = result.warmMs {
+                loadPanelStatusMessage = "Loaded & warmed in \(ms)ms"
+                loadPanelStatusIsError = false
+            } else {
+                loadPanelStatusMessage = "Model loaded"
+                loadPanelStatusIsError = false
+            }
+            await onGenerationCompleted?()
+        } catch {
+            loadPanelStatusMessage = error.localizedDescription
+            loadPanelStatusIsError = true
+            onStatusMessage("Model load failed for \(modelID): \(error.localizedDescription)")
+        }
+    }
 
     public func selectGenerationModel(_ targetModelID: String) {
         let currentID = activeModelIDProvider()
@@ -307,22 +712,18 @@ public final class ChatController {
         }
         guard let target = registeredModelsProvider().first(where: { $0.modelID == targetModelID }) else {
             onSelectModelID(targetModelID)
+            Task { [weak self] in
+                await self?.refreshActiveAdminModel(resetDrafts: true)
+                self?.scheduleStagedImagePlanRefresh()
+            }
             return
         }
 
-        let convImages = countConversationAttachments(ofKind: .image)
-        let convAudio = countConversationAttachments(ofKind: .audio)
-        var dropped: [String] = []
-        if convImages > 0 && !target.supportsVision.value {
-            dropped.append("\(convImages) image\(convImages == 1 ? "" : "s") (no vision)")
-        }
-        if convAudio > 0 && !target.supportsAudio.value {
-            dropped.append("\(convAudio) audio clip\(convAudio == 1 ? "" : "s") (no audio)")
-        }
-
+        // Strict parity: switch warning checks ONLY persisted history media (never staged composer media).
+        let dropped = incompatibilitiesForSwitch(to: target)
         if !dropped.isEmpty {
             pendingModelSwitchTargetID = targetModelID
-            modelSwitchWarningMessage = "Switching to '\(targetModelID)' will omit \(dropped.joined(separator: " and ")) in this conversation."
+            modelSwitchWarningMessage = "Switching to '\(targetModelID)' will omit \(dropped.joined(separator: " and ")) from persisted conversation history."
             return
         }
 
@@ -342,6 +743,11 @@ public final class ChatController {
     }
 
     private func commitModelSelection(_ targetModelID: String) {
+        // Mid-stream model switch stops the active stream first.
+        if isGenerating || isSelectedConversationGenerating {
+            cancelGeneration()
+        }
+
         onSelectModelID(targetModelID)
         let targetDesc = registeredModelsProvider().first(where: { $0.modelID == targetModelID })
         _ = chatSettings.reconcileSettings(for: targetDesc, engineContract: nil)
@@ -350,6 +756,8 @@ public final class ChatController {
             if let contract = await self.activeEngineContractProvider() {
                 _ = self.chatSettings.reconcileSettings(for: targetDesc, engineContract: contract)
             }
+            await self.refreshActiveAdminModel(resetDrafts: true)
+            self.scheduleStagedImagePlanRefresh()
         }
 
         if let convID = selectedConversationID,
@@ -367,23 +775,58 @@ public final class ChatController {
         }
     }
 
-    private func countConversationAttachments(ofKind kind: MessagesRequest.MediaKind) -> Int {
-        var count = stagedAttachments.filter { $0.kind == kind }.count
+    private func incompatibilitiesForSwitch(to target: EngineDescription) -> [String] {
+        let convImages = countPersistedHistoryAttachments(ofKind: .image)
+        let convAudio = countPersistedHistoryAttachments(ofKind: .audio)
+        var dropped: [String] = []
+        if convImages > 0 && !target.supportsVision.value {
+            dropped.append("\(convImages) image\(convImages == 1 ? "" : "s") (no vision)")
+        }
+        if convAudio > 0 && !target.supportsAudio.value {
+            dropped.append("\(convAudio) audio clip\(convAudio == 1 ? "" : "s") (no audio)")
+        }
+        return dropped
+    }
+
+    private func countPersistedHistoryAttachments(ofKind kind: MessagesRequest.MediaKind) -> Int {
+        var count = 0
         for msg in currentMessages {
-            count += (messageAttachmentsByID[msg.id] ?? []).filter { $0.kind == kind }.count
+            if let hydrated = messageAttachmentsByID[msg.id], !hydrated.isEmpty {
+                count += hydrated.filter { $0.kind == kind }.count
+            } else if let blocks = msg.contentBlocks {
+                count += blocks.filter { part in
+                    if case .media(let att) = part {
+                        return (att.kind == "audio" ? MessagesRequest.MediaKind.audio : .image) == kind
+                    }
+                    return false
+                }.count
+            }
         }
         return count
     }
 
     public func omittedMediaNote(for messageID: String) -> String? {
-        guard let attachments = messageAttachmentsByID[messageID], !attachments.isEmpty else {
+        let msg = currentMessages.first(where: { $0.id == messageID })
+        let hydrated = messageAttachmentsByID[messageID] ?? []
+        let mediaParts: [MessagesRequest.MediaKind]
+        if !hydrated.isEmpty {
+            mediaParts = hydrated.map(\.kind)
+        } else if let blocks = msg?.contentBlocks {
+            mediaParts = blocks.compactMap { part in
+                if case .media(let att) = part {
+                    return att.kind == "audio" ? .audio : .image
+                }
+                return nil
+            }
+        } else {
             return nil
         }
+        guard !mediaParts.isEmpty else { return nil }
         let activeDesc = activeModelProvider()
         let supportsVis = activeDesc?.supportsVision.value ?? false
         let supportsAud = activeDesc?.supportsAudio.value ?? false
-        let droppedImages = supportsVis ? 0 : attachments.filter { $0.kind == .image }.count
-        let droppedAudio = supportsAud ? 0 : attachments.filter { $0.kind == .audio }.count
+        let droppedImages = supportsVis ? 0 : mediaParts.filter { $0 == .image }.count
+        let droppedAudio = supportsAud ? 0 : mediaParts.filter { $0 == .audio }.count
         var parts: [String] = []
         if droppedImages > 0 {
             parts.append("\(droppedImages) image\(droppedImages == 1 ? "" : "s")")
@@ -397,7 +840,7 @@ public final class ChatController {
         return "\(parts.joined(separator: " & ")) not sent to \(modelLabel)"
     }
 
-    // MARK: - Conversation Lifecycle & System Prompt Persistence
+    // MARK: - Conversation Lifecycle, Background Re-Adoption & System Prompt Persistence
 
     private func stashComposerState(for key: String) {
         composerDraftByConversationID[key] = draftPrompt
@@ -415,10 +858,43 @@ public final class ChatController {
             stashComposerState(for: prevID)
         }
 
-        // Inheritance per presetForNewDoc(): stamped preset of open doc, or pre-doc draft.
         let inherited = chatSettings.presetForNewDoc()
         let selectedID = activeModelIDProvider()
         let model = selectedID.isEmpty ? (generationModelsProvider().first?.modelID ?? "") : selectedID
+
+        if let remote = remoteBackendProvider() {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let detail = try await remote.createConversation(
+                        title: "New Chat",
+                        modelID: model.isEmpty ? nil : model,
+                        systemPrompt: inherited.systemPrompt.isEmpty ? nil : inherited.systemPrompt,
+                        params: inherited.params,
+                        appliedPresetID: inherited.appliedPresetID
+                    )
+                    let updatedMs = WireTimestamp.unixMs(fromISO8601: detail.updatedAt) ?? SQLiteStore.nowMillis()
+                    let createdMs = WireTimestamp.unixMs(fromISO8601: detail.createdAt) ?? updatedMs
+                    let record = ConversationRecord(
+                        id: detail.id,
+                        title: detail.title,
+                        systemPrompt: detail.systemPrompt ?? "",
+                        defaultModelID: detail.modelID,
+                        params: detail.params.settings == SamplerSettings() ? nil : detail.params.settings,
+                        appliedPresetID: detail.appliedPresetID,
+                        createdUnixMs: createdMs,
+                        updatedUnixMs: updatedMs
+                    )
+                    try? store.upsertConversation(record)
+                    conversations = (try? store.listConversations()) ?? conversations
+                    chatSettings.clearPreDocDraftPrompt()
+                    selectConversation(record.id)
+                } catch {
+                    onStatusMessage("Could not create remote conversation: \(error.localizedDescription)")
+                }
+            }
+            return
+        }
 
         do {
             let conv = ConversationRecord(
@@ -430,6 +906,7 @@ public final class ChatController {
             )
             try store.upsertConversation(conv)
             conversations = try store.listConversations()
+            chatSettings.clearPreDocDraftPrompt()
             selectedConversationID = conv.id
             chatSettings.saveLastDocumentID(conv.id)
             currentMessages = []
@@ -444,18 +921,6 @@ public final class ChatController {
                 activeModel: activeModelProvider(),
                 engineContract: nil
             )
-
-            if let remote = remoteBackendProvider() {
-                Task {
-                    _ = try? await remote.createConversation(
-                        title: conv.title,
-                        modelID: conv.defaultModelID,
-                        systemPrompt: conv.systemPrompt.isEmpty ? nil : conv.systemPrompt,
-                        params: conv.params,
-                        appliedPresetID: conv.appliedPresetID
-                    )
-                }
-            }
             if showPromptPreview {
                 schedulePromptPreviewRefresh()
             }
@@ -466,6 +931,7 @@ public final class ChatController {
 
     public func selectConversation(_ id: String) {
         if selectedConversationID == id && !currentMessages.isEmpty {
+            checkBackgroundGenerationStatus(for: id)
             return
         }
         chatSettings.flushPendingWrites()
@@ -478,8 +944,14 @@ public final class ChatController {
         selectedConversationID = id
         chatSettings.saveLastDocumentID(id)
         editingMessageID = nil
+        editingAttachments = []
+        editorPreviewResponse = nil
+        editorPreviewError = nil
         pendingModelSwitchTargetID = nil
         modelSwitchWarningMessage = nil
+        backgroundGeneratingConversationID = nil
+        resyncPollTask?.cancel()
+        resyncPollTask = nil
 
         do {
             currentMessages = try loadAndHydrateMessages(conversationID: id)
@@ -490,8 +962,13 @@ public final class ChatController {
         if let conv = conversations.first(where: { $0.id == id }) ?? (try? store.getConversation(id: id)) {
             if let defModel = conv.defaultModelID,
                !defModel.isEmpty,
+               defModel != activeModelIDProvider(),
                generationModelsProvider().contains(where: { $0.modelID == defModel }) {
                 onSelectModelID(defModel)
+                Task { [weak self] in
+                    await self?.refreshActiveAdminModel(resetDrafts: true)
+                    self?.scheduleStagedImagePlanRefresh()
+                }
             }
             chatSettings.hydrateDocument(
                 id: conv.id,
@@ -501,24 +978,18 @@ public final class ChatController {
                 activeModel: activeModelProvider(),
                 engineContract: nil
             )
-            if let remote = remoteBackendProvider(), currentMessages.isEmpty {
+            if let remote = remoteBackendProvider() {
                 Task { [weak self] in
                     guard let self, let detail = try? await remote.getConversation(id: id) else { return }
                     let hydrated = detail.messages.map { wire in
-                        MessageRecord(
-                            id: wire.id,
-                            conversationID: id,
-                            position: wire.position,
-                            role: wire.role,
-                            content: wire.content,
-                            thinking: wire.thinking,
-                            modelID: wire.modelID,
-                            contentBlocks: wire.contentBlocks,
-                            stats: wire.stats
-                        )
+                        Self.messageRecord(from: wire, conversationID: id)
                     }
                     if self.selectedConversationID == id {
                         self.currentMessages = hydrated
+                        self.hydrateRemoteMessageAttachments(from: hydrated)
+                        if detail.generating && !(self.isGenerating && self.generatingConversationID == id) {
+                            self.adoptBackgroundGeneration(for: id)
+                        }
                     }
                 }
             }
@@ -533,22 +1004,114 @@ public final class ChatController {
             )
         }
         restoreComposerState(for: id)
+        checkBackgroundGenerationStatus(for: id)
 
         if showPromptPreview {
             schedulePromptPreviewRefresh()
         }
     }
 
+    private func checkBackgroundGenerationStatus(for conversationID: String) {
+        if !(isGenerating && generatingConversationID == conversationID) && registry.isConversationGenerating(conversationID) {
+            adoptBackgroundGeneration(for: conversationID)
+        }
+    }
+
+    private func adoptBackgroundGeneration(for conversationID: String) {
+        backgroundGeneratingConversationID = conversationID
+        if selectedConversationID == conversationID {
+            onStatusMessage("Generation running in background — syncing when complete.")
+        }
+        startResyncUntilSettled(for: conversationID)
+    }
+
+    private func startResyncUntilSettled(for conversationID: String) {
+        resyncPollTask?.cancel()
+        resyncPollTask = Task { [weak self] in
+            guard let self else { return }
+            let maxAttempts = 120
+            for _ in 0..<maxAttempts {
+                try? await Task.sleep(for: .milliseconds(750))
+                guard !Task.isCancelled else { return }
+
+                if let remote = self.remoteBackendProvider() {
+                    if let detail = try? await remote.getConversation(id: conversationID) {
+                        let hydrated = detail.messages.map { Self.messageRecord(from: $0, conversationID: conversationID) }
+                        if self.selectedConversationID == conversationID {
+                            self.currentMessages = hydrated
+                            self.hydrateRemoteMessageAttachments(from: hydrated)
+                        }
+                        if !detail.generating {
+                            if self.backgroundGeneratingConversationID == conversationID {
+                                self.backgroundGeneratingConversationID = nil
+                            }
+                            self.onStatusMessage(nil)
+                            await self.onGenerationCompleted?()
+                            return
+                        }
+                    }
+                } else {
+                    if let loaded = try? self.loadAndHydrateMessages(conversationID: conversationID),
+                       self.selectedConversationID == conversationID {
+                        self.currentMessages = loaded
+                    }
+                    if !self.registry.isConversationGenerating(conversationID) {
+                        if self.backgroundGeneratingConversationID == conversationID {
+                            self.backgroundGeneratingConversationID = nil
+                        }
+                        self.onStatusMessage(nil)
+                        await self.onGenerationCompleted?()
+                        return
+                    }
+                }
+            }
+            if self.backgroundGeneratingConversationID == conversationID {
+                self.backgroundGeneratingConversationID = nil
+            }
+        }
+    }
+
     public func cloneConversation(id: String, upToPosition: Int? = nil, newTitle: String? = nil) {
         chatSettings.flushPendingWrites()
+        if let remote = remoteBackendProvider() {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let detail = try await remote.cloneConversation(id: id, title: newTitle, upToPosition: upToPosition)
+                    let updatedMs = WireTimestamp.unixMs(fromISO8601: detail.updatedAt) ?? SQLiteStore.nowMillis()
+                    let createdMs = WireTimestamp.unixMs(fromISO8601: detail.createdAt) ?? updatedMs
+                    let record = ConversationRecord(
+                        id: detail.id,
+                        title: detail.title,
+                        systemPrompt: detail.systemPrompt ?? "",
+                        defaultModelID: detail.modelID,
+                        params: detail.params.settings == SamplerSettings() ? nil : detail.params.settings,
+                        appliedPresetID: detail.appliedPresetID,
+                        createdUnixMs: createdMs,
+                        updatedUnixMs: updatedMs
+                    )
+                    try? store.upsertConversation(record)
+                    conversations = (try? store.listConversations()) ?? conversations
+                    selectConversation(detail.id)
+                    onSwitchToChatSurface()
+                    if let upToPosition {
+                        onStatusMessage("Forked conversation at turn #\(upToPosition + 1) → \"\(detail.title)\".")
+                    } else {
+                        onStatusMessage("Cloned conversation → \"\(detail.title)\".")
+                    }
+                } catch {
+                    onErrorMessage(error.localizedDescription)
+                    onStatusMessage("Clone failed: \(error.localizedDescription)")
+                }
+            }
+            return
+        }
+
         do {
             let cloned = try store.cloneConversation(id: id, upToPosition: upToPosition, newTitle: newTitle)
             conversations = try store.listConversations()
             selectConversation(cloned.id)
             onSwitchToChatSurface()
-            if let remote = remoteBackendProvider() {
-                Task { _ = try? await remote.cloneConversation(id: id, title: newTitle, upToPosition: upToPosition) }
-            }
             if let upToPosition {
                 onStatusMessage("Forked conversation at turn #\(upToPosition + 1) → \"\(cloned.title)\".")
             } else {
@@ -573,6 +1136,11 @@ public final class ChatController {
     }
 
     public func deleteConversation(_ id: String) {
+        if backgroundGeneratingConversationID == id {
+            backgroundGeneratingConversationID = nil
+            resyncPollTask?.cancel()
+            resyncPollTask = nil
+        }
         let msgIDs = ((try? store.listMessages(conversationID: id)) ?? []).map(\.id)
         for mID in msgIDs {
             messageAttachmentsByID[mID] = nil
@@ -652,18 +1220,17 @@ public final class ChatController {
         let thinkOn = chatSettings.effectiveThinkingEnabled
         let depthOptions = chatSettings.activeModelDepthOptions
         let depthVal = depthOptions.isEmpty ? nil : chatSettings.effectiveThinkingDepth
+        let thinkingBudget = chatSettings.thinkingBudgetOverride
         let remoteBackend = remoteBackendProvider()
         let activeConvID = selectedConversationID
+        let service = localService
 
         isRenderingPromptPreview = true
         promptPreviewTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled else { return }
 
-            if activeModel?.provider == .remote,
-               let remoteBackend,
-               let activeConvID,
-               let activeModel {
+            if let activeConvID, let activeModel, activeModel.isLoaded {
                 let userParts: [MessagesRequest.MessageTurn.ContentPart] =
                     staged.map { .media($0.wireAttachment) }
                     + (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? [] : [.text(draft)])
@@ -675,18 +1242,21 @@ public final class ChatController {
                         model: activeModel.modelID,
                         system: sysPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : sysPrompt,
                         thinking: activeModel.supportsThinking.value ? .bool(thinkOn) : nil,
-                        thinkingDepth: depthVal
+                        thinkingDepth: depthVal,
+                        thinkingBudget: thinkingBudget
                     )
                 )
-                if let remotePreview = try? await remoteBackend.previewPrompt(conversationID: activeConvID, request: payload) {
+                let serverPreview: PromptPreviewWireResponse?
+                if activeModel.provider == .remote, let remoteBackend {
+                    serverPreview = try? await remoteBackend.previewPrompt(conversationID: activeConvID, request: payload)
+                } else {
+                    serverPreview = try? await service.previewPrompt(conversationID: activeConvID, request: payload)
+                }
+                if let serverPreview {
                     guard !Task.isCancelled else { return }
-                    var badges = [remotePreview.source]
-                    if remotePreview.droppedMedia.total > 0 {
-                        badges.append("\(remotePreview.droppedMedia.total) media omitted")
-                    }
-                    self?.promptPreviewText = remotePreview.prompt
-                    self?.promptPreviewSource = badges.joined(separator: " • ")
-                    self?.promptPreviewMarkers = []
+                    self?.promptPreviewText = serverPreview.prompt
+                    self?.promptPreviewSource = Self.formatPromptPreviewSummary(serverPreview)
+                    self?.promptPreviewMarkers = Self.computeMarkerSpans(in: serverPreview.prompt, markers: serverPreview.markers)
                     self?.isRenderingPromptPreview = false
                     return
                 }
@@ -757,52 +1327,238 @@ public final class ChatController {
         }
     }
 
-    // MARK: - Multimodal Attachments, Image Plan, Structured Output & Paste
-
-    public func estimateStagedImagePlan(for attachment: StagedChatAttachment) -> StagedImagePlanEstimate? {
-        guard attachment.kind == .image else { return nil }
-        let width: Int
-        let height: Int
-        if attachment.useShrunk2048, let sw = attachment.shrunkPixelWidth, let sh = attachment.shrunkPixelHeight {
-            width = sw
-            height = sh
-        } else if let ow = attachment.originalPixelWidth, let oh = attachment.originalPixelHeight {
-            width = ow
-            height = oh
-        } else {
-            return nil
+    public static func formatPromptPreviewSummary(_ response: PromptPreviewWireResponse) -> String {
+        var badges: [String] = [response.source]
+        if let tokens = response.tokenCount {
+            badges.append("\(tokens) tokens")
         }
-        guard width > 0, height > 0 else { return nil }
+        if let cont = response.continuation, !cont.isEmpty {
+            badges.append("continue:\(cont)")
+        }
+        if !response.markers.isEmpty {
+            badges.append("\(response.markers.count) markers")
+        }
+        if response.droppedMedia.total > 0 {
+            badges.append("\(response.droppedMedia.total) media omitted")
+        }
+        if response.unrenderedMedia > 0 {
+            badges.append("\(response.unrenderedMedia) unrendered media")
+        }
+        return badges.joined(separator: " • ")
+    }
 
-        var tokenCap = 280
-        if let active = activeModelProvider() {
-            if active.provider == .remote {
-                tokenCap = 1024
-            } else {
-                let dirURL = HeylookConfig.resolveModelDirectoryURL(from: active.modelPath)
-                let sidecarCap = sidecarLoader(active).imageMaxTokens
-                tokenCap = max(16, sidecarCap ?? HeylookConfig.estimateImageTokenBudget(in: dirURL))
+    public static func computeMarkerSpans(in prompt: String, markers: [String]) -> [PromptMarkerSpan] {
+        let unique = Array(Set(markers.filter { !$0.isEmpty })).sorted { $0.count > $1.count }
+        guard !prompt.isEmpty, !unique.isEmpty else { return [] }
+        var spans: [PromptMarkerSpan] = []
+        let chars = Array(prompt)
+        var occupied = Array(repeating: false, count: chars.count)
+        for token in unique {
+            let tokenChars = Array(token)
+            let tLen = tokenChars.count
+            guard tLen > 0, tLen <= chars.count else { continue }
+            var i = 0
+            while i <= chars.count - tLen {
+                if !occupied[i] && Array(chars[i..<(i + tLen)]) == tokenChars {
+                    var free = true
+                    for k in i..<(i + tLen) where occupied[k] {
+                        free = false
+                        break
+                    }
+                    if free {
+                        for k in i..<(i + tLen) {
+                            occupied[k] = true
+                        }
+                        spans.append(PromptMarkerSpan(start: i, end: i + tLen, token: token))
+                        i += tLen
+                        continue
+                    }
+                }
+                i += 1
             }
         }
-        let maxPixels = tokenCap * 28 * 28
-        let rawPixels = width * height
-        let scale = rawPixels > maxPixels ? sqrt(Double(maxPixels) / Double(rawPixels)) : 1.0
-        let targetW = max(28, Int((Double(width) * scale / 28.0).rounded() * 28.0))
-        let targetH = max(28, Int((Double(height) * scale / 28.0).rounded() * 28.0))
-        let estTokens = min(tokenCap, max(16, (targetW / 28) * (targetH / 28)))
+        return spans.sorted { $0.start < $1.start }
+    }
+
+    // MARK: - Multimodal Attachments, Resident Image Plan, Structured Output & Paste
+
+    public func scheduleStagedImagePlanRefresh() {
+        imagePlanTask?.cancel()
+        let imageAttachments = stagedAttachments.filter { $0.kind == .image }
+        guard !imageAttachments.isEmpty else {
+            stagedImagePlansByID = [:]
+            isRefreshingImagePlans = false
+            return
+        }
+
+        let activeModel = activeModelProvider()
+        let remote = remoteBackendProvider()
+        let service = localService
+
+        guard let activeModel else {
+            stagedImagePlansByID = [:]
+            isRefreshingImagePlans = false
+            return
+        }
+        guard activeModel.supportsVision.value else {
+            var next: [String: StagedImagePlanState] = [:]
+            for att in imageAttachments {
+                let dims = Self.currentPixelSize(for: att)
+                let orig = Self.originalPixelSize(for: att)
+                next[att.id] = StagedImagePlanState(
+                    tokens: 0,
+                    currentWidth: dims.width,
+                    currentHeight: dims.height,
+                    originalWidth: orig.width,
+                    originalHeight: orig.height,
+                    isExactServerPlan: false,
+                    note: "Model does not support images"
+                )
+            }
+            stagedImagePlansByID = next
+            isRefreshingImagePlans = false
+            return
+        }
+
+        guard activeModel.isLoaded else {
+            var next: [String: StagedImagePlanState] = [:]
+            for att in imageAttachments {
+                let dims = Self.currentPixelSize(for: att)
+                let orig = Self.originalPixelSize(for: att)
+                next[att.id] = StagedImagePlanState(
+                    tokens: 0,
+                    currentWidth: dims.width,
+                    currentHeight: dims.height,
+                    originalWidth: orig.width,
+                    originalHeight: orig.height,
+                    isExactServerPlan: false,
+                    note: "Load \(activeModel.modelID) for exact image tokens"
+                )
+            }
+            stagedImagePlansByID = next
+            isRefreshingImagePlans = false
+            return
+        }
+
+        isRefreshingImagePlans = true
+        imagePlanTask = Task { [weak self] in
+            var sizesPayload: [[Int]] = []
+            var entries: [(id: String, curW: Int, curH: Int, origW: Int, origH: Int, hasOrigPair: Bool)] = []
+            for att in imageAttachments {
+                let cur = Self.currentPixelSize(for: att)
+                let orig = Self.originalPixelSize(for: att)
+                guard cur.width > 0, cur.height > 0 else { continue }
+                let hasOrig = orig.width > 0 && orig.height > 0 && (orig.width != cur.width || orig.height != cur.height)
+                entries.append((att.id, cur.width, cur.height, orig.width, orig.height, hasOrig))
+                sizesPayload.append([cur.width, cur.height])
+                if hasOrig {
+                    sizesPayload.append([orig.width, orig.height])
+                }
+            }
+            guard !sizesPayload.isEmpty else {
+                self?.stagedImagePlansByID = [:]
+                self?.isRefreshingImagePlans = false
+                return
+            }
+
+            do {
+                let plan: ImagePlanWireResponse
+                if activeModel.provider == .remote, let remote {
+                    plan = try await remote.planImages(id: activeModel.modelID, sizes: sizesPayload)
+                } else {
+                    plan = try await service.planImages(id: activeModel.modelID, sizes: sizesPayload)
+                }
+                guard !Task.isCancelled else { return }
+
+                var result: [String: StagedImagePlanState] = [:]
+                var rowIdx = 0
+                for entry in entries {
+                    guard rowIdx < plan.images.count else { break }
+                    let curRow = plan.images[rowIdx]
+                    rowIdx += 1
+                    let origRow: ImagePlanRow
+                    if entry.hasOrigPair, rowIdx < plan.images.count {
+                        origRow = plan.images[rowIdx]
+                        rowIdx += 1
+                    } else {
+                        origRow = curRow
+                    }
+                    let targetW = (origRow.target?.count == 2) ? origRow.target?[0] : ((curRow.target?.count == 2) ? curRow.target?[0] : nil)
+                    let targetH = (origRow.target?.count == 2) ? origRow.target?[1] : ((curRow.target?.count == 2) ? curRow.target?[1] : nil)
+                    result[entry.id] = StagedImagePlanState(
+                        tokens: curRow.tokens,
+                        targetWidth: targetW,
+                        targetHeight: targetH,
+                        currentWidth: entry.curW,
+                        currentHeight: entry.curH,
+                        originalWidth: entry.origW > 0 ? entry.origW : entry.curW,
+                        originalHeight: entry.origH > 0 ? entry.origH : entry.curH,
+                        isExactServerPlan: true,
+                        note: nil
+                    )
+                }
+                self?.stagedImagePlansByID = result
+                self?.isRefreshingImagePlans = false
+            } catch {
+                guard !Task.isCancelled else { return }
+                var unavailable: [String: StagedImagePlanState] = [:]
+                for entry in entries {
+                    unavailable[entry.id] = StagedImagePlanState(
+                        tokens: 0,
+                        currentWidth: entry.curW,
+                        currentHeight: entry.curH,
+                        originalWidth: entry.origW > 0 ? entry.origW : entry.curW,
+                        originalHeight: entry.origH > 0 ? entry.origH : entry.curH,
+                        isExactServerPlan: false,
+                        note: "Cost unavailable"
+                    )
+                }
+                self?.stagedImagePlansByID = unavailable
+                self?.isRefreshingImagePlans = false
+            }
+        }
+    }
+
+    private static func currentPixelSize(for att: StagedChatAttachment) -> (width: Int, height: Int) {
+        if att.useShrunk2048, let sw = att.shrunkPixelWidth, let sh = att.shrunkPixelHeight {
+            return (sw, sh)
+        }
+        return (att.originalPixelWidth ?? 0, att.originalPixelHeight ?? 0)
+    }
+
+    private static func originalPixelSize(for att: StagedChatAttachment) -> (width: Int, height: Int) {
+        (att.originalPixelWidth ?? 0, att.originalPixelHeight ?? 0)
+    }
+
+    public func estimateStagedImagePlan(for attachment: StagedChatAttachment) -> StagedImagePlanEstimate? {
+        guard attachment.kind == .image,
+              let exact = stagedImagePlansByID[attachment.id],
+              exact.isExactServerPlan else {
+            return nil
+        }
         return StagedImagePlanEstimate(
-            resizedWidth: targetW,
-            resizedHeight: targetH,
-            estimatedTokens: estTokens,
-            tokenCap: tokenCap
+            resizedWidth: exact.targetWidth ?? exact.currentWidth,
+            resizedHeight: exact.targetHeight ?? exact.currentHeight,
+            estimatedTokens: exact.tokens,
+            tokenCap: exact.tokens
         )
     }
 
     public var totalStagedImageTokens: Int {
         stagedAttachments.reduce(0) { sum, att in
-            guard att.kind == .image else { return sum }
-            return sum + (estimateStagedImagePlan(for: att)?.estimatedTokens ?? 280)
+            guard att.kind == .image,
+                  let plan = stagedImagePlansByID[att.id],
+                  plan.isExactServerPlan else {
+                return sum
+            }
+            return sum + plan.tokens
         }
+    }
+
+    public var hasExactTotalStagedImageTokens: Bool {
+        let images = stagedAttachments.filter { $0.kind == .image }
+        guard !images.isEmpty else { return false }
+        return images.allSatisfy { stagedImagePlansByID[$0.id]?.isExactServerPlan == true }
     }
 
     public var responseFormatValidationError: String? {
@@ -888,14 +1644,42 @@ public final class ChatController {
             return
         }
 
+        _ = stageMediaDataIfAllowed(kind: kind, mimeType: mime, filename: url.lastPathComponent, data: data)
+    }
+
+    @discardableResult
+    public func stageMediaDataIfAllowed(
+        kind: MessagesRequest.MediaKind,
+        mimeType: String,
+        filename: String,
+        data: Data
+    ) -> Bool {
+        if let active = activeModelProvider() {
+            if kind == .image && !active.supportsVision.value {
+                onStatusMessage("Model '\(active.modelID)' does not accept image attachments.")
+                return false
+            }
+            if kind == .audio && !active.supportsAudio.value {
+                onStatusMessage("Model '\(active.modelID)' does not accept audio attachments.")
+                return false
+            }
+        }
+        let currentCount = stagedAttachments.filter { $0.kind == kind }.count
+        let limit = (kind == .image) ? Self.maxStagedImages : Self.maxStagedAudio
+        if currentCount >= limit {
+            let noun = (kind == .image) ? "images" : "audio clips"
+            onStatusMessage("Maximum \(limit) \(noun) per message.")
+            return false
+        }
         stagedAttachments.append(
             StagedChatAttachment.make(
                 kind: kind,
-                mimeType: mime,
-                filename: url.lastPathComponent,
+                mimeType: mimeType,
+                filename: filename,
                 data: data
             )
         )
+        return true
     }
 
     #if os(macOS)
@@ -915,38 +1699,118 @@ public final class ChatController {
         }
         if let pngData = pb.data(forType: .png), !pngData.isEmpty {
             let stamp = Int(Date().timeIntervalSince1970)
-            stagedAttachments.append(
-                StagedChatAttachment.make(
-                    kind: .image,
-                    mimeType: "image/png",
-                    filename: "pasted-\(stamp).png",
-                    data: pngData
-                )
+            return stageMediaDataIfAllowed(
+                kind: .image,
+                mimeType: "image/png",
+                filename: "pasted-\(stamp).png",
+                data: pngData
             )
-            return true
         }
         if let tiffData = pb.data(forType: .tiff),
            let bitmap = NSBitmapImageRep(data: tiffData),
            let pngData = bitmap.representation(using: .png, properties: [:]) {
             let stamp = Int(Date().timeIntervalSince1970)
-            stagedAttachments.append(
-                StagedChatAttachment.make(
-                    kind: .image,
-                    mimeType: "image/png",
-                    filename: "pasted-\(stamp).png",
-                    data: pngData
-                )
+            return stageMediaDataIfAllowed(
+                kind: .image,
+                mimeType: "image/png",
+                filename: "pasted-\(stamp).png",
+                data: pngData
             )
-            return true
+        }
+        return false
+    }
+    #endif
+
+    #if canImport(UIKit)
+    @discardableResult
+    public func pasteAttachmentFromIOSClipboard() -> Bool {
+        let pb = UIPasteboard.general
+        if let image = pb.image, let pngData = image.pngData(), !pngData.isEmpty {
+            let stamp = Int(Date().timeIntervalSince1970)
+            return stageMediaDataIfAllowed(
+                kind: .image,
+                mimeType: "image/png",
+                filename: "pasted-\(stamp).png",
+                data: pngData
+            )
         }
         return false
     }
     #endif
 
     public func toggleAttachmentShrink(id: String) {
-        guard let idx = stagedAttachments.firstIndex(where: { $0.id == id }),
-              stagedAttachments[idx].canToggleShrink else { return }
+        guard let idx = stagedAttachments.firstIndex(where: { $0.id == id }) else { return }
+        let att = stagedAttachments[idx]
+        if let plan = stagedImagePlansByID[id], plan.isExactServerPlan {
+            if att.useShrunk2048 || plan.currentWidth != plan.originalWidth || plan.currentHeight != plan.originalHeight {
+                stagedAttachments[idx].useShrunk2048 = false
+                scheduleStagedImagePlanRefresh()
+                return
+            }
+            if let tw = plan.targetWidth, let th = plan.targetHeight,
+               (tw != plan.currentWidth || th != plan.currentHeight),
+               let resized = Self.resizeImageDataExact(att.originalData, width: tw, height: th, mimeType: att.mimeType) {
+                stagedAttachments[idx] = StagedChatAttachment(
+                    id: att.id,
+                    kind: att.kind,
+                    mimeType: att.mimeType,
+                    filename: att.filename,
+                    originalData: att.originalData,
+                    shrunk2048Data: resized.data,
+                    shrunkMimeType: resized.mimeType,
+                    originalPixelWidth: att.originalPixelWidth,
+                    originalPixelHeight: att.originalPixelHeight,
+                    shrunkPixelWidth: tw,
+                    shrunkPixelHeight: th,
+                    useShrunk2048: true
+                )
+                scheduleStagedImagePlanRefresh()
+                return
+            }
+        }
+        guard att.canToggleShrink else { return }
         stagedAttachments[idx].useShrunk2048.toggle()
+        scheduleStagedImagePlanRefresh()
+    }
+
+    private static func resizeImageDataExact(
+        _ data: Data,
+        width targetW: Int,
+        height targetH: Int,
+        mimeType: String
+    ) -> (data: Data, mimeType: String)? {
+        guard targetW > 0, targetH > 0,
+              let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            return nil
+        }
+        let colorSpace = cgImage.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: targetW,
+            height: targetH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
+        guard let scaled = ctx.makeImage() else { return nil }
+
+        let preferPNG = mimeType.lowercased().contains("png")
+        let utType = preferPNG ? UTType.png.identifier : UTType.jpeg.identifier
+        let outMime = preferPNG ? "image/png" : "image/jpeg"
+        let outData = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(outData, utType as CFString, 1, nil) else {
+            return nil
+        }
+        let options: [CFString: Any] = preferPNG ? [:] : [kCGImageDestinationLossyCompressionQuality: 0.9]
+        CGImageDestinationAddImage(dest, scaled, options as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return (outData as Data, outMime)
     }
 
     public func removeDraftAttachment(id: String) {
@@ -965,10 +1829,10 @@ public final class ChatController {
         let hasImage = stagedAttachments.contains { $0.kind == .image }
         let hasAudio = stagedAttachments.contains { $0.kind == .audio }
         if hasImage && !desc.supportsVision.value {
-            return "Model '\(desc.modelID)' does not support image inputs (supports_vision = false)."
+            return "Model '\(desc.modelID)' does not support image inputs (supports_vision = false). Remove staged images or switch models."
         }
         if hasAudio && !desc.supportsAudio.value {
-            return "Model '\(desc.modelID)' does not support audio inputs (supports_audio = false)."
+            return "Model '\(desc.modelID)' does not support audio inputs (supports_audio = false). Remove staged audio or switch models."
         }
         return nil
     }
@@ -1169,11 +2033,54 @@ public final class ChatController {
         }
     }
 
-    // MARK: - Send, Streaming & Turn Editing/Regeneration
+    // MARK: - Send, Canonical Saga Streaming & Turn Editing/Regeneration
+
+    public var activeModelCanEndThinking: Bool {
+        guard chatSettings.activeModelSupportsThinking else { return false }
+        if let adminEnforced = activeAdminRow?.engine.thinking?.budget?.enforced {
+            return adminEnforced
+        }
+        if let ctrlEnforced = activeModelProvider()?.thinkingControls?.budgetEnforced {
+            return ctrlEnforced
+        }
+        if let row = activeAdminRow {
+            return row.capabilities.contains("thinking_budget")
+        }
+        return false
+    }
+
+    public var activeModelBudgetDisabledReason: String? {
+        guard chatSettings.activeModelSupportsThinking else { return nil }
+        if let reason = activeAdminRow?.engine.thinking?.budget?.reason,
+           activeAdminRow?.engine.thinking?.budget?.enforced == false {
+            return reason
+        }
+        if let ctrl = activeModelProvider()?.thinkingControls,
+           ctrl.budgetEnforced == false {
+            return ctrl.budgetReason
+        }
+        return nil
+    }
+
+    public var canContinueEditedUserTurn: Bool {
+        if let row = activeAdminRow {
+            return row.provider != .gguf
+        }
+        return activeModelProvider()?.provider != .gguf
+    }
 
     public func sendChatPrompt() async {
+        // Pressing Send while a model-switch confirmation banner is pending commits the switch first.
+        if pendingModelSwitchTargetID != nil {
+            confirmPendingModelSwitch()
+        }
+
         let promptText = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard (!promptText.isEmpty || !stagedAttachments.isEmpty), !isGenerating else { return }
+        guard !promptText.isEmpty || !stagedAttachments.isEmpty else { return }
+        guard !isGenerating && !isSelectedConversationGenerating else {
+            onStatusMessage("Generation already in progress in this conversation.")
+            return
+        }
 
         if let warning = chatAttachmentCapabilityWarning {
             onStatusMessage(warning)
@@ -1192,46 +2099,117 @@ public final class ChatController {
         }
 
         if let existingConvID = selectedConversationID, registry.isConversationGenerating(existingConvID) {
-            onStatusMessage("Conversation is already generating (HTTP client or another session holds the conversation lock).")
+            adoptBackgroundGeneration(for: existingConvID)
+            onStatusMessage("Conversation is already generating in background.")
             return
         }
 
         chatSettings.flushPendingWrites()
         let pendingStaged = stagedAttachments
+        let rawDraftPrompt = draftPrompt
 
         if selectedConversationID == nil {
             let inherited = chatSettings.presetForNewDoc()
-            let conv = ConversationRecord(
-                title: "New Chat",
-                systemPrompt: inherited.systemPrompt,
-                defaultModelID: modelID,
-                params: inherited.params,
-                appliedPresetID: inherited.appliedPresetID
-            )
-            try? store.upsertConversation(conv)
-            conversations = (try? store.listConversations()) ?? []
-            selectedConversationID = conv.id
-            chatSettings.saveLastDocumentID(conv.id)
-            chatSettings.hydrateDocument(
-                id: conv.id,
-                systemPrompt: conv.systemPrompt,
-                params: conv.params,
-                appliedPresetID: conv.appliedPresetID,
-                activeModel: activeModelProvider(),
-                engineContract: nil
-            )
-            currentMessages = []
+            let initialTitle = Self.derivedConversationTitle(promptText: promptText, attachments: pendingStaged)
+
             if let remote = remoteBackendProvider() {
-                _ = try? await remote.createConversation(
-                    title: conv.title,
-                    modelID: conv.defaultModelID,
-                    systemPrompt: conv.systemPrompt.isEmpty ? nil : conv.systemPrompt,
-                    params: conv.params,
-                    appliedPresetID: conv.appliedPresetID
+                do {
+                    let detail = try await remote.createConversation(
+                        title: initialTitle,
+                        modelID: modelID,
+                        systemPrompt: inherited.systemPrompt.isEmpty ? nil : inherited.systemPrompt,
+                        params: inherited.params,
+                        appliedPresetID: inherited.appliedPresetID
+                    )
+                    let updatedMs = WireTimestamp.unixMs(fromISO8601: detail.updatedAt) ?? SQLiteStore.nowMillis()
+                    let createdMs = WireTimestamp.unixMs(fromISO8601: detail.createdAt) ?? updatedMs
+                    let conv = ConversationRecord(
+                        id: detail.id,
+                        title: detail.title,
+                        systemPrompt: detail.systemPrompt ?? "",
+                        defaultModelID: detail.modelID,
+                        params: detail.params.settings == SamplerSettings() ? nil : detail.params.settings,
+                        appliedPresetID: detail.appliedPresetID,
+                        createdUnixMs: createdMs,
+                        updatedUnixMs: updatedMs
+                    )
+                    try? store.upsertConversation(conv)
+                    conversations = (try? store.listConversations()) ?? conversations
+                    chatSettings.clearPreDocDraftPrompt()
+                    selectedConversationID = conv.id
+                    chatSettings.saveLastDocumentID(conv.id)
+                    chatSettings.hydrateDocument(
+                        id: conv.id,
+                        systemPrompt: conv.systemPrompt,
+                        params: conv.params,
+                        appliedPresetID: conv.appliedPresetID,
+                        activeModel: activeModelProvider(),
+                        engineContract: nil
+                    )
+                    currentMessages = []
+                } catch {
+                    onStatusMessage("Failed to create remote conversation: \(error.localizedDescription)")
+                    return
+                }
+            } else {
+                let conv = ConversationRecord(
+                    title: initialTitle,
+                    systemPrompt: inherited.systemPrompt,
+                    defaultModelID: modelID,
+                    params: inherited.params,
+                    appliedPresetID: inherited.appliedPresetID
                 )
+                try? store.upsertConversation(conv)
+                conversations = (try? store.listConversations()) ?? []
+                chatSettings.clearPreDocDraftPrompt()
+                selectedConversationID = conv.id
+                chatSettings.saveLastDocumentID(conv.id)
+                chatSettings.hydrateDocument(
+                    id: conv.id,
+                    systemPrompt: conv.systemPrompt,
+                    params: conv.params,
+                    appliedPresetID: conv.appliedPresetID,
+                    activeModel: activeModelProvider(),
+                    engineContract: nil
+                )
+                currentMessages = []
             }
         }
         guard let convID = selectedConversationID else { return }
+
+        if var conv = try? store.getConversation(id: convID),
+           currentMessages.isEmpty,
+           (conv.title == "New Chat" || conv.title == "New Conversation") {
+            let derived = Self.derivedConversationTitle(promptText: promptText, attachments: pendingStaged)
+            if derived != conv.title {
+                conv.title = derived
+                conv.defaultModelID = modelID
+                conv.updatedUnixMs = SQLiteStore.nowMillis()
+                try? store.upsertConversation(conv)
+                conversations = (try? store.listConversations()) ?? conversations
+                if let remote = remoteBackendProvider() {
+                    Task { _ = try? await remote.updateConversation(id: convID, title: derived, modelID: modelID) }
+                }
+            }
+        }
+
+        // Media-only messages store empty string "" + contentBlocks (never "[Attached: ...]").
+        let storedContent = promptText
+        let wireParts: [MessagesRequest.MessageTurn.ContentPart] =
+            pendingStaged.map { .media($0.wireAttachment) }
+            + (storedContent.isEmpty ? [] : [.text(storedContent)])
+        let pendingUser = MessageRecord(
+            conversationID: convID,
+            position: (currentMessages.map(\.position).max() ?? -1) + 1,
+            role: "user",
+            content: storedContent,
+            modelID: modelID,
+            contentBlocks: wireParts.isEmpty ? nil : wireParts
+        )
+        if !pendingStaged.isEmpty {
+            messageAttachmentsByID[pendingUser.id] = pendingStaged
+        }
+        pendingStreamingUserMessage = pendingUser
 
         draftPrompt = ""
         stagedAttachments = []
@@ -1240,42 +2218,44 @@ public final class ChatController {
         composerDraftByConversationID[Self.orphanConversationKey] = nil
         composerMediaByConversationID[Self.orphanConversationKey] = nil
 
-        do {
-            let nextPos = (currentMessages.map(\.position).max() ?? -1) + 1
-            let fallbackAttachmentLabel = pendingStaged.map(\.filename).joined(separator: ", ")
-            let storedContent = promptText.isEmpty ? "[Attached: \(fallbackAttachmentLabel)]" : promptText
-            let contentBlocks: [MessagesRequest.MessageTurn.ContentPart]? = pendingStaged.isEmpty
-                ? nil
-                : (pendingStaged.map { .media($0.wireAttachment) } + (promptText.isEmpty ? [] : [.text(promptText)]))
-            let userMsg = MessageRecord(
-                conversationID: convID,
-                position: nextPos,
-                role: "user",
-                content: storedContent,
-                modelID: modelID,
-                contentBlocks: contentBlocks
-            )
-            if !pendingStaged.isEmpty {
-                messageAttachmentsByID[userMsg.id] = pendingStaged
-            }
-            try store.appendMessage(userMsg)
-            currentMessages = try loadAndHydrateMessages(conversationID: convID)
-            if var conv = try store.getConversation(id: convID), conv.title == "New Chat" {
-                conv.title = String(storedContent.prefix(44))
-                conv.defaultModelID = modelID
-                conv.updatedUnixMs = SQLiteStore.nowMillis()
-                try store.upsertConversation(conv)
-                conversations = try store.listConversations()
-            }
-            await streamAssistantReply(for: convID, modelOverride: modelID)
-        } catch {
-            onStatusMessage("Chat error: \(error.localizedDescription)")
+        await streamConversationGeneration(
+            for: convID,
+            mode: .append,
+            messageID: nil,
+            content: storedContent,
+            userParts: wireParts,
+            modelOverride: modelID,
+            rollbackDraft: (rawDraftPrompt, pendingStaged, pendingUser.id)
+        )
+    }
+
+    private static func derivedConversationTitle(
+        promptText: String,
+        attachments: [StagedChatAttachment]
+    ) -> String {
+        if !promptText.isEmpty {
+            return String(promptText.prefix(44))
         }
+        let hasImages = attachments.contains { $0.kind == .image }
+        let hasAudio = attachments.contains { $0.kind == .audio }
+        if hasImages && hasAudio { return "Multimodal chat" }
+        if hasImages { return "Image chat" }
+        if hasAudio { return "Audio chat" }
+        return "New Chat"
     }
 
     private func loadAndHydrateMessages(conversationID: String) throws -> [MessageRecord] {
         let loaded = try store.listMessages(conversationID: conversationID, hydrateMedia: true)
-        for msg in loaded {
+        hydrateAttachmentsIfNeeded(from: loaded)
+        return loaded
+    }
+
+    private func hydrateRemoteMessageAttachments(from messages: [MessageRecord]) {
+        hydrateAttachmentsIfNeeded(from: messages)
+    }
+
+    private func hydrateAttachmentsIfNeeded(from messages: [MessageRecord]) {
+        for msg in messages {
             guard messageAttachmentsByID[msg.id] == nil, let blocks = msg.contentBlocks else { continue }
             var hydrated: [StagedChatAttachment] = []
             for block in blocks {
@@ -1298,23 +2278,49 @@ public final class ChatController {
                 messageAttachmentsByID[msg.id] = hydrated
             }
         }
-        return loaded
     }
 
-    private static func updatingTextInContentBlocks(
-        _ existingBlocks: [MessagesRequest.MessageTurn.ContentPart]?,
+    private static func messageRecord(from wire: WireMessageDTO, conversationID: String) -> MessageRecord {
+        let createdMs = WireTimestamp.unixMs(fromISO8601: wire.createdAt) ?? SQLiteStore.nowMillis()
+        let updatedMs = WireTimestamp.unixMs(fromISO8601: wire.updatedAt)
+        return MessageRecord(
+            id: wire.id,
+            conversationID: conversationID,
+            position: wire.position,
+            role: wire.role,
+            content: wire.content,
+            thinking: wire.thinking,
+            modelID: wire.modelID,
+            tokenCount: wire.stats?.outputTokens,
+            generationTPS: wire.stats?.generationTPS,
+            ttftMs: wire.stats?.ttftMs,
+            cacheReport: wire.stats?.cache,
+            speculativeReport: wire.stats?.speculative,
+            contentBlocks: wire.contentBlocks.isEmpty ? nil : wire.contentBlocks,
+            createdUnixMs: createdMs,
+            updatedUnixMs: updatedMs,
+            promptTPS: wire.stats?.promptTPS,
+            peakMemoryGB: wire.stats?.peakMemoryGB,
+            queueWaitMs: wire.stats?.queueWaitMs,
+            stats: wire.stats
+        )
+    }
+
+    private static func rebuiltContentBlocks(
+        for attachments: [EditableChatAttachment],
         newContent: String,
         newThinking: String?
     ) -> [MessagesRequest.MessageTurn.ContentPart]? {
-        guard let existingBlocks else { return nil }
+        let hasThinking = (newThinking?.isEmpty == false)
+        if attachments.isEmpty && !hasThinking {
+            return nil
+        }
         var rebuilt: [MessagesRequest.MessageTurn.ContentPart] = []
         if let th = newThinking, !th.isEmpty {
             rebuilt.append(.thinking(th))
         }
-        for block in existingBlocks {
-            if case .media = block {
-                rebuilt.append(block)
-            }
+        for att in attachments {
+            rebuilt.append(att.contentPart)
         }
         if !newContent.isEmpty || rebuilt.isEmpty {
             rebuilt.append(.text(newContent))
@@ -1322,50 +2328,234 @@ public final class ChatController {
         return rebuilt
     }
 
+    public func canEditMedia(for message: MessageRecord) -> Bool {
+        if message.role == "user" {
+            return true
+        }
+        let provider = activeAdminRow?.provider ?? activeModelProvider()?.provider
+        return provider != .mlx
+    }
+
     public func beginEditingMessage(_ message: MessageRecord) {
         editingMessageID = message.id
         editingContent = message.content
         editingThinking = message.thinking ?? ""
+        editorPreviewResponse = nil
+        editorPreviewError = nil
+
+        let hydrated = messageAttachmentsByID[message.id] ?? []
+        var items: [EditableChatAttachment] = []
+        if let blocks = message.contentBlocks, !blocks.isEmpty {
+            var hydratedIdx = 0
+            for block in blocks {
+                if case .media(let att) = block {
+                    let matched: StagedChatAttachment?
+                    if hydratedIdx < hydrated.count {
+                        matched = hydrated[hydratedIdx]
+                        hydratedIdx += 1
+                    } else {
+                        matched = nil
+                    }
+                    items.append(EditableChatAttachment(kept: att, hydrated: matched))
+                }
+            }
+        } else {
+            items = hydrated.map { EditableChatAttachment(staged: $0) }
+        }
+        editingAttachments = items
     }
 
     public func cancelEditingMessage() {
         editingMessageID = nil
         editingContent = ""
         editingThinking = ""
+        editingAttachments = []
+        editorPreviewResponse = nil
+        editorPreviewError = nil
+        isRenderingEditorPreview = false
+    }
+
+    public func removeEditingAttachment(id: String) {
+        editingAttachments.removeAll { $0.id == id }
+    }
+
+    public func moveEditingAttachment(id: String, delta: Int) {
+        guard let idx = editingAttachments.firstIndex(where: { $0.id == id }) else { return }
+        let dest = idx + delta
+        guard editingAttachments.indices.contains(dest) else { return }
+        editingAttachments.swapAt(idx, dest)
+    }
+
+    public func addMediaToEditingMessage(from urls: [URL], message: MessageRecord) {
+        guard canEditMedia(for: message) else {
+            onStatusMessage("MLX templates reject media inside assistant turns; attach media on user turns.")
+            return
+        }
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer {
+                if scoped { url.stopAccessingSecurityScopedResource() }
+            }
+            guard let data = try? Data(contentsOf: url), !data.isEmpty else { continue }
+            let ext = url.pathExtension.lowercased()
+            let audioExts: Set<String> = ["wav", "mp3", "m4a", "aac", "flac"]
+            let imageExts: Set<String> = ["png", "jpg", "jpeg", "webp", "heic", "gif", "tiff"]
+
+            let kind: MessagesRequest.MediaKind
+            let mime: String
+            if audioExts.contains(ext) {
+                kind = .audio
+                switch ext {
+                case "mp3": mime = "audio/mp3"
+                case "m4a", "aac": mime = "audio/mp4"
+                case "flac": mime = "audio/flac"
+                default: mime = "audio/wav"
+                }
+            } else if imageExts.contains(ext) {
+                kind = .image
+                switch ext {
+                case "png": mime = "image/png"
+                case "webp": mime = "image/webp"
+                case "gif": mime = "image/gif"
+                default: mime = "image/jpeg"
+                }
+            } else {
+                onStatusMessage("Unsupported media format '\(url.lastPathComponent)'.")
+                continue
+            }
+
+            if let active = activeModelProvider() {
+                if kind == .image && !active.supportsVision.value {
+                    onStatusMessage("Model '\(active.modelID)' does not accept image attachments.")
+                    continue
+                }
+                if kind == .audio && !active.supportsAudio.value {
+                    onStatusMessage("Model '\(active.modelID)' does not accept audio attachments.")
+                    continue
+                }
+            }
+            let currentCount = editingAttachments.filter { $0.kind == kind }.count
+            let limit = (kind == .image) ? Self.maxStagedImages : Self.maxStagedAudio
+            if currentCount >= limit {
+                onStatusMessage("Maximum \(limit) \(kind == .image ? "images" : "audio clips") per turn.")
+                continue
+            }
+
+            let staged = StagedChatAttachment.make(
+                kind: kind,
+                mimeType: mime,
+                filename: url.lastPathComponent,
+                data: data
+            )
+            editingAttachments.append(EditableChatAttachment(staged: staged))
+        }
+    }
+
+    public func previewEditorPrompt(for message: MessageRecord) async {
+        guard let convID = selectedConversationID else { return }
+        isRenderingEditorPreview = true
+        editorPreviewError = nil
+
+        let modelID = activeModelIDProvider()
+        let activeModel = activeModelProvider()
+        let sysPrompt = chatSettings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let depthOptions = chatSettings.activeModelDepthOptions
+        let depthVal = depthOptions.isEmpty ? nil : chatSettings.effectiveThinkingDepth
+
+        let payload = PromptPreviewRequestPayload(
+            mode: .continue,
+            messageID: message.id,
+            overrides: PromptPreviewOverrides(
+                model: modelID.isEmpty ? nil : modelID,
+                system: sysPrompt.isEmpty ? nil : chatSettings.systemPrompt,
+                thinking: (activeModel?.supportsThinking.value == true) ? .bool(chatSettings.effectiveThinkingEnabled) : nil,
+                thinkingDepth: depthVal,
+                thinkingBudget: chatSettings.thinkingBudgetOverride
+            ),
+            edits: [message.id: editingContent]
+        )
+
+        do {
+            let response: PromptPreviewWireResponse
+            if let remote = remoteBackendProvider() {
+                response = try await remote.previewPrompt(conversationID: convID, request: payload)
+            } else {
+                response = try await localService.previewPrompt(conversationID: convID, request: payload)
+            }
+            editorPreviewResponse = response
+            editorPreviewError = nil
+        } catch {
+            editorPreviewResponse = nil
+            editorPreviewError = error.localizedDescription
+        }
+        isRenderingEditorPreview = false
     }
 
     public func saveEditedMessageInPlace(_ message: MessageRecord) {
         guard let convID = selectedConversationID else { return }
-        if registry.isConversationGenerating(convID) {
+        if registry.isConversationGenerating(convID) || isSelectedConversationGenerating {
             onStatusMessage("Cannot edit while conversation is actively generating.")
             return
         }
-        do {
-            let trimmedThinking = editingThinking.trimmingCharacters(in: .whitespacesAndNewlines)
-            var updated = message
-            updated.content = editingContent
-            if message.role == "assistant" {
-                updated.thinking = trimmedThinking.isEmpty ? nil : editingThinking
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.persistEditedMessageAsync(message, conversationID: convID)
+                self.cancelEditingMessage()
+                if self.showPromptPreview {
+                    self.schedulePromptPreviewRefresh()
+                }
+            } catch {
+                self.onErrorMessage(error.localizedDescription)
+                self.onStatusMessage("Failed to save message edit: \(error.localizedDescription)")
             }
-            updated.contentBlocks = Self.updatingTextInContentBlocks(
-                updated.contentBlocks,
-                newContent: updated.content,
-                newThinking: updated.thinking
+        }
+    }
+
+    @discardableResult
+    private func persistEditedMessageAsync(
+        _ message: MessageRecord,
+        conversationID convID: String
+    ) async throws -> MessageRecord {
+        let trimmedThinking = editingThinking.trimmingCharacters(in: .whitespacesAndNewlines)
+        var updated = message
+        updated.content = editingContent
+        if message.role == "assistant" {
+            updated.thinking = trimmedThinking.isEmpty ? nil : editingThinking
+        }
+        updated.contentBlocks = Self.rebuiltContentBlocks(
+            for: editingAttachments,
+            newContent: updated.content,
+            newThinking: updated.thinking
+        )
+
+        if let remote = remoteBackendProvider() {
+            let wire = try await remote.updateMessage(
+                conversationID: convID,
+                messageID: updated.id,
+                content: updated.content,
+                contentBlocks: updated.contentBlocks ?? [.text(updated.content)],
+                thinking: updated.role == "assistant" ? updated.thinking : nil,
+                truncateAfter: false
             )
-            try store.appendMessage(updated)
-            cancelEditingMessage()
-            currentMessages = try loadAndHydrateMessages(conversationID: convID)
-            if showPromptPreview {
-                schedulePromptPreviewRefresh()
+            let mapped = Self.messageRecord(from: wire, conversationID: convID)
+            messageAttachmentsByID[mapped.id] = nil
+            hydrateAttachmentsIfNeeded(from: [mapped])
+            if let idx = currentMessages.firstIndex(where: { $0.id == mapped.id }) {
+                currentMessages[idx] = mapped
             }
-        } catch {
-            onErrorMessage(error.localizedDescription)
-            onStatusMessage("Failed to save message edit: \(error.localizedDescription)")
+            _ = try? store.appendMessage(mapped)
+            return mapped
+        } else {
+            let saved = try store.appendMessage(updated)
+            messageAttachmentsByID[saved.id] = nil
+            currentMessages = try loadAndHydrateMessages(conversationID: convID)
+            return saved
         }
     }
 
     public func saveAndRegenerateEditedMessage(_ message: MessageRecord) async {
-        guard let convID = selectedConversationID, !isGenerating else { return }
+        guard let convID = selectedConversationID, !isGenerating, !isSelectedConversationGenerating else { return }
         if registry.isConversationGenerating(convID) {
             onStatusMessage("Conversation is already generating.")
             return
@@ -1373,24 +2563,38 @@ public final class ChatController {
         do {
             if message.role == "assistant" {
                 cancelEditingMessage()
-                try store.deleteMessages(conversationID: convID, fromPosition: message.position)
-                currentMessages = try loadAndHydrateMessages(conversationID: convID)
-                await streamAssistantReply(for: convID)
+                streamingHiddenFromPosition = message.position
+                await streamConversationGeneration(
+                    for: convID,
+                    mode: .regenerate,
+                    messageID: message.id
+                )
                 return
             }
 
-            var updated = message
-            updated.content = editingContent
-            updated.contentBlocks = Self.updatingTextInContentBlocks(
-                updated.contentBlocks,
-                newContent: updated.content,
-                newThinking: updated.thinking
-            )
-            try store.appendMessage(updated)
-            try store.deleteMessages(conversationID: convID, fromPosition: message.position + 1)
+            let priorIndex = currentMessages.firstIndex(where: { $0.id == message.id })
+            let nextMessage = priorIndex.flatMap { idx in
+                (idx + 1 < currentMessages.count) ? currentMessages[idx + 1] : nil
+            }
+            let updated = try await persistEditedMessageAsync(message, conversationID: convID)
             cancelEditingMessage()
-            currentMessages = try loadAndHydrateMessages(conversationID: convID)
-            await streamAssistantReply(for: convID)
+
+            if let nextMessage {
+                // Non-destructive saga: hide downstream visually; SQLite tail commits atomically on heylook_saved.
+                streamingHiddenFromPosition = nextMessage.position
+                await streamConversationGeneration(
+                    for: convID,
+                    mode: .regenerate,
+                    messageID: nextMessage.id
+                )
+            } else {
+                streamingHiddenFromPosition = updated.position + 1
+                await streamConversationGeneration(
+                    for: convID,
+                    mode: .continue,
+                    messageID: updated.id
+                )
+            }
         } catch {
             onErrorMessage(error.localizedDescription)
             onStatusMessage("Failed to regenerate message: \(error.localizedDescription)")
@@ -1398,32 +2602,36 @@ public final class ChatController {
     }
 
     public func saveAndContinueEditedMessage(_ message: MessageRecord) async {
-        guard let convID = selectedConversationID, !isGenerating else { return }
+        guard let convID = selectedConversationID, !isGenerating, !isSelectedConversationGenerating else { return }
         if registry.isConversationGenerating(convID) {
             onStatusMessage("Conversation is already generating.")
             return
         }
+        if message.role == "user" && !canContinueEditedUserTurn {
+            onStatusMessage("GGUF models cannot continue directly from a user turn; use Save & Regenerate.")
+            return
+        }
         do {
-            let trimmedThinking = editingThinking.trimmingCharacters(in: .whitespacesAndNewlines)
-            var updated = message
-            updated.content = editingContent
-            if message.role == "assistant" {
-                updated.thinking = trimmedThinking.isEmpty ? nil : editingThinking
-            }
-            updated.contentBlocks = Self.updatingTextInContentBlocks(
-                updated.contentBlocks,
-                newContent: updated.content,
-                newThinking: updated.thinking
-            )
-            try store.appendMessage(updated)
-            try store.deleteMessages(conversationID: convID, fromPosition: message.position + 1)
+            let updated = try await persistEditedMessageAsync(message, conversationID: convID)
             cancelEditingMessage()
-            currentMessages = try loadAndHydrateMessages(conversationID: convID)
 
             if updated.role == "assistant" {
-                await streamAssistantReply(for: convID, continuingAssistantMessage: updated)
+                streamingContinueAnchorMessageID = updated.id
+                streamingHiddenFromPosition = updated.position + 1
+                await streamConversationGeneration(
+                    for: convID,
+                    mode: .continue,
+                    messageID: updated.id,
+                    initialThinking: updated.thinking ?? "",
+                    initialContent: updated.content
+                )
             } else {
-                await streamAssistantReply(for: convID)
+                streamingHiddenFromPosition = updated.position + 1
+                await streamConversationGeneration(
+                    for: convID,
+                    mode: .continue,
+                    messageID: updated.id
+                )
             }
         } catch {
             onErrorMessage(error.localizedDescription)
@@ -1432,39 +2640,42 @@ public final class ChatController {
     }
 
     public func regenerateAssistantMessage(_ message: MessageRecord) async {
-        guard let convID = selectedConversationID, !isGenerating else { return }
+        guard let convID = selectedConversationID, !isGenerating, !isSelectedConversationGenerating else { return }
         if registry.isConversationGenerating(convID) {
             onStatusMessage("Conversation is already generating.")
             return
         }
-        do {
-            try store.deleteMessages(conversationID: convID, fromPosition: message.position)
-            currentMessages = try loadAndHydrateMessages(conversationID: convID)
-            await streamAssistantReply(for: convID)
-        } catch {
-            onErrorMessage(error.localizedDescription)
-            onStatusMessage("Failed to regenerate turn: \(error.localizedDescription)")
-        }
+        // Non-destructive: mask replaced turns in UI while streaming; atomic replace happens on heylook_saved.
+        streamingHiddenFromPosition = message.position
+        await streamConversationGeneration(
+            for: convID,
+            mode: .regenerate,
+            messageID: message.id
+        )
     }
 
     public func continueAssistantMessage(_ message: MessageRecord) async {
-        guard let convID = selectedConversationID, !isGenerating, message.role == "assistant" else { return }
+        guard let convID = selectedConversationID, !isGenerating, !isSelectedConversationGenerating, message.role == "assistant" else {
+            return
+        }
         if registry.isConversationGenerating(convID) {
             onStatusMessage("Conversation is already generating.")
             return
         }
-        do {
-            try store.deleteMessages(conversationID: convID, fromPosition: message.position + 1)
-            currentMessages = try loadAndHydrateMessages(conversationID: convID)
-            await streamAssistantReply(for: convID, continuingAssistantMessage: message)
-        } catch {
-            onErrorMessage(error.localizedDescription)
-            onStatusMessage("Failed to continue assistant turn: \(error.localizedDescription)")
-        }
+        // Non-destructive: keep SQLite intact until heylook_saved commits anchor update + tail trim.
+        streamingContinueAnchorMessageID = message.id
+        streamingHiddenFromPosition = message.position + 1
+        await streamConversationGeneration(
+            for: convID,
+            mode: .continue,
+            messageID: message.id,
+            initialThinking: message.thinking ?? "",
+            initialContent: message.content
+        )
     }
 
     public func deleteSingleMessage(id: String, conversationID: String) {
-        if registry.isConversationGenerating(conversationID) {
+        if registry.isConversationGenerating(conversationID) || isSelectedConversationGenerating {
             onStatusMessage("Cannot delete messages while conversation is actively generating.")
             return
         }
@@ -1479,6 +2690,9 @@ public final class ChatController {
                 schedulePromptPreviewRefresh()
             }
         }
+        if let remote = remoteBackendProvider() {
+            Task { try? await remote.deleteMessage(conversationID: conversationID, messageID: id) }
+        }
     }
 
     public func streamAssistantReply(
@@ -1486,275 +2700,250 @@ public final class ChatController {
         modelOverride: String? = nil,
         continuingAssistantMessage: MessageRecord? = nil
     ) async {
+        if let cont = continuingAssistantMessage {
+            streamingContinueAnchorMessageID = cont.id
+            streamingHiddenFromPosition = cont.position + 1
+            await streamConversationGeneration(
+                for: convID,
+                mode: .continue,
+                messageID: cont.id,
+                modelOverride: modelOverride,
+                initialThinking: cont.thinking ?? "",
+                initialContent: cont.content
+            )
+        } else {
+            await streamConversationGeneration(
+                for: convID,
+                mode: .append,
+                messageID: nil,
+                modelOverride: modelOverride
+            )
+        }
+    }
+
+    private func streamConversationGeneration(
+        for convID: String,
+        mode: ConversationGenerateMode,
+        messageID: String?,
+        content: String = "",
+        userParts: [MessagesRequest.MessageTurn.ContentPart] = [],
+        modelOverride: String? = nil,
+        initialThinking: String = "",
+        initialContent: String = "",
+        rollbackDraft: (prompt: String, attachments: [StagedChatAttachment], tempUserID: String)? = nil
+    ) async {
         let selectedID = activeModelIDProvider()
         let modelID = modelOverride
             ?? (selectedID.isEmpty ? (generationModelsProvider().first?.modelID ?? "") : selectedID)
         guard !modelID.isEmpty else {
             onStatusMessage("No generation model selected or configured. Add scan_folders in heylook.toml or load the sample workspace.")
+            clearStreamingPresentationState()
             return
-        }
-
-        let reqID = "req_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
-        guard let execID = registry.tryAcquireConversationLock(
-            conversationID: convID,
-            requestID: reqID,
-            modelID: modelID
-        ) else {
-            onStatusMessage("Conversation '\(convID)' is already generating (shared lock active).")
-            HeylookObservabilityLog.shared.record(
-                level: "WARN",
-                category: "ui.chat",
-                message: "Blocked concurrent generation on locked conversation",
-                requestID: reqID,
-                metadata: ["conversation_id": convID, "model": modelID]
-            )
-            return
-        }
-        defer {
-            registry.releaseConversationLock(
-                conversationID: convID,
-                requestID: reqID,
-                executionID: execID
-            )
         }
 
         // Flush any debounced `chatSettings` edit BEFORE reading samplers/prompt for generation!
         chatSettings.flushPendingWrites()
         let sparseOverlay = chatSettings.requestSamplerOverlay
-        let resolvedEffective = chatSettings.currentResolvedSamplers.effective
         let supportsThinking = chatSettings.activeModelSupportsThinking
         let thinkingEnabled = chatSettings.effectiveThinkingEnabled
         let depthOptions = chatSettings.activeModelDepthOptions
         let depthValue = depthOptions.isEmpty ? nil : chatSettings.effectiveThinkingDepth
+        let convSystemPrompt = (try? store.getConversation(id: convID))?.systemPrompt ?? chatSettings.systemPrompt
+        let trimmedSys = convSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        let validatedResponseFormat: ResponseFormat?
+        do {
+            validatedResponseFormat = try buildValidatedResponseFormat()
+        } catch {
+            onStatusMessage("Structured output error: \(error.localizedDescription)")
+            if let rb = rollbackDraft {
+                restoreFailedDraft(rb, conversationID: convID)
+            }
+            clearStreamingPresentationState()
+            return
+        }
+
+        let reqID = "req_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
         let requestStartedAt = Date()
+
         activeRequestID = reqID
         isGenerating = true
         generatingConversationID = convID
         isEndingThinking = false
-        streamingThinking = continuingAssistantMessage?.thinking ?? ""
-        streamingContent = continuingAssistantMessage?.content ?? ""
+        prefillProcessed = 0
+        prefillTotal = 0
+        streamingThinking = initialThinking
+        streamingContent = initialContent
         streamingTPS = 0
         streamingTokens = 0
 
-        let targetDesc = await scheduler.modelDescription(for: modelID)
+        let targetDesc = activeModelProvider() ?? registeredModelsProvider().first(where: { $0.modelID == modelID })
         if targetDesc?.isLoaded == false {
-            streamStatusLine = "Loading \(modelID)… (first token follows model load)"
+            streamStatusLine = "Loading \(modelID)…"
         } else {
-            streamStatusLine = "Waiting for first token…"
+            streamStatusLine = "Waiting for the first token…"
+        }
+
+        let req = ConversationGenerateRequest(
+            model: modelID,
+            content: content,
+            mode: mode,
+            messageID: messageID,
+            userParts: userParts.isEmpty ? nil : userParts,
+            system: trimmedSys.isEmpty ? nil : convSystemPrompt,
+            thinking: supportsThinking ? thinkingEnabled : nil,
+            thinkingDepth: depthValue,
+            thinkingBudget: supportsThinking ? sparseOverlay.thinkingBudget : nil,
+            presetName: chatSettings.selectedPresetName,
+            sampling: sparseOverlay,
+            stopSequences: sparseOverlay.stopSequences,
+            responseFormat: validatedResponseFormat
+        )
+
+        let cancelSignal = StreamCancellationSignal()
+        activeCancellationSignal = cancelSignal
+
+        var firstTokenDate: Date?
+        var generatedTextAndThinkTokensApprox = 0
+        var inBandError: String?
+        var receivedSavedEvent: HeylookSavedEvent?
+
+        let handleFrame: @Sendable (String) async -> Void = { [weak self] frame in
+            guard let parsed = Self.parseSSEFrame(frame),
+                  let data = parsed.data.data(using: .utf8) else { return }
+
+            await MainActor.run {
+                guard let self else { return }
+                switch parsed.event {
+                case "heylook_progress":
+                    if let ev = try? JSONDecoder().decode(HeylookProgressSSEEvent.self, from: data) {
+                        self.streamStatusLine = nil
+                        self.prefillProcessed = ev.prefill.processed
+                        self.prefillTotal = ev.prefill.total
+                    }
+                case "content_block_delta":
+                    if let ev = try? JSONDecoder().decode(ContentBlockDeltaSSEEvent.self, from: data) {
+                        self.streamStatusLine = nil
+                        self.prefillProcessed = 0
+                        self.prefillTotal = 0
+                        if firstTokenDate == nil {
+                            firstTokenDate = Date()
+                        }
+                        if ev.delta.type == "thinking_delta" {
+                            let piece = ev.delta.thinking ?? ev.delta.text ?? ""
+                            if !piece.isEmpty {
+                                self.streamingThinking.append(piece)
+                                generatedTextAndThinkTokensApprox += 1
+                            }
+                        } else {
+                            let piece = ev.delta.text ?? ""
+                            if !piece.isEmpty {
+                                self.isEndingThinking = false
+                                self.streamingContent.append(piece)
+                                generatedTextAndThinkTokensApprox += 1
+                            }
+                        }
+                        self.streamingTokens = max(self.streamingTokens, generatedTextAndThinkTokensApprox)
+                        if let ft = firstTokenDate {
+                            let elapsed = Date().timeIntervalSince(ft)
+                            if elapsed > 0.08 && self.streamingTokens > 0 {
+                                self.streamingTPS = Double(self.streamingTokens) / elapsed
+                            }
+                        }
+                    }
+                case "message_delta":
+                    if let ev = try? JSONDecoder().decode(MessageDeltaSSEEvent.self, from: data),
+                       let out = ev.usage?.outputTokens, out > 0 {
+                        self.streamingTokens = out
+                        let elapsed = Date().timeIntervalSince(firstTokenDate ?? requestStartedAt)
+                        if elapsed > 0.05 {
+                            self.streamingTPS = Double(out) / elapsed
+                        }
+                    }
+                case "message_stop":
+                    if let ev = try? JSONDecoder().decode(MessageStopSSEEvent.self, from: data),
+                       let perf = ev.performance {
+                        if let tps = perf.generationTPS ?? perf.tokensPerSecond, tps > 0 {
+                            self.streamingTPS = tps
+                        }
+                    }
+                case "error":
+                    if let ev = try? JSONDecoder().decode(StreamErrorSSEEvent.self, from: data) {
+                        inBandError = ev.error.message
+                    }
+                case "heylook_saved":
+                    if let ev = try? JSONDecoder().decode(HeylookSavedEvent.self, from: data) {
+                        receivedSavedEvent = ev
+                    }
+                default:
+                    break
+                }
+            }
         }
 
         do {
-            let convMessages = try loadAndHydrateMessages(conversationID: convID)
-            if let cont = continuingAssistantMessage, selectedConversationID == convID {
-                currentMessages = convMessages.filter { $0.id != cont.id }
-            }
-
-            let supportsVis = targetDesc?.supportsVision.value ?? false
-            let supportsAud = targetDesc?.supportsAudio.value ?? false
-            var droppedMedia = 0
-
-            let turns: [MessagesRequest.MessageTurn] = convMessages.map { msg in
-                let staged = messageAttachmentsByID[msg.id] ?? []
-                if !staged.isEmpty {
-                    let allowedWire = staged.compactMap { att -> MessagesRequest.MediaAttachment? in
-                        if att.kind == .image && !supportsVis {
-                            droppedMedia += 1
-                            return nil
-                        }
-                        if att.kind == .audio && !supportsAud {
-                            droppedMedia += 1
-                            return nil
-                        }
-                        return att.wireAttachment
-                    }
-                    return MessagesRequest.MessageTurn(
-                        role: msg.role,
-                        content: msg.content,
-                        thinking: msg.thinking,
-                        attachments: allowedWire
-                    )
-                } else if let blocks = msg.contentBlocks, !blocks.isEmpty {
-                    var keptBlocks: [MessagesRequest.MessageTurn.ContentPart] = []
-                    for block in blocks {
-                        if case .media(let att) = block {
-                            if att.kind == "image" && !supportsVis {
-                                droppedMedia += 1
-                                continue
-                            }
-                            if att.kind == "audio" && !supportsAud {
-                                droppedMedia += 1
-                                continue
-                            }
-                        }
-                        keptBlocks.append(block)
-                    }
-                    return MessagesRequest.MessageTurn(
-                        role: msg.role,
-                        content: msg.content,
-                        thinking: msg.thinking,
-                        attachments: [],
-                        parts: keptBlocks
-                    )
-                } else {
-                    return MessagesRequest.MessageTurn(
-                        role: msg.role,
-                        content: msg.content,
-                        thinking: msg.thinking,
-                        attachments: []
-                    )
-                }
-            }
-            lastDroppedMediaCount = droppedMedia
-            if droppedMedia > 0 {
-                HeylookObservabilityLog.shared.record(
-                    level: "INFO",
-                    category: "ui.chat",
-                    message: "Omitted \(droppedMedia) historical media attachment(s) unsupported by \(modelID)",
-                    requestID: reqID,
-                    metadata: ["model": modelID, "dropped_media": "\(droppedMedia)"]
-                )
-            }
-
-            let provider = try await scheduler.provider(for: modelID)
-            let isRemoteProvider = provider is RemoteHeylookProvider
-            // Null-Means-Cascade on remote requests; resolved 5-layer cascade locally.
-            let effective = isRemoteProvider ? sparseOverlay : resolvedEffective
-            let convSystemPrompt = (try? store.getConversation(id: convID))?.systemPrompt ?? chatSettings.systemPrompt
-            let trimmedSys = convSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            let validatedResponseFormat = try buildValidatedResponseFormat()
-
-            let req = MessagesRequest(
-                model: modelID,
-                messages: turns,
-                system: trimmedSys.isEmpty ? nil : convSystemPrompt,
-                maxTokens: effective.maxTokens,
-                temperature: effective.temperature,
-                topP: effective.topP,
-                topK: effective.topK,
-                minP: effective.minP,
-                repetitionPenalty: effective.repetitionPenalty,
-                repetitionContextSize: effective.repetitionContextSize,
-                presencePenalty: effective.presencePenalty,
-                seed: effective.seed,
-                stream: true,
-                thinking: isRemoteProvider ? effective.thinking : (supportsThinking ? thinkingEnabled : nil),
-                thinkingDepth: isRemoteProvider ? effective.thinkingDepth : depthValue,
-                thinkingBudget: isRemoteProvider ? effective.thinkingBudget : (supportsThinking ? effective.thinkingBudget : nil),
-                stopSequences: effective.stopSequences,
-                responseFormat: validatedResponseFormat
-            )
-
-            let finalChunk = try await scheduler.withComputeLease(for: modelID) { [registry] () throws -> GenerationChunk in
-                var lastChunk = GenerationChunk()
-                let stream = await provider.generate(
-                    requestID: reqID,
-                    request: req,
-                    effectiveSampling: effective,
-                    registry: registry
-                )
-                for try await chunk in stream {
-                    await MainActor.run {
-                        if !chunk.thinking.isEmpty || !chunk.text.isEmpty {
-                            self.streamStatusLine = nil
-                        } else if chunk.promptTokens > 0 && self.streamStatusLine != nil {
-                            self.streamStatusLine = "Prefilling \(chunk.promptTokens) prompt tokens…"
-                        }
-                        if !chunk.thinking.isEmpty {
-                            self.streamingThinking.append(chunk.thinking)
-                        }
-                        if !chunk.text.isEmpty {
-                            self.isEndingThinking = false
-                            self.streamingContent.append(chunk.text)
-                        }
-                        if chunk.tokenCount > 0 { self.streamingTokens = chunk.tokenCount }
-                        if chunk.generationTPS > 0 { self.streamingTPS = chunk.generationTPS }
-                    }
-                    lastChunk = chunk
-                }
-                return lastChunk
-            }
-
-            let requestDurationMs = Date().timeIntervalSince(requestStartedAt) * 1000.0
-
-            if !streamingContent.isEmpty || !streamingThinking.isEmpty {
-                let savedMessageID: String
-                if var cont = continuingAssistantMessage {
-                    cont.content = streamingContent
-                    cont.thinking = streamingThinking.isEmpty ? nil : streamingThinking
-                    cont.contentBlocks = Self.updatingTextInContentBlocks(
-                        cont.contentBlocks,
-                        newContent: cont.content,
-                        newThinking: cont.thinking
-                    )
-                    cont.modelID = modelID
-                    cont.stopReason = (finalChunk.stopReason ?? .endTurn).rawValue
-                    cont.tokenCount = finalChunk.tokenCount > 0 ? finalChunk.tokenCount : cont.tokenCount
-                    cont.ttftMs = finalChunk.ttftMs ?? cont.ttftMs
-                    cont.cacheReport = finalChunk.cacheReport ?? cont.cacheReport
-                    cont.speculativeReport = finalChunk.speculativeReport ?? cont.speculativeReport
-                    cont.generationTPS = finalChunk.generationTPS > 0 ? finalChunk.generationTPS : cont.generationTPS
-                    cont.computePlacement = finalChunk.activeComputePlacement
-                    try store.appendMessage(cont)
-                    savedMessageID = cont.id
-                } else {
-                    let nextPos = (convMessages.map(\.position).max() ?? -1) + 1
-                    let assistantMsg = MessageRecord(
-                        conversationID: convID,
-                        position: nextPos,
-                        role: "assistant",
-                        content: streamingContent,
-                        thinking: streamingThinking.isEmpty ? nil : streamingThinking,
-                        modelID: modelID,
-                        stopReason: finalChunk.stopReason ?? .endTurn,
-                        cacheReport: finalChunk.cacheReport,
-                        speculativeReport: finalChunk.speculativeReport,
-                        generationTPS: finalChunk.generationTPS,
-                        computePlacement: finalChunk.activeComputePlacement,
-                        tokenCount: finalChunk.tokenCount > 0 ? finalChunk.tokenCount : nil,
-                        ttftMs: finalChunk.ttftMs
-                    )
-                    try store.appendMessage(assistantMsg)
-                    savedMessageID = assistantMsg.id
-                }
-
-                let stats = MessageStatsRecord(
-                    messageID: savedMessageID,
+            let returnedSaved: HeylookSavedEvent
+            if let remote = remoteBackendProvider() {
+                returnedSaved = try await remote.generateInConversation(
                     conversationID: convID,
-                    modelID: modelID,
-                    promptTokens: finalChunk.promptTokens,
-                    outputTokens: finalChunk.tokenCount,
-                    thinkingTokens: finalChunk.thinkingTokens,
-                    contentTokens: finalChunk.contentTokens,
-                    cachedTokens: finalChunk.cacheReport?.cachedTokens ?? 0,
-                    promptTPS: finalChunk.promptTPS,
-                    generationTPS: finalChunk.generationTPS,
-                    ttftMs: finalChunk.ttftMs,
-                    thinkingDurationMs: finalChunk.thinkingDurationMs,
-                    contentDurationMs: finalChunk.contentDurationMs,
-                    generationDurationMs: finalChunk.generationDurationMs,
-                    requestDurationMs: requestDurationMs
+                    request: req,
+                    requestID: reqID,
+                    detachOnSubscriberExit: true,
+                    onSSEFrame: handleFrame
                 )
-                try? store.upsertMessageStats(stats)
+            } else {
+                returnedSaved = try await localService.generateInConversation(
+                    conversationID: convID,
+                    request: req,
+                    requestID: reqID,
+                    cancellationSignal: cancelSignal,
+                    detachOnSubscriberExit: true,
+                    onSSEFrame: handleFrame
+                )
+            }
+
+            let saved = receivedSavedEvent ?? returnedSaved
+            lastDroppedMediaCount = saved.droppedMedia.total
+            if saved.droppedMedia.total > 0 {
                 HeylookObservabilityLog.shared.record(
                     level: "INFO",
                     category: "ui.chat",
-                    message: "Completed assistant turn (\(finalChunk.tokenCount) tok @ \(String(format: "%.1f", finalChunk.generationTPS)) tok/s)",
+                    message: "Omitted \(saved.droppedMedia.total) unsupported media attachment(s) on \(modelID)",
                     requestID: reqID,
-                    metadata: [
-                        "conversation_id": convID,
-                        "model": modelID,
-                        "output_tokens": "\(finalChunk.tokenCount)",
-                        "prompt_tokens": "\(finalChunk.promptTokens)",
-                        "stop_reason": (finalChunk.stopReason ?? .endTurn).rawValue
-                    ]
+                    metadata: ["model": modelID, "dropped_media": "\(saved.droppedMedia.total)"]
                 )
             }
-            if selectedConversationID == convID {
-                currentMessages = try loadAndHydrateMessages(conversationID: convID)
+
+            if saved.endReason == "detached" {
+                adoptBackgroundGeneration(for: convID)
+            } else {
+                if let err = saved.error ?? inBandError, !err.isEmpty {
+                    onStatusMessage("Generation stopped: \(err)")
+                }
+                if remoteBackendProvider() != nil {
+                    let hydrated = saved.messages.map { Self.messageRecord(from: $0, conversationID: convID) }
+                    if selectedConversationID == convID {
+                        currentMessages = hydrated
+                        hydrateRemoteMessageAttachments(from: hydrated)
+                    }
+                    for msg in hydrated {
+                        _ = try? store.appendMessage(msg)
+                    }
+                } else if selectedConversationID == convID {
+                    currentMessages = (try? loadAndHydrateMessages(conversationID: convID)) ?? currentMessages
+                }
+                if let rb = rollbackDraft {
+                    messageAttachmentsByID[rb.tempUserID] = nil
+                }
+                pendingStreamingUserMessage = nil
+                conversations = (try? store.listConversations()) ?? conversations
             }
         } catch {
-            onStatusMessage("Generation failed: \(error.localizedDescription)")
+            if let errMsg = inBandError, !errMsg.isEmpty {
+                onStatusMessage("Generation failed: \(errMsg)")
+            } else {
+                onStatusMessage("Generation failed: \(error.localizedDescription)")
+            }
             HeylookObservabilityLog.shared.record(
                 level: "ERROR",
                 category: "ui.chat",
@@ -1762,25 +2951,75 @@ public final class ChatController {
                 requestID: reqID,
                 metadata: ["conversation_id": convID, "model": modelID]
             )
+            if let rb = rollbackDraft,
+               (try? store.listMessages(conversationID: convID))?.last?.role != "user" {
+                restoreFailedDraft(rb, conversationID: convID)
+            }
             if selectedConversationID == convID {
                 currentMessages = (try? loadAndHydrateMessages(conversationID: convID)) ?? currentMessages
             }
         }
 
+        clearStreamingPresentationState()
+        activeCancellationSignal = nil
+        if selectedConversationID == convID && showPromptPreview {
+            schedulePromptPreviewRefresh()
+        }
+        await refreshActiveAdminModel(resetDrafts: false)
+        await onGenerationCompleted?()
+    }
+
+    private func restoreFailedDraft(
+        _ rollback: (prompt: String, attachments: [StagedChatAttachment], tempUserID: String),
+        conversationID: String
+    ) {
+        messageAttachmentsByID[rollback.tempUserID] = nil
+        if pendingStreamingUserMessage?.id == rollback.tempUserID {
+            pendingStreamingUserMessage = nil
+        }
+        if selectedConversationID == conversationID, draftPrompt.isEmpty, stagedAttachments.isEmpty {
+            draftPrompt = rollback.prompt
+            stagedAttachments = rollback.attachments
+        } else {
+            composerDraftByConversationID[conversationID] = rollback.prompt
+            composerMediaByConversationID[conversationID] = rollback.attachments
+        }
+    }
+
+    private func clearStreamingPresentationState() {
         isGenerating = false
         generatingConversationID = nil
         activeRequestID = nil
         isEndingThinking = false
         streamStatusLine = nil
+        prefillProcessed = 0
+        prefillTotal = 0
         streamingThinking = ""
         streamingContent = ""
-        if selectedConversationID == convID && showPromptPreview {
-            schedulePromptPreviewRefresh()
+        streamingHiddenFromPosition = nil
+        streamingContinueAnchorMessageID = nil
+        pendingStreamingUserMessage = nil
+    }
+
+    nonisolated private static func parseSSEFrame(_ frame: String) -> (event: String, data: String)? {
+        var eventName = ""
+        var dataLines: [String] = []
+        for rawLine in frame.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : String(rawLine)
+            if line.hasPrefix("event:") {
+                eventName = line.dropFirst("event:".count).trimmingCharacters(in: .whitespaces)
+            } else if line.hasPrefix("data:") {
+                let tail = line.dropFirst("data:".count)
+                let cleaned = tail.first == " " ? String(tail.dropFirst()) : String(tail)
+                dataLines.append(cleaned)
+            }
         }
-        await onGenerationCompleted?()
+        guard !dataLines.isEmpty else { return nil }
+        return (eventName, dataLines.joined(separator: "\n"))
     }
 
     public func endThinkingNow() {
+        guard activeModelCanEndThinking else { return }
         guard let reqID = activeRequestID, !isEndingThinking else { return }
         isEndingThinking = true
         _ = registry.requestReasoningEnd(requestID: reqID)
@@ -1790,10 +3029,18 @@ public final class ChatController {
     }
 
     public func cancelGeneration() {
-        guard let reqID = activeRequestID else { return }
-        _ = registry.abort(requestID: reqID)
-        if let remote = remoteBackendProvider() {
-            Task { try? await remote.abortRequest(id: reqID) }
+        if let reqID = activeRequestID {
+            _ = registry.abort(requestID: reqID)
+            if let remote = remoteBackendProvider() {
+                Task { try? await remote.abortRequest(id: reqID) }
+            }
+            return
+        }
+        if let bgConvID = backgroundGeneratingConversationID {
+            _ = registry.abort(forConversationID: bgConvID)
+            if remoteBackendProvider() != nil {
+                startResyncUntilSettled(for: bgConvID)
+            }
         }
     }
 }
